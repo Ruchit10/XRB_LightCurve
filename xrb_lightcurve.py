@@ -155,8 +155,8 @@ def wind_los_integral(
         )
 
     # z start and bounds (identical for each cell within a phase)
-    z1 = d1 * np.sin(gma) * np.cos(i)
-    z2 = d2 * np.sin(gma) * np.cos(i)
+        z1 = d1 * np.sin(gma) * np.cos(i)
+        z2 = d2 * np.sin(gma) * np.cos(i)
     z_start = z1 + z2
 
     # Per-cell LOS half-extent
