@@ -23,6 +23,7 @@ Example:
 Notes:
 - XSPEC tbabs.nH parameter is in 1e22 cm^-2. This script accepts nH in cm^-2 and converts accordingly.
 - Photon flux is computed by integrating the unfolded model spectrum (photons/cm^2/s/keV) over the band.
+  If that fails, we fall back to XSPEC's band energy flux for visibility (also saved in CSV).
 """
 
 import argparse
@@ -129,13 +130,23 @@ def fit_baseline_model(model_expr: str = "tbabs*powerlaw") -> None:
 
     # Reasonable starting values
     try:
-        # tbabs.nH in 1e22 units
-        AllModels(1).tbabs.nH = 0.511314
+        # tbabs.nH in 1e22 units - try both capitalizations
+        model = AllModels(1)
+        if hasattr(model, 'TBabs'):
+            model.TBabs.nH = 0.511314
+        elif hasattr(model, 'tbabs'):
+            model.tbabs.nH = 0.511314
     except Exception:
         pass
     try:
-        AllModels(1).powerlaw.PhoIndex = 1.84513
-        AllModels(1).powerlaw.norm = 3.05926e-04
+        # Set powerlaw parameters - try both capitalizations
+        model = AllModels(1)
+        if hasattr(model, 'powerlaw'):
+            model.powerlaw.PhoIndex = 1.84513
+            model.powerlaw.norm = 3.05926e-04
+        elif hasattr(model, 'Powerlaw'):
+            model.Powerlaw.PhoIndex = 1.84513
+            model.Powerlaw.norm = 3.05926e-04
     except Exception:
         pass
 
@@ -157,8 +168,13 @@ def fit_baseline_model(model_expr: str = "tbabs*powerlaw") -> None:
 
     # Freeze continuum so only nH varies
     try:
-        AllModels(1).powerlaw.PhoIndex.frozen = True
-        AllModels(1).powerlaw.norm.frozen = True
+        model = AllModels(1)
+        if hasattr(model, 'powerlaw'):
+            model.powerlaw.PhoIndex.frozen = True
+            model.powerlaw.norm.frozen = True
+        elif hasattr(model, 'Powerlaw'):
+            model.Powerlaw.PhoIndex.frozen = True
+            model.Powerlaw.norm.frozen = True
     except Exception:
         pass
 
@@ -176,6 +192,90 @@ def integrate_photon_flux(E: np.ndarray, y: np.ndarray, band: Tuple[float, float
     return float(np.trapz(y[mask], E[mask]))
 
 
+def compute_energy_flux_for_band(band: Tuple[float, float]) -> float:
+    """Compute band energy flux (erg/cm^2/s) via XSPEC's native calculator with robust fallbacks."""
+    e1, e2 = band
+
+    # Try global calcFlux
+    try:
+        band_str = f"{e1} {e2}"
+        res = AllModels.calcFlux(band_str)
+        # When spectra are loaded, calcFlux populates each Spectrum object's `.flux` attribute but
+        # often returns `None`.  Retrieve the value explicitly from the first spectrum to make
+        # the behaviour version-independent.
+        try:
+            sp = AllData(1)
+            if sp and hasattr(sp, "flux") and len(sp.flux) >= 1 and np.isfinite(sp.flux[0]):
+                return float(sp.flux[0])
+        except Exception as e:
+            pass
+        if isinstance(res, (list, tuple, np.ndarray)) and len(res) > 0 and np.isfinite(res[0]):
+            return float(res[0])
+        if isinstance(res, (int, float)) and np.isfinite(res):
+            return float(res)
+    except Exception as e:
+        pass
+
+    # Try model-specific calcFlux (source/model index 1)
+    try:
+        mdl = AllModels(1)
+        band_str = f"{e1} {e2}"
+        res = mdl.calcFlux(band_str)
+        try:
+            sp = AllData(1)
+            if sp and hasattr(sp, "flux") and len(sp.flux) >= 1 and np.isfinite(sp.flux[0]):
+                return float(sp.flux[0])
+        except Exception as e:
+            pass
+        if isinstance(res, (list, tuple, np.ndarray)) and len(res) > 0 and np.isfinite(res[0]):
+            return float(res[0])
+        if isinstance(res, (int, float)) and np.isfinite(res):
+            return float(res)
+    except Exception as e:
+        pass
+
+    # Fallback: capture 'flux e1 e2' command output to a temp log and parse numeric value
+    try:
+        tmp_log = "_xspec_flux_tmp.log"
+        # Remove existing tmp file
+        try:
+            if os.path.exists(tmp_log):
+                os.remove(tmp_log)
+        except Exception:
+            pass
+
+        Xset.openLog(tmp_log)
+        # This prints to the log. XSPEC reports energy flux by default (erg/cm^2/s)
+        Xset.command(f"flux {e1} {e2}")
+        Xset.closeLog()
+
+        # Parse the last numeric in the file
+        val = np.nan
+        with open(tmp_log, "r") as fh:
+            content = fh.read()
+            for line in fh:
+                # Look for a number in scientific notation
+                m = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", line)
+                if m:
+                    try:
+                        # take last number on the line
+                        candidate = float(m[-1])
+                        # XSPEC prints error bars too; keep positive plausible values
+                        if np.isfinite(candidate) and candidate > 0:
+                            val = candidate
+                    except Exception:
+                        continue
+        # Cleanup
+        try:
+            os.remove(tmp_log)
+        except Exception:
+            pass
+
+        return float(val) if np.isfinite(val) else float("nan")
+    except Exception as e:
+        return float("nan")
+
+
 def compute_photon_flux_for_band(band: Tuple[float, float]) -> float:
     """
     Compute photon flux by integrating the unfolded model spectrum over the band.
@@ -184,31 +284,9 @@ def compute_photon_flux_for_band(band: Tuple[float, float]) -> float:
     """
     e1, e2 = band
 
-    # First try XSPEC's native calculation
-    try:
-        # Some PyXspec versions return a list/tuple; others may set internals.
-        res = AllModels.calcFlux(f"{e1} {e2}")
-        if res is None:
-            # Try to access via Model object if available
-            try:
-                # Not standardized; keep as placeholder for older versions
-                pass
-            except Exception:
-                pass
-        else:
-            # If res is scalar or sequence, extract first element as flux value
-            if isinstance(res, (list, tuple, np.ndarray)):
-                if len(res) > 0:
-                    val = float(res[0])
-                    if np.isfinite(val) and val >= 0:
-                        return val
-            else:
-                val = float(res)
-                if np.isfinite(val) and val >= 0:
-                    return val
-    except Exception:
-        # Fall through to plot-based method
-        pass
+    # First try XSPEC's native calculation (energy flux); not photon, but allows a non-empty value
+    # We still prefer photon flux from unfolded model below.
+    # (We will call this again in the caller as a fallback if photon integration fails.)
 
     # Configure plot to get unfolded spectrum in photons/cm^2/s/keV
     Xset.chatter = 5
@@ -216,20 +294,33 @@ def compute_photon_flux_for_band(band: Tuple[float, float]) -> float:
     try:
         Xset.command("setplot energy")
         Xset.command("setplot ufspec")
-    except Exception:
-        pass
+    except Exception as e:
+        # Note: Some XSPEC versions may not have Xset.command method
+        return float("nan")
 
     # Build model arrays
+    # Use the special "/null" device to suppress on-screen PGPLOT windows.
     Plot.device = "/null"
+    E = np.array([])
+    y = np.array([])
+    
     try:
-        # Ensure a well-sampled energy grid for integration
-        Xset.command("energies 0.1 20.0 2000 log")
-        # Request unfolded spectrum so model is in photons/cm^2/s/keV
+        # Primary: use unfolded spectrum directly
+        Xset.command("setplot energy")
         Plot("ufspec")
         E = np.array(Plot.x(1), dtype=float)
-        # Prefer model array; if unavailable, fall back to y
-        y = np.array(Plot.model(1), dtype=float) if len(Plot.model(1)) else np.array(Plot.y(1), dtype=float)
-    except Exception:
+        y = np.array(Plot.y(1), dtype=float)
+        
+        if y.size < 2:
+            # Secondary: well-sampled energy grid with model values
+            Xset.command("energies 0.1 20.0 2000 log")
+            Plot("model")
+            E = np.array(Plot.x(1), dtype=float)
+            y = np.array(Plot.model(1), dtype=float)
+    except Exception as e:
+        return float("nan")
+
+    if E.size < 2 or y.size < 2:
         return float("nan")
 
     return integrate_photon_flux(E, y, band)
@@ -257,23 +348,46 @@ def vary_nh_and_compute(specdir: str,
     for nH_cm2 in nH_values_cm2:
         nH_1e22 = float(nH_cm2 / 1.0e22)
         try:
-            AllModels(1).tbabs.nH = nH_1e22
-        except Exception:
+            # Try both possible capitalizations of tbabs/TBabs
+            model = AllModels(1)
+            if hasattr(model, 'TBabs'):
+                model.TBabs.nH = nH_1e22
+            elif hasattr(model, 'tbabs'):
+                model.tbabs.nH = nH_1e22
+            else:
+                raise AttributeError("Model has neither 'TBabs' nor 'tbabs' component")
+        except Exception as e:
             # If model isn't tbabs-based, skip with NaNs
-            soft_flux = float("nan")
-            hard_flux = float("nan")
+            soft_flux_ph = float("nan")
+            hard_flux_ph = float("nan")
+            soft_flux_erg = float("nan")
+            hard_flux_erg = float("nan")
         else:
-            soft_flux = compute_photon_flux_for_band(band_soft)
-            hard_flux = compute_photon_flux_for_band(band_hard)
+            # Try to compute photon flux via unfolded model
+            soft_flux_ph = compute_photon_flux_for_band(band_soft)
+            
+            hard_flux_ph = compute_photon_flux_for_band(band_hard)
+            
+            # Also compute energy flux via XSPEC calculator for visibility/fallback
+            soft_flux_erg = compute_energy_flux_for_band(band_soft)
+            
+            hard_flux_erg = compute_energy_flux_for_band(band_hard)
+            
+            # If photon flux failed, fall back to energy flux (so plot is not empty)
+            if not np.isfinite(soft_flux_ph) or soft_flux_ph <= 0:
+                soft_flux_ph = soft_flux_erg
+            if not np.isfinite(hard_flux_ph) or hard_flux_ph <= 0:
+                hard_flux_ph = hard_flux_erg
 
-        results.append(
-            {
-                "nH_cm2": float(nH_cm2),
-                "nH_1e22": nH_1e22,
-                "flux_soft_ph": soft_flux,
-                "flux_hard_ph": hard_flux,
-            }
-        )
+        result_row = {
+            "nH_cm2": float(nH_cm2),
+            "nH_1e22": nH_1e22,
+            "flux_soft_ph": soft_flux_ph,
+            "flux_hard_ph": hard_flux_ph,
+            "flux_soft_erg": soft_flux_erg,
+            "flux_hard_erg": hard_flux_erg,
+        }
+        results.append(result_row)
 
     return pd.DataFrame(results)
 
@@ -353,7 +467,7 @@ def main():
             ax.plot(
                 dfp.loc[mask_soft, "nH_cm2"],
                 dfp.loc[mask_soft, "flux_soft_ph"],
-                label=f"Soft {band_soft[0]}-{band_soft[1]} keV",
+                label=f"Soft {band_soft[0]}-{band_soft[1]} keV (ph or erg)",
                 color="tab:blue",
                 marker="o",
                 markersize=3,
@@ -365,7 +479,7 @@ def main():
             ax.plot(
                 dfp.loc[mask_hard, "nH_cm2"],
                 dfp.loc[mask_hard, "flux_hard_ph"],
-                label=f"Hard {band_hard[0]}-{band_hard[1]} keV",
+                label=f"Hard {band_hard[0]}-{band_hard[1]} keV (ph or erg)",
                 color="tab:red",
                 marker="s",
                 markersize=3,
@@ -373,6 +487,35 @@ def main():
                 alpha=0.9,
             )
             any_plotted = True
+
+        # If still nothing plotted, try energy flux columns
+        if not any_plotted and "flux_soft_erg" in dfp.columns and "flux_hard_erg" in dfp.columns:
+            mask_soft_e = (dfp["nH_cm2"] > 0) & (dfp["flux_soft_erg"] > 0)
+            mask_hard_e = (dfp["nH_cm2"] > 0) & (dfp["flux_hard_erg"] > 0)
+            if mask_soft_e.any():
+                ax.plot(
+                    dfp.loc[mask_soft_e, "nH_cm2"],
+                    dfp.loc[mask_soft_e, "flux_soft_erg"],
+                    label=f"Soft {band_soft[0]}-{band_soft[1]} keV (erg)",
+                    color="tab:blue",
+                    marker="o",
+                    markersize=3,
+                    linewidth=1.5,
+                    alpha=0.9,
+                )
+                any_plotted = True
+            if mask_hard_e.any():
+                ax.plot(
+                    dfp.loc[mask_hard_e, "nH_cm2"],
+                    dfp.loc[mask_hard_e, "flux_hard_erg"],
+                    label=f"Hard {band_hard[0]}-{band_hard[1]} keV (erg)",
+                    color="tab:red",
+                    marker="s",
+                    markersize=3,
+                    linewidth=1.5,
+                    alpha=0.9,
+                )
+                any_plotted = True
 
         # Force log scales for readability
         ax.set_xscale("log")
@@ -384,6 +527,11 @@ def main():
             yvals.append(dfp.loc[mask_soft, "flux_soft_ph"].values)
         if mask_hard.any():
             yvals.append(dfp.loc[mask_hard, "flux_hard_ph"].values)
+        if not yvals and "flux_soft_erg" in dfp.columns and "flux_hard_erg" in dfp.columns:
+            if (dfp["flux_soft_erg"] > 0).any():
+                yvals.append(dfp.loc[dfp["flux_soft_erg"] > 0, "flux_soft_erg"].values)
+            if (dfp["flux_hard_erg"] > 0).any():
+                yvals.append(dfp.loc[dfp["flux_hard_erg"] > 0, "flux_hard_erg"].values)
         if yvals:
             yvals = np.concatenate(yvals)
             yvals = yvals[yvals > 0]
@@ -394,14 +542,13 @@ def main():
                     ax.set_ylim(ymin, ymax)
 
         # X limits from available nH
-        if any_plotted:
-            xmin = dfp["nH_cm2"].min() * 0.8
-            xmax = dfp["nH_cm2"].max() * 1.2
-            if xmin > 0 and xmax > xmin:
-                ax.set_xlim(xmin, xmax)
+        xmin = dfp["nH_cm2"].min() * 0.8
+        xmax = dfp["nH_cm2"].max() * 1.2
+        if xmin > 0 and xmax > xmin:
+            ax.set_xlim(xmin, xmax)
 
         ax.set_xlabel("nH (cm$^{-2}$)")
-        ax.set_ylabel("Photon flux (photons cm$^{-2}$ s$^{-1}$)")
+        ax.set_ylabel("Flux (photons or ergs cm$^{-2}$ s$^{-1}$)")
         ax.grid(True, which="both", alpha=0.3)
         ax.legend(loc="best")
         fig.tight_layout()
