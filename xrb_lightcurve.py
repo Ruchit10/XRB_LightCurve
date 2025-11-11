@@ -298,12 +298,16 @@ def fit_exponential_to_csv(df: pd.DataFrame, band: str) -> Tuple[float, float]:
     """
     Fit exponential function A * exp(-B * nH) to CSV flux data.
     
+    Flux values are scaled by 1e-13 before fitting to match the legacy approach.
+    This produces coefficients comparable to the hardcoded legacy values.
+    
     Args:
         df: DataFrame from load_flux_vs_nh_csv
         band: Either "soft" or "hard"
         
     Returns:
         Tuple of (A, B) coefficients for flux = A * exp(-B * nH_1e22)
+        where flux is in units of 1e-13 photons/cm²/s
     """
     if band == "soft":
         flux_col = "flux_soft_ph"
@@ -315,37 +319,41 @@ def fit_exponential_to_csv(df: pd.DataFrame, band: str) -> Tuple[float, float]:
     # Get data
     df_sorted = df.sort_values("nH_1e22")
     nh = df_sorted["nH_1e22"].values
-    flux = df_sorted[flux_col].values
+    flux_raw = df_sorted[flux_col].values
     
-    # Fit exponential: flux = A * exp(-B * nH)
+    # Scale flux by 1e-13 to match legacy fitting approach
+    # This converts e.g., 9.82e-13 photons/cm²/s → 9.82
+    flux_scaled = flux_raw / 1e-13
+    
+    # Fit exponential: flux_scaled = A * exp(-B * nH)
     def exp_func(x, A, B):
         return A * np.exp(-B * x)
     
     try:
         # Initial guess: A = flux at nH=0 (extrapolate), B from slope
-        A_guess = flux[0] * np.exp(0.1 * nh[0])
-        B_guess = -np.log(flux[-1] / flux[0]) / (nh[-1] - nh[0])
+        A_guess = flux_scaled[0] * np.exp(0.1 * nh[0])
+        B_guess = -np.log(flux_scaled[-1] / flux_scaled[0]) / (nh[-1] - nh[0])
         
         popt, _ = curve_fit(
             exp_func,
             nh,
-            flux,
+            flux_scaled,
             p0=[A_guess, max(B_guess, 0.01)],
             bounds=([0, 0], [np.inf, np.inf]),
             maxfev=10000,
         )
         A, B = popt
         
-        print(f"Fitted exponential for {band} band: A={A:.6e}, B={B:.6f}")
+        print(f"Fitted exponential for {band} band (flux in 1e-13 units): A={A:.6f}, B={B:.6f}")
         return float(A), float(B)
         
     except Exception as e:
         warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy values.")
         # Return legacy values as fallback
         if band == "hard":
-            return 9.524e-13, 0.057  # Legacy hard band coefficients
+            return 9.524, 0.057  # Legacy hard band coefficients
         else:
-            return 9.3923e-13, 2.5062  # Legacy soft band coefficients
+            return 9.3923, 2.5062  # Legacy soft band coefficients
 
 
 def simulate_lightcurve(
