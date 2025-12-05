@@ -1,31 +1,62 @@
 #!/usr/bin/env python3
 """
-Chandra Phase Analysis
-----------------------
-This script replicates and extends the phase–conversion logic from the original
-R prototype (`light_curve_model_opt_bw.R`).  It
+X-ray Binary Phase Analysis
+----------------------------
+This script converts observational X-ray light-curve data to orbital phase and
+fits simulation models to the observations.
 
-1.  Reads either the master `Chandra.txt` file or all `chandra*.txt` files in a
-    data directory.
+Features:
+1.  Reads all .txt files from a data directory (or a specified master file)
 2.  Converts observation times to orbital phase using the reference epoch and
-    orbital period found in the R script.
-3.  Optionally verifies that every point in the individual `chandra*.txt` files
-    is present in the master file.
-4.  Produces a scatter plot of count-rate versus orbital phase, colour-coded by
-    observation.
+    orbital period
+3.  Optionally verifies that individual files are contained in a master file
+4.  Produces scatter plots of count-rate versus orbital phase
+5.  Fits simulation models to observations via chi-square minimization
+6.  Supports multiple energy bands and automatically detects available flux columns
 
-Example
-~~~~~~~
-$ python chandra_phase_analysis.py --data-dir data --output chandra_phase_plot.png --verify-master
+File Format:
+  Whitespace-delimited text files with three columns:
+    1. time (seconds)
+    2. count rate / flux
+    3. error (optional)
 
-Dependencies: numpy, pandas, matplotlib (already listed in requirements.txt).
+Examples
+~~~~~~~~
+# Load all .txt files from a custom directory:
+$ python chandra_phase_analysis.py --data-dir my_observations --output phase_plot.png
+
+# Use a specific master file:
+$ python chandra_phase_analysis.py --data-dir data --master-file Chandra.txt --output plot.png
+
+# Use specific observation column (e.g., NET_RATE instead of default):
+$ python chandra_phase_analysis.py --data-dir data --obs-column NET_RATE --output plot.png
+
+# Use FLUX column from observations with specific error column:
+$ python chandra_phase_analysis.py --data-dir data --obs-column FLUX --obs-error-column FLUX_ERR --output plot.png
+
+# Fit simulation to observations (auto-detects all flux columns):
+$ python chandra_phase_analysis.py --data-dir data --fit --sim-file simulation.csv --output fit.png
+
+# Fit specific flux columns:
+$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+    --sim-column nfl_broad_av nfl_soft_av --output fit.png
+
+# Fit with specific observation column, without rescaling:
+$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+    --obs-column FLUX --sim-column nfl_broad_av --output fit.png
+
+# Fit with rescaling enabled:
+$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+    --obs-column NET_RATE --sim-column nfl_broad_av --rescale --output fit.png
+
+Dependencies: numpy, pandas, matplotlib, scipy (in requirements.txt).
 """
 from __future__ import annotations
 
 import argparse
 import glob
 import os
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -48,17 +79,191 @@ def frac(x: np.ndarray | float) -> np.ndarray | float:
     return np.abs(x - np.floor(x))
 
 
-def read_observation(file_path: str, label: str) -> pd.DataFrame:
+def detect_flux_columns(df: pd.DataFrame) -> List[str]:
+    """Detect available flux columns in simulation DataFrame.
+    
+    Looks for columns matching common flux patterns:
+    - nfl_{band}_av (accretion velocity wind model, scaled by lam)
+    - nfl_{band}_cv (constant velocity wind model, scaled by lam)
+    - pho_count_{band}_av (photon counts)
+    
+    Note: fl and fl2 columns are excluded as they are unscaled column density values.
+    
+    Parameters
+    ----------
+    df : DataFrame
+        Simulation results DataFrame
+        
+    Returns
+    -------
+    List of flux column names found in the DataFrame
+    """
+    flux_columns = []
+    
+    # Check for nfl_* columns (normalized flux for various bands, scaled by lam)
+    for col in df.columns:
+        if col.startswith("nfl_") and (col.endswith("_av") or col.endswith("_cv")):
+            flux_columns.append(col)
+    
+    # Check for pho_count_* columns (photon counts)
+    for col in df.columns:
+        if col.startswith("pho_count_") and col.endswith("_av"):
+            flux_columns.append(col)
+    
+    return sorted(flux_columns)
+
+
+def validate_sim_columns(df: pd.DataFrame, requested_columns: List[str]) -> List[str]:
+    """Validate that requested columns exist in simulation DataFrame.
+    
+    Parameters
+    ----------
+    df : DataFrame
+        Simulation results DataFrame
+    requested_columns : list of str
+        Column names requested by user
+        
+    Returns
+    -------
+    List of valid column names
+    
+    Raises
+    ------
+    ValueError
+        If none of the requested columns exist in the DataFrame
+    """
+    available = detect_flux_columns(df)
+    
+    # Check which requested columns exist
+    valid_columns = [col for col in requested_columns if col in df.columns]
+    missing_columns = [col for col in requested_columns if col not in df.columns]
+    
+    if missing_columns:
+        print(f"⚠️  Warning: The following columns were not found in simulation file: {missing_columns}")
+        if available:
+            print(f"   Available flux columns: {available}")
+    
+    if not valid_columns:
+        raise ValueError(
+            f"None of the requested columns exist in simulation file.\n"
+            f"Requested: {requested_columns}\n"
+            f"Available: {available if available else 'No flux columns found'}"
+        )
+    
+    return valid_columns
+
+
+def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_error_column: Optional[str] = None) -> pd.DataFrame:
     """Read a single Chandra observation text file.
 
-    The files are whitespace-delimited with three columns:
-        1. time (seconds)
-        2. count rate / flux
-        3. formal error (ignored here)
+    The files can be whitespace-delimited with or without headers.
+    If a header is present (lines starting with #), column names are extracted.
+    Otherwise, assumes three columns: time, count rate/flux, error.
+    
+    Parameters
+    ----------
+    file_path : str
+        Path to observation file
+    label : str
+        Label for this observation
+    obs_column : str, default "rate"
+        Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE").
+        If file has no header, this is ignored and "rate" is used.
+    obs_error_column : str, optional
+        Name of column to use for errors. If None, will attempt to auto-detect based on obs_column
+        (e.g., "ERR_RATE" for "NET_RATE", "FLUX_ERR" for "FLUX").
+    
+    Returns
+    -------
+    DataFrame with columns: time, phase, obs, and the specified observable column renamed to "rate"
+    (and optionally "error" column)
     """
+    # Try to read with header detection
+    try:
+        # Read file and check for header
+        with open(file_path, 'r') as f:
+            first_line = f.readline().strip()
+        
+        # Check if file has a header (starts with # and contains column names)
+        if first_line.startswith('#') and any(col_name in first_line.upper() for col_name in ['TIME', 'RATE', 'FLUX', 'COUNTS']):
+            # Read with header - skip comment lines until we find the column names
+            df = pd.read_csv(file_path, delim_whitespace=True, comment='#', header=None)
+            
+            # Extract column names from the last comment line before data
+            with open(file_path, 'r') as f:
+                header_line = None
+                for line in f:
+                    if line.strip().startswith('#'):
+                        # Check if this line has column-like content (no ":" or "=" which indicate metadata)
+                        if ':' not in line and '=' not in line and any(name in line.upper() for name in ['TIME', 'RATE', 'FLUX']):
+                            header_line = line.strip().lstrip('#').strip()
+                    else:
+                        break
+            
+            if header_line:
+                col_names = header_line.split()
+                if len(col_names) == len(df.columns):
+                    df.columns = col_names
+                    
+                    # Ensure time column exists (case-insensitive)
+                    time_col = None
+                    for col in df.columns:
+                        if col.upper() == 'TIME':
+                            time_col = col
+                            break
+                    
+                    if time_col:
+                        if obs_column not in df.columns:
+                            # Column not found - print available columns and raise error
+                            print(f"⚠️  Error: Column '{obs_column}' not found in {file_path}")
+                            print(f"   Available columns: {list(df.columns)}")
+                            raise ValueError(f"Column '{obs_column}' not found in observation file")
+                        
+                        # Use specified columns
+                        result_df = pd.DataFrame({
+                            'time': df[time_col],
+                            'rate': df[obs_column],
+                        })
+                        
+                        # Try to find error column
+                        error_col = None
+                        if obs_error_column and obs_error_column in df.columns:
+                            error_col = obs_error_column
+                        else:
+                            # Auto-detect error column
+                            possible_error_cols = [
+                                f"{obs_column}_ERR",
+                                f"ERR_{obs_column}",
+                                obs_column.replace("RATE", "ERR_RATE").replace("FLUX", "FLUX_ERR"),
+                            ]
+                            for err_col in possible_error_cols:
+                                if err_col in df.columns:
+                                    error_col = err_col
+                                    break
+                            
+                            # Also try case-insensitive matching
+                            if not error_col:
+                                for col in df.columns:
+                                    if 'ERR' in col.upper() and obs_column.split('_')[0] in col.upper():
+                                        error_col = col
+                                        break
+                        
+                        if error_col:
+                            result_df['error'] = df[error_col]
+                        
+                        # Convert timestamps to orbital phase
+                        result_df['phase'] = frac((result_df['time'] - REF_EPOCH) / ORBITAL_PERIOD)
+                        result_df['obs'] = label
+                        
+                        return result_df
+    except Exception as e:
+        pass
+    
+    # Fallback: read as headerless file with 3 columns
     df = pd.read_csv(
         file_path,
         delim_whitespace=True,
+        comment='#',
         header=None,
         names=["time", "rate", "error"],
     )
@@ -72,49 +277,81 @@ def read_observation(file_path: str, label: str) -> pd.DataFrame:
 # Data loading helpers
 # -----------------------------------------------------------------------------
 
-def load_data(data_dir: str) -> pd.DataFrame:
-    """Load Chandra data from *data_dir*.
+def load_data(data_dir: str, master_file: Optional[str] = None, obs_column: str = "rate", obs_error_column: Optional[str] = None) -> pd.DataFrame:
+    """Load observational data from *data_dir*.
 
-    Preference order:
-        1. Use master `Chandra.txt` if it exists.
-        2. Otherwise, concatenate all `chandra*.txt` files.
+    Parameters
+    ----------
+    data_dir : str
+        Directory containing observation text files
+    master_file : str, optional
+        Name of master file (if it exists). If provided and exists, only this file is loaded.
+        If None, all .txt files in the directory are loaded.
+    obs_column : str, default "rate"
+        Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE")
+    obs_error_column : str, optional
+        Name of column to use for errors. If None, will auto-detect based on obs_column.
+
+    Returns
+    -------
+    DataFrame with columns: time, rate (containing the specified observable), error (optional), phase, obs
     """
-    master_file = os.path.join(data_dir, "Chandra.txt")
-    individual_pattern = os.path.join(data_dir, "chandra*.txt")
+    # Check for master file if specified
+    if master_file:
+        master_path = os.path.join(data_dir, master_file)
+        if os.path.isfile(master_path):
+            print(f"Using master file: {master_path}")
+            return read_observation(master_path, "master", obs_column, obs_error_column)
+        else:
+            print(f"Warning: Master file '{master_file}' not found in {data_dir}, loading all files instead.")
 
-    if os.path.isfile(master_file):
-        print(f"Using master file: {master_file}")
-        return read_observation(master_file, "master")
-
-    # Fall back to individual files
-    files: List[str] = sorted(glob.glob(individual_pattern))
+    # Load all .txt files from directory
+    txt_pattern = os.path.join(data_dir, "*.txt")
+    files: List[str] = sorted(glob.glob(txt_pattern))
+    
     if not files:
         raise FileNotFoundError(
-            f"No Chandra data found in {data_dir} (expected 'Chandra.txt' or 'chandra*.txt')"
+            f"No .txt files found in {data_dir}"
         )
 
-    dfs = [read_observation(fp, os.path.basename(fp)) for fp in files]
-    print(f"Loaded {len(files)} individual observation file(s).")
+    print(f"Loading {len(files)} observation file(s) from {data_dir}")
+    dfs = [read_observation(fp, os.path.basename(fp), obs_column, obs_error_column) for fp in files]
     return pd.concat(dfs, ignore_index=True)
 
 
-def verify_master_contains_individual(data_dir: str) -> None:
-    """Check that every timestamp in `chandra*.txt` appears in `Chandra.txt`."""
-    master_file = os.path.join(data_dir, "Chandra.txt")
-    if not os.path.isfile(master_file):
-        print("No master 'Chandra.txt' found; skipping verification.")
+def verify_master_contains_individual(data_dir: str, master_file: str = "Chandra.txt") -> None:
+    """Check that every timestamp in individual .txt files appears in the master file.
+    
+    Parameters
+    ----------
+    data_dir : str
+        Directory containing observation files
+    master_file : str, optional
+        Name of the master file to verify against (default: "Chandra.txt")
+    """
+    master_path = os.path.join(data_dir, master_file)
+    if not os.path.isfile(master_path):
+        print(f"No master file '{master_file}' found; skipping verification.")
         return
 
-    print("Verifying individual files against master...\n")
+    print(f"Verifying individual files against master file: {master_file}\n")
     master_times = (
-        pd.read_csv(master_file, delim_whitespace=True, header=None, usecols=[0])[0]
+        pd.read_csv(master_path, delim_whitespace=True, header=None, usecols=[0])[0]
         .round(6)
         .astype(str)
         .tolist()
     )
     master_set = set(master_times)
 
-    for fp in glob.glob(os.path.join(data_dir, "chandra*.txt")):
+    # Get all .txt files except the master file
+    all_files = glob.glob(os.path.join(data_dir, "*.txt"))
+    individual_files = [fp for fp in all_files if os.path.basename(fp) != master_file]
+    
+    if not individual_files:
+        print("No individual files found to verify.")
+        return
+
+    for fp in sorted(individual_files):
         ind_times = (
             pd.read_csv(fp, delim_whitespace=True, header=None, usecols=[0])[0]
             .round(6)
@@ -133,7 +370,7 @@ def verify_master_contains_individual(data_dir: str) -> None:
 # Plotting
 # -----------------------------------------------------------------------------
 
-def fit_simulation(obs_df: pd.DataFrame, sim_df: pd.DataFrame, sim_column: str = "fl") -> tuple[float, float, float]:
+def fit_simulation(obs_df: pd.DataFrame, sim_df: pd.DataFrame, sim_column: str = "fl", rescale: bool = False) -> tuple[float, float, float]:
     """Fit simulation light-curve to observations via chi-square minimization.
 
     Parameters
@@ -144,11 +381,15 @@ def fit_simulation(obs_df: pd.DataFrame, sim_df: pd.DataFrame, sim_column: str =
         Simulation results. Must contain columns ``phase`` (or ``deg``) and *sim_column*.
     sim_column : str, default ``"fl"``
         Column in *sim_df* to use as the model flux.
+    rescale : bool, default False
+        If True, optimize phase shift and scale factor to minimize chi-square.
+        If False, compute chi-square with no shift (shift=0) and no scaling (scale=1).
 
     Returns
     -------
     (phase_shift, scale_factor, reduced_chi2)
         Best-fit phase shift (0–1), multiplicative scale factor, and reduced chi-squared value.
+        If rescale=False, returns (0.0, 1.0, reduced_chi2).
     """
     # Prepare observation arrays
     phase_obs = obs_df["phase"].to_numpy()
@@ -195,20 +436,32 @@ def fit_simulation(obs_df: pd.DataFrame, sim_df: pd.DataFrame, sim_column: str =
         ) * scale
         return np.sum(((rate_obs - model) / err_obs) ** 2)
 
-    # Initial guess: no shift, scale = ratio of means
-    mean_sim = np.mean(sim_flux_sorted)
-    initial_scale = (np.mean(rate_obs) / mean_sim) if mean_sim > 0 else 1.0
-    res = minimize(chi2, x0=[0.0, initial_scale], bounds=[(0, 1), (0, None)], method="Nelder-Mead")
+    if rescale:
+        # Perform optimization to find best-fit shift and scale
+        # Initial guess: no shift, scale = ratio of means
+        mean_sim = np.mean(sim_flux_sorted)
+        initial_scale = (np.mean(rate_obs) / mean_sim) if mean_sim > 0 else 1.0
+        res = minimize(chi2, x0=[0.0, initial_scale], bounds=[(0, 1), (0, None)], method="Nelder-Mead")
 
-    if not res.success:
-        print("⚠️  Optimization did not converge; results may be unreliable.")
+        if not res.success:
+            print("⚠️  Optimization did not converge; results may be unreliable.")
 
-    best_shift, best_scale = res.x % np.array([1.0, np.inf])
-    reduced_chi2 = res.fun / max(len(rate_obs) - 2, 1)
-    print(
-        f"Best-fit parameters:\n  Phase shift = {best_shift:.5f}\n  Scale factor = {best_scale:.5f}\n  Reduced χ² = {reduced_chi2:.3f}"
-    )
-    return float(best_shift), float(best_scale), float(reduced_chi2)
+        best_shift, best_scale = res.x % np.array([1.0, np.inf])
+        reduced_chi2 = res.fun / max(len(rate_obs) - 2, 1)
+        print(
+            f"Best-fit parameters:\n  Phase shift = {best_shift:.5f}\n  Scale factor = {best_scale:.5f}\n  Reduced χ² = {reduced_chi2:.3f}"
+        )
+        return float(best_shift), float(best_scale), float(reduced_chi2)
+    else:
+        # No optimization: compute chi-square with no shift and no scaling
+        best_shift = 0.0
+        best_scale = 1.0
+        chi2_value = chi2(np.array([best_shift, best_scale]))
+        reduced_chi2 = chi2_value / max(len(rate_obs) - 2, 1)
+        print(
+            f"Chi-square (no rescaling):\n  Phase shift = {best_shift:.5f} (fixed)\n  Scale factor = {best_scale:.5f} (fixed)\n  Reduced χ² = {reduced_chi2:.3f}"
+        )
+        return float(best_shift), float(best_scale), float(reduced_chi2)
 
 
 def plot_phase(
@@ -220,6 +473,8 @@ def plot_phase(
     sim_column: str = "fl",
     chi2: float | None = None,
     ax: plt.Axes | None = None,
+    rescaled: bool = False,
+    obs_column_name: str = "rate",
 ) -> None:
     """Scatter plot with optional best-fit simulation overlay.
     
@@ -241,6 +496,10 @@ def plot_phase(
         Reduced chi-squared value to annotate on plot.
     ax : Axes, optional
         Matplotlib axes to plot on. If None, creates a new figure.
+    rescaled : bool, default False
+        Whether the model was rescaled (optimized) or not.
+    obs_column_name : str, default "rate"
+        Name of the observable column being plotted (for labeling).
     """
     if ax is None:
         plt.figure(figsize=(10, 6))
@@ -271,11 +530,13 @@ def plot_phase(
         ax.plot(phase_overlay, flux_overlay, "k-", linewidth=2, label="Best-fit model")
 
     ax.set_xlabel("Orbital phase")
-    ax.set_ylabel("Count rate / Flux")
+    ylabel = obs_column_name.replace("_", " ").title() if obs_column_name != "rate" else "Count rate / Flux"
+    ax.set_ylabel(ylabel)
     
     # Set title with chi-squared annotation if provided
     if chi2 is not None:
-        ax.set_title(f"{sim_column}\nReduced χ² = {chi2:.3f}")
+        rescale_label = " (rescaled)" if rescaled else " (no rescaling)"
+        ax.set_title(f"{sim_column}\nReduced χ² = {chi2:.3f}{rescale_label}")
     else:
         ax.set_title("Chandra Light-curve Observations")
     
@@ -296,6 +557,8 @@ def plot_multi_column_fits(
     sim_df: pd.DataFrame,
     sim_columns: List[str],
     fit_results: List[tuple[float, float, float]],
+    rescaled: bool = False,
+    obs_column_name: str = "rate",
 ) -> None:
     """Plot multiple fitted simulation columns in a grid layout.
     
@@ -311,6 +574,10 @@ def plot_multi_column_fits(
         List of column names to plot.
     fit_results : list of tuples
         List of (shift, scale, chi2) tuples for each column.
+    rescaled : bool, default False
+        Whether the models were rescaled (optimized) or not.
+    obs_column_name : str, default "rate"
+        Name of the observable column being plotted (for labeling).
     """
     n_cols = len(sim_columns)
     
@@ -327,7 +594,7 @@ def plot_multi_column_fits(
     
     for i, (col, (shift, scale, chi2)) in enumerate(zip(sim_columns, fit_results)):
         ax = axes[i]
-        plot_phase(df, None, sim_df, shift, scale, col, chi2, ax)
+        plot_phase(df, None, sim_df, shift, scale, col, chi2, ax, rescaled, obs_column_name)
     
     # Hide unused subplots
     for i in range(n_cols, len(axes)):
@@ -348,7 +615,7 @@ def plot_multi_column_fits(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert Chandra observation times to orbital phase and plot the data.",
+        description="Convert X-ray observation times to orbital phase, plot light curves, and fit simulation models.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -356,7 +623,14 @@ def main() -> None:
         "--data-dir",
         type=str,
         default="data",
-        help="Directory containing Chandra observation text files.",
+        help="Directory containing observation text files (.txt format with time, rate, error columns).",
+    )
+    parser.add_argument(
+        "--master-file",
+        type=str,
+        default=None,
+        help="Name of master file in data directory (e.g., 'Chandra.txt'). If specified and exists, "
+             "only this file is loaded. If not specified, all .txt files in the directory are loaded.",
     )
     parser.add_argument(
         "--output",
@@ -367,7 +641,7 @@ def main() -> None:
     parser.add_argument(
         "--verify-master",
         action="store_true",
-        help="Verify that each individual 'chandra*.txt' file is contained in 'Chandra.txt'.",
+        help="Verify that each individual .txt file is contained in the master file (requires --master-file).",
     )
     parser.add_argument(
         "--sim-file",
@@ -376,33 +650,86 @@ def main() -> None:
         help="CSV file containing simulation results to fit.",
     )
     parser.add_argument(
+        "--obs-column",
+        type=str,
+        default=None,
+        help="Column name in observation files to use (e.g., 'NET_RATE', 'FLUX', 'COUNT_RATE'). "
+             "If the observation files have headers, this column name will be used. "
+             "If not specified, uses 'rate' (assumes 3-column headerless format).",
+    )
+    parser.add_argument(
+        "--obs-error-column",
+        type=str,
+        default=None,
+        help="Column name for observation errors (e.g., 'ERR_RATE', 'FLUX_ERR'). "
+             "If not specified, will attempt to auto-detect based on --obs-column.",
+    )
+    parser.add_argument(
         "--sim-column",
         type=str,
         nargs='+',
-        default=["nfl_soft_av", "nfl_hard_av", "nfl_soft_cv", "nfl_hard_cv"],
-        help="Column name(s) in simulation CSV to use as model flux. Can specify multiple columns separated by spaces.",
+        default=None,
+        help="Column name(s) in simulation CSV to use as model flux. Can specify multiple columns separated by spaces. "
+             "If not specified, will auto-detect all available scaled flux columns (nfl_*, pho_count_*).",
     )
     parser.add_argument(
         "--fit",
         action="store_true",
         help="Perform χ² minimization to fit simulation to observations.",
     )
+    parser.add_argument(
+        "--rescale",
+        action="store_true",
+        help="Optimize phase shift and flux scale to minimize χ². "
+             "By default, chi-square is computed without rescaling (shift=0, scale=1).",
+    )
 
     args = parser.parse_args()
 
     if args.verify_master:
-        verify_master_contains_individual(args.data_dir)
+        if not args.master_file:
+            parser.error("--verify-master requires --master-file to be specified.")
+        verify_master_contains_individual(args.data_dir, args.master_file)
 
-    df = load_data(args.data_dir)
+    # Determine observation column to use
+    obs_column = args.obs_column if args.obs_column else "rate"
+    obs_error_column = args.obs_error_column
+    
+    if args.obs_column:
+        print(f"Using observation column: {obs_column}")
+        if obs_error_column:
+            print(f"Using error column: {obs_error_column}")
+        else:
+            print(f"Error column will be auto-detected")
+    
+    df = load_data(args.data_dir, args.master_file, obs_column, obs_error_column)
     print(f"Loaded {len(df)} data point(s) from {df['obs'].nunique()} observation(s).")
+    
+    # Show which columns are present in the loaded data
+    if 'error' in df.columns:
+        print(f"Using data column: '{obs_column}' (with error column)")
+    else:
+        print(f"Using data column: '{obs_column}' (no error column found)")
 
     if args.fit:
         if not args.sim_file:
             parser.error("--fit requires --sim-file to be specified.")
+        
+        print(f"Loading simulation file: {args.sim_file}")
         sim_df = pd.read_csv(args.sim_file)
         
-        # Handle multiple columns
-        sim_columns = args.sim_column if isinstance(args.sim_column, list) else [args.sim_column]
+        # Auto-detect or validate columns
+        if args.sim_column is None:
+            # Auto-detect all flux columns
+            sim_columns = detect_flux_columns(sim_df)
+            if not sim_columns:
+                parser.error("No scaled flux columns found in simulation file. Expected columns like nfl_* or pho_count_*")
+            print(f"Auto-detected {len(sim_columns)} scaled flux column(s): {sim_columns}")
+        else:
+            # Validate user-specified columns
+            requested_columns = args.sim_column if isinstance(args.sim_column, list) else [args.sim_column]
+            sim_columns = validate_sim_columns(sim_df, requested_columns)
+            print(f"Using {len(sim_columns)} flux column(s): {sim_columns}")
         
         # Fit each column
         fit_results = []
@@ -410,19 +737,24 @@ def main() -> None:
             print(f"\n{'='*60}")
             print(f"Fitting column: {col}")
             print('='*60)
-            shift, scale, chi2 = fit_simulation(df, sim_df, col)
-            fit_results.append((shift, scale, chi2))
+            try:
+                shift, scale, chi2 = fit_simulation(df, sim_df, col, rescale=args.rescale)
+                fit_results.append((shift, scale, chi2))
+            except Exception as e:
+                print(f"⚠️  Failed to fit column '{col}': {e}")
+                # Add dummy values so we can still plot other columns
+                fit_results.append((0.0, 1.0, float('nan')))
         
         # Plot based on number of columns
         if len(sim_columns) == 1:
             # Single column: use original plot
             shift, scale, chi2 = fit_results[0]
-            plot_phase(df, args.output, sim_df, shift, scale, sim_columns[0], chi2)
+            plot_phase(df, args.output, sim_df, shift, scale, sim_columns[0], chi2, rescaled=args.rescale, obs_column_name=obs_column)
         else:
             # Multiple columns: use grid plot
-            plot_multi_column_fits(df, args.output, sim_df, sim_columns, fit_results)
+            plot_multi_column_fits(df, args.output, sim_df, sim_columns, fit_results, rescaled=args.rescale, obs_column_name=obs_column)
     else:
-        plot_phase(df, args.output)
+        plot_phase(df, args.output, obs_column_name=obs_column)
 
 
 if __name__ == "__main__":
