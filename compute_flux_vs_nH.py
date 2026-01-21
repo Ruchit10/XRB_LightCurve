@@ -155,49 +155,79 @@ def load_data(pha_or_pi: str, bkg: Optional[str], rmf: Optional[str], arf: Optio
         os.chdir(cwd)
 
 
-def fit_baseline_model(model_expr: str = "tbabs*powerlaw") -> None:
-    """Fit a baseline model and freeze non-absorption parameters."""
+def setup_model_with_params(model_expr: str = "tbabs*powerlaw",
+                            nH: float = 0.572385,
+                            PhoIndex: float = 1.92146,
+                            norm: float = 3.37606e-04) -> None:
+    """Set up the model with pre-fitted parameter values (no fitting performed).
+    
+    Uses user-specified parameter values and freezes the continuum parameters
+    so only nH can be varied later.
+    
+    Args:
+        model_expr: XSPEC model expression
+        nH: Hydrogen column density in 10^22 cm^-2 (default: 0.572385)
+        PhoIndex: Power-law photon index (default: 1.92146)
+        norm: Power-law normalization (default: 3.37606e-04)
+    """
+    # Set abundance and cross-section tables
+    Xset.abund = "wilm"
+    Xset.xsect = "vern"
+    
     Model(model_expr)
 
-    # Reasonable starting values
+    # Ensure ALL channels are noticed (no energy filtering)
     try:
-        # tbabs.nH in 1e22 units - try both capitalizations
+        AllData.notice("all")
+        print("Noticed all channels")
+    except Exception as e:
+        print(f"Warning: Could not notice all channels: {e}")
+
+    # Set pre-fitted parameter values for absorption component (tbabs or phabs)
+    try:
         model = AllModels(1)
         if hasattr(model, 'TBabs'):
-            model.TBabs.nH = 0.511314
+            model.TBabs.nH = nH
         elif hasattr(model, 'tbabs'):
-            model.tbabs.nH = 0.511314
-    except Exception:
-        pass
+            model.tbabs.nH = nH
+        elif hasattr(model, 'phabs'):
+            model.phabs.nH = nH
+        elif hasattr(model, 'Phabs'):
+            model.Phabs.nH = nH
+        else:
+            print(f"Warning: No recognized absorption model found (tbabs/phabs)")
+    except Exception as e:
+        print(f"Warning: Could not set nH: {e}")
+    
     try:
-        # Set powerlaw parameters - try both capitalizations
         model = AllModels(1)
         if hasattr(model, 'powerlaw'):
-            model.powerlaw.PhoIndex = 1.84513
-            model.powerlaw.norm = 3.05926e-04
+            model.powerlaw.PhoIndex = PhoIndex
+            model.powerlaw.norm = norm
         elif hasattr(model, 'Powerlaw'):
-            model.Powerlaw.PhoIndex = 1.84513
-            model.Powerlaw.norm = 3.05926e-04
-    except Exception:
-        pass
+            model.Powerlaw.PhoIndex = PhoIndex
+            model.Powerlaw.norm = norm
+    except Exception as e:
+        print(f"Warning: Could not set powerlaw parameters: {e}")
 
-    # Fit
-    Fit.method = "leven"
-    Fit.statMethod = "chi"
-    Fit.query = "yes"
+    # Print the parameters being used
+    print(f"Using pre-fitted model parameters (no fitting):")
+    print(f"  nH = {nH:.6f} (10^22 cm^-2)")
+    print(f"  PhoIndex = {PhoIndex:.5f}")
+    print(f"  norm = {norm:.5e}")
+    
+    # Verify parameters are set by printing chi-squared statistic
     try:
-        Fit.perform()
-    except Exception:
-        pass
+        # Query the fit statistic without actually fitting
+        Fit.statMethod = "chi"
+        chi_sq = Fit.statistic
+        dof = Fit.dof
+        print(f"  Chi-squared (with these params) = {chi_sq:.2f}, DOF = {dof}")
+        print(f"  Reduced chi-squared = {chi_sq/dof:.3f}")
+    except Exception as e:
+        print(f"  (Could not compute chi-squared: {e})")
 
-    # Ensure best-fit parameters are used thereafter
-    try:
-        Xset.command("save all xspec_fit_tmp.xcm")
-        Xset.command("@xspec_fit_tmp.xcm")
-    except Exception:
-        pass
-
-    # Freeze continuum so only nH varies
+    # Freeze continuum so only nH varies when computing flux grid
     try:
         model = AllModels(1)
         if hasattr(model, 'powerlaw'):
@@ -206,6 +236,7 @@ def fit_baseline_model(model_expr: str = "tbabs*powerlaw") -> None:
         elif hasattr(model, 'Powerlaw'):
             model.Powerlaw.PhoIndex.frozen = True
             model.Powerlaw.norm.frozen = True
+        print("Froze powerlaw parameters (PhoIndex, norm)")
     except Exception:
         pass
 
@@ -427,15 +458,24 @@ def fit_exponential_decay(nH_cm2: np.ndarray, flux: np.ndarray) -> Tuple[float, 
 def vary_nh_and_compute(specdir: str,
                         nH_values_cm2: np.ndarray,
                         bands: dict,
-                        model_expr: str = "tbabs*powerlaw") -> pd.DataFrame:
+                        model_expr: str = "tbabs*powerlaw",
+                        nH: float = 0.572385,
+                        PhoIndex: float = 1.92146,
+                        norm: float = 3.37606e-04) -> pd.DataFrame:
     """
     For each nH (cm^-2), set tbabs.nH and compute photon flux in specified bands.
+    
+    Sets up the model with pre-fitted parameters (no fitting performed),
+    then varies nH and computes flux for each specified energy band.
     
     Args:
         specdir: Directory containing spectrum files
         nH_values_cm2: Array of nH values in cm^-2
         bands: Dictionary mapping band names to (E_min, E_max) tuples in keV
         model_expr: XSPEC model expression
+        nH: Pre-fitted hydrogen column density in 10^22 cm^-2 (default: 0.572385)
+        PhoIndex: Pre-fitted power-law photon index (default: 1.92146)
+        norm: Pre-fitted power-law normalization (default: 3.37606e-04)
     
     Returns:
         DataFrame with columns: nH_cm2, nH_1e22, flux_{band}_ph, flux_{band}_erg for each band
@@ -443,11 +483,7 @@ def vary_nh_and_compute(specdir: str,
     src, bkg, rmf, arf = find_spectrum_files(specdir)
     load_data(src, bkg, rmf, arf)
 
-    # XSPEC settings for reproducibility
-    Xset.abund = "wilm"
-    Xset.xsect = "vern"
-
-    fit_baseline_model(model_expr)
+    setup_model_with_params(model_expr, nH=nH, PhoIndex=PhoIndex, norm=norm)
 
     results = []
     for nH_cm2 in nH_values_cm2:
@@ -458,16 +494,20 @@ def vary_nh_and_compute(specdir: str,
         }
         
         try:
-            # Try both possible capitalizations of tbabs/TBabs
+            # Try both possible capitalizations of tbabs/TBabs and phabs/Phabs
             model = AllModels(1)
             if hasattr(model, 'TBabs'):
                 model.TBabs.nH = nH_1e22
             elif hasattr(model, 'tbabs'):
                 model.tbabs.nH = nH_1e22
+            elif hasattr(model, 'phabs'):
+                model.phabs.nH = nH_1e22
+            elif hasattr(model, 'Phabs'):
+                model.Phabs.nH = nH_1e22
             else:
-                raise AttributeError("Model has neither 'TBabs' nor 'tbabs' component")
+                raise AttributeError("Model has no recognized absorption component (tbabs/phabs)")
         except Exception as e:
-            # If model isn't tbabs-based, fill with NaNs for all bands
+            # If model doesn't have recognized absorption, fill with NaNs for all bands
             for band_name in bands.keys():
                 result_row[f"flux_{band_name}_ph"] = float("nan")
                 result_row[f"flux_{band_name}_erg"] = float("nan")
@@ -521,11 +561,33 @@ def main():
         "--model",
         type=str,
         default="tbabs*powerlaw",
-        help="XSPEC model expression to fit before varying nH",
+        choices=["tbabs*powerlaw", "phabs*powerlaw"],
+        help="XSPEC absorption model (parameters set from pre-fitted values, no fitting performed)",
     )
-    parser.add_argument("--nH_min", type=float, default=1e20, help="Min nH (cm^-2)")
-    parser.add_argument("--nH_max", type=float, default=1e24, help="Max nH (cm^-2)")
-    parser.add_argument("--nH_points", type=int, default=50, help="Number of nH grid points (log-spaced)")
+    
+    # Pre-fitted model parameters (no fitting performed)
+    parser.add_argument(
+        "--nH",
+        type=float,
+        default=0.572385,
+        help="Pre-fitted nH value in 10^22 cm^-2 (from XSPEC fit)",
+    )
+    parser.add_argument(
+        "--PhoIndex",
+        type=float,
+        default=1.92146,
+        help="Pre-fitted power-law photon index (from XSPEC fit)",
+    )
+    parser.add_argument(
+        "--norm",
+        type=float,
+        default=3.37606e-04,
+        help="Pre-fitted power-law normalization (from XSPEC fit)",
+    )
+    
+    parser.add_argument("--nH_min", type=float, default=1e15, help="Min nH (cm^-2) for flux grid")
+    parser.add_argument("--nH_max", type=float, default=1e26, help="Max nH (cm^-2) for flux grid")
+    parser.add_argument("--nH_points", type=int, default=1000, help="Number of nH grid points (log-spaced)")
 
     parser.add_argument("--out_csv", type=str, default="flux_vs_nH.csv", help="Output CSV filename")
     parser.add_argument("--out_png", type=str, default="flux_vs_nH.png", help="Output PNG filename")
@@ -563,12 +625,15 @@ def main():
     # Build nH grid (log-spaced)
     nH_values_cm2 = np.logspace(np.log10(args.nH_min), np.log10(args.nH_max), args.nH_points)
 
-    # Compute
+    # Compute flux vs nH using pre-fitted model parameters
     df = vary_nh_and_compute(
         specdir=args.specdir,
         nH_values_cm2=nH_values_cm2,
         bands=bands,
         model_expr=args.model,
+        nH=args.nH,
+        PhoIndex=args.PhoIndex,
+        norm=args.norm,
     )
 
     # Save CSV

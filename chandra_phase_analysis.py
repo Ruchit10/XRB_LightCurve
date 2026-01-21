@@ -49,6 +49,14 @@ $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
     --obs-column NET_RATE --sim-column nfl_broad_av --rescale --output fit.png
 
+# Load CIAO format data (time in second column, flux as ECF):
+$ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
+    --obs-column ECF --output ciao_plot.png
+
+# Fit CIAO data to simulation:
+$ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
+    --obs-column ECF --fit --sim-file sim.csv --output ciao_fit.png
+
 Dependencies: numpy, pandas, matplotlib, scipy (in requirements.txt).
 """
 from __future__ import annotations
@@ -153,12 +161,16 @@ def validate_sim_columns(df: pd.DataFrame, requested_columns: List[str]) -> List
     return valid_columns
 
 
-def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_error_column: Optional[str] = None) -> pd.DataFrame:
+def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None) -> pd.DataFrame:
     """Read a single Chandra observation text file.
 
     The files can be whitespace-delimited with or without headers.
     If a header is present (lines starting with #), column names are extracted.
     Otherwise, assumes three columns: time, count rate/flux, error.
+    
+    Supports two formats:
+    1. Standard format: TIME in first column, tab or space delimited
+    2. CIAO format: time in second column (after dt), space delimited, with "#Columns:" header
     
     Parameters
     ----------
@@ -167,11 +179,14 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
     label : str
         Label for this observation
     obs_column : str, default "rate"
-        Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE").
+        Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE", "ECF").
         If file has no header, this is ignored and "rate" is used.
     obs_error_column : str, optional
         Name of column to use for errors. If None, will attempt to auto-detect based on obs_column
         (e.g., "ERR_RATE" for "NET_RATE", "FLUX_ERR" for "FLUX").
+    time_column : str, optional
+        Name of column containing timestamps (e.g., "TIME", "time"). If None, will auto-detect
+        by looking for a column named 'time' (case-insensitive).
     
     Returns
     -------
@@ -180,40 +195,77 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
     """
     # Try to read with header detection
     try:
-        # Read file and check for header
+        # Read file and check for header format
         with open(file_path, 'r') as f:
-            first_line = f.readline().strip()
+            lines = []
+            for line in f:
+                lines.append(line.strip())
+                if not line.strip().startswith('#') or len(lines) > 10:
+                    break
         
-        # Check if file has a header (starts with # and contains column names)
-        if first_line.startswith('#') and any(col_name in first_line.upper() for col_name in ['TIME', 'RATE', 'FLUX', 'COUNTS']):
-            # Read with header - skip comment lines until we find the column names
-            df = pd.read_csv(file_path, delim_whitespace=True, comment='#', header=None)
-            
-            # Extract column names from the last comment line before data
-            with open(file_path, 'r') as f:
-                header_line = None
-                for line in f:
-                    if line.strip().startswith('#'):
-                        # Check if this line has column-like content (no ":" or "=" which indicate metadata)
-                        if ':' not in line and '=' not in line and any(name in line.upper() for name in ['TIME', 'RATE', 'FLUX']):
-                            header_line = line.strip().lstrip('#').strip()
-                    else:
-                        break
+        # Check for CIAO format with "#Columns:" header
+        ciao_format = False
+        header_line = None
+        for line in lines:
+            if line.startswith('#') and '#Columns:' in line:
+                # CIAO format: "# #Columns: dt, time, counts, count_rate, count_rate_err, ECF"
+                ciao_format = True
+                # Extract column names after "#Columns:"
+                col_part = line.split('#Columns:')[1].strip()
+                col_names = [c.strip() for c in col_part.split(',')]
+                header_line = ' '.join(col_names)
+                break
+            elif line.startswith('#') and not ciao_format:
+                # Standard format: check if this line has column-like content
+                # Skip lines with ":" or "=" which indicate metadata (except #Columns:)
+                clean_line = line.lstrip('#').strip()
+                if clean_line and ':' not in clean_line and '=' not in clean_line:
+                    if any(name in line.upper() for name in ['TIME', 'RATE', 'FLUX']):
+                        header_line = clean_line
+        
+        # Check if file has a header
+        has_header = header_line is not None or any(
+            any(col_name in line.upper() for col_name in ['TIME', 'RATE', 'FLUX', 'COUNTS', 'ECF'])
+            for line in lines if line.startswith('#')
+        )
+        
+        if has_header:
+            # Read with header - skip comment lines
+            df = pd.read_csv(file_path, sep='\\s+', comment='#', header=None)
             
             if header_line:
                 col_names = header_line.split()
                 if len(col_names) == len(df.columns):
                     df.columns = col_names
                     
-                    # Ensure time column exists (case-insensitive)
+                    # Find time column (case-insensitive, or use user-specified)
                     time_col = None
-                    for col in df.columns:
-                        if col.upper() == 'TIME':
-                            time_col = col
-                            break
+                    if time_column:
+                        # User specified time column
+                        for col in df.columns:
+                            if col.upper() == time_column.upper():
+                                time_col = col
+                                break
+                        if not time_col:
+                            print(f"⚠️  Warning: Specified time column '{time_column}' not found in {file_path}")
+                            print(f"   Available columns: {list(df.columns)}")
+                    
+                    if not time_col:
+                        # Auto-detect time column
+                        for col in df.columns:
+                            if col.upper() == 'TIME':
+                                time_col = col
+                                break
                     
                     if time_col:
-                        if obs_column not in df.columns:
+                        # Case-insensitive column matching for obs_column
+                        actual_obs_column = None
+                        for col in df.columns:
+                            if col.upper() == obs_column.upper():
+                                actual_obs_column = col
+                                break
+                        
+                        if not actual_obs_column:
                             # Column not found - print available columns and raise error
                             print(f"⚠️  Error: Column '{obs_column}' not found in {file_path}")
                             print(f"   Available columns: {list(df.columns)}")
@@ -222,31 +274,43 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
                         # Use specified columns
                         result_df = pd.DataFrame({
                             'time': df[time_col],
-                            'rate': df[obs_column],
+                            'rate': df[actual_obs_column],
                         })
                         
                         # Try to find error column
                         error_col = None
-                        if obs_error_column and obs_error_column in df.columns:
-                            error_col = obs_error_column
-                        else:
+                        if obs_error_column:
+                            # Check for user-specified error column (case-insensitive)
+                            for col in df.columns:
+                                if col.upper() == obs_error_column.upper():
+                                    error_col = col
+                                    break
+                        
+                        if not error_col:
                             # Auto-detect error column
                             possible_error_cols = [
-                                f"{obs_column}_ERR",
-                                f"ERR_{obs_column}",
-                                obs_column.replace("RATE", "ERR_RATE").replace("FLUX", "FLUX_ERR"),
+                                f"{actual_obs_column}_ERR",
+                                f"ERR_{actual_obs_column}",
+                                actual_obs_column.replace("RATE", "ERR_RATE").replace("FLUX", "FLUX_ERR"),
+                                # For CIAO format, try count_rate_err
+                                "count_rate_err",
                             ]
                             for err_col in possible_error_cols:
-                                if err_col in df.columns:
-                                    error_col = err_col
-                                    break
-                            
-                            # Also try case-insensitive matching
-                            if not error_col:
                                 for col in df.columns:
-                                    if 'ERR' in col.upper() and obs_column.split('_')[0] in col.upper():
+                                    if col.upper() == err_col.upper():
                                         error_col = col
                                         break
+                                if error_col:
+                                    break
+                            
+                            # Also try case-insensitive matching for generic error columns
+                            if not error_col:
+                                for col in df.columns:
+                                    if 'ERR' in col.upper():
+                                        # Prefer error column related to the obs column
+                                        if actual_obs_column.split('_')[0].upper() in col.upper():
+                                            error_col = col
+                                            break
                         
                         if error_col:
                             result_df['error'] = df[error_col]
@@ -277,7 +341,7 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
 # Data loading helpers
 # -----------------------------------------------------------------------------
 
-def load_data(data_dir: str, master_file: Optional[str] = None, obs_column: str = "rate", obs_error_column: Optional[str] = None) -> pd.DataFrame:
+def load_data(data_dir: str, master_file: Optional[str] = None, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None) -> pd.DataFrame:
     """Load observational data from *data_dir*.
 
     Parameters
@@ -288,9 +352,11 @@ def load_data(data_dir: str, master_file: Optional[str] = None, obs_column: str 
         Name of master file (if it exists). If provided and exists, only this file is loaded.
         If None, all .txt files in the directory are loaded.
     obs_column : str, default "rate"
-        Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE")
+        Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE", "ECF")
     obs_error_column : str, optional
         Name of column to use for errors. If None, will auto-detect based on obs_column.
+    time_column : str, optional
+        Name of column containing timestamps. If None, will auto-detect (looks for 'time').
 
     Returns
     -------
@@ -301,7 +367,7 @@ def load_data(data_dir: str, master_file: Optional[str] = None, obs_column: str 
         master_path = os.path.join(data_dir, master_file)
         if os.path.isfile(master_path):
             print(f"Using master file: {master_path}")
-            return read_observation(master_path, "master", obs_column, obs_error_column)
+            return read_observation(master_path, "master", obs_column, obs_error_column, time_column)
         else:
             print(f"Warning: Master file '{master_file}' not found in {data_dir}, loading all files instead.")
 
@@ -315,8 +381,111 @@ def load_data(data_dir: str, master_file: Optional[str] = None, obs_column: str 
         )
 
     print(f"Loading {len(files)} observation file(s) from {data_dir}")
-    dfs = [read_observation(fp, os.path.basename(fp), obs_column, obs_error_column) for fp in files]
+    dfs = [read_observation(fp, os.path.basename(fp), obs_column, obs_error_column, time_column) for fp in files]
     return pd.concat(dfs, ignore_index=True)
+
+
+def phase_bin_data(
+    df: pd.DataFrame,
+    n_bins: int = 50,
+    min_points_per_bin: int = 3,
+    rate_column: str = 'rate',
+    error_column: str = 'error',
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Bin observed data into orbital phase bins.
+    
+    This function groups data points by orbital phase and computes weighted
+    averages within each bin. Useful for reducing scatter in light curves
+    and for comparing with phase-folded models.
+    
+    Parameters
+    ----------
+    df : DataFrame
+        Observed data with columns: phase, and the rate/error columns
+    n_bins : int
+        Number of phase bins (default 50)
+    min_points_per_bin : int
+        Minimum number of data points required per bin (default 3)
+    rate_column : str
+        Name of column containing flux/rate values (default 'rate')
+    error_column : str
+        Name of column containing error values (default 'error')
+    verbose : bool
+        Print summary of binning operation (default True)
+        
+    Returns
+    -------
+    DataFrame with columns: phase, rate (binned), error (binned), n_points
+    
+    Notes
+    -----
+    - Uses weighted mean if errors are available, otherwise simple mean
+    - Bins with fewer than min_points_per_bin are excluded
+    - Error on weighted mean is computed as sqrt(1/sum(weights))
+    """
+    # Create bin edges
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    
+    # Assign each point to a bin
+    df = df.copy()
+    df['_bin'] = np.digitize(df['phase'], bin_edges) - 1
+    df['_bin'] = df['_bin'].clip(0, n_bins - 1)  # Handle edge case at phase=1
+    
+    binned_data = []
+    
+    for i in range(n_bins):
+        bin_mask = df['_bin'] == i
+        bin_df = df[bin_mask]
+        
+        if len(bin_df) >= min_points_per_bin:
+            # Get rate values
+            rate_vals = bin_df[rate_column].values
+            
+            # If errors are available, use weighted mean
+            has_errors = (error_column in bin_df.columns and 
+                         not bin_df[error_column].isna().all())
+            
+            if has_errors:
+                err_vals = bin_df[error_column].values
+                # Replace zero/nan errors with median of valid errors
+                valid_err = err_vals[(err_vals > 0) & np.isfinite(err_vals)]
+                if len(valid_err) > 0:
+                    median_err = np.median(valid_err)
+                    err_vals = np.where((err_vals <= 0) | ~np.isfinite(err_vals), 
+                                       median_err, err_vals)
+                else:
+                    err_vals = np.ones_like(rate_vals) * np.std(rate_vals)
+                
+                weights = 1.0 / err_vals**2
+                mean_rate = np.average(rate_vals, weights=weights)
+                # Standard error of weighted mean
+                mean_err = np.sqrt(1.0 / np.sum(weights))
+            else:
+                # Simple mean and standard error
+                mean_rate = np.mean(rate_vals)
+                mean_err = np.std(rate_vals) / np.sqrt(len(rate_vals))
+            
+            binned_data.append({
+                'phase': bin_centers[i],
+                'rate': mean_rate,
+                'error': mean_err,
+                'n_points': len(bin_df)
+            })
+    
+    result = pd.DataFrame(binned_data)
+    
+    # Preserve observation label if present (use 'binned')
+    if 'obs' in df.columns:
+        result['obs'] = 'binned'
+    
+    if verbose:
+        print(f"Phase binning: {len(df)} points -> {len(result)} bins "
+              f"(avg {len(df)/n_bins:.1f} points/bin)")
+    
+    return result
 
 
 def verify_master_contains_individual(data_dir: str, master_file: str = "Chandra.txt") -> None:
@@ -475,13 +644,14 @@ def plot_phase(
     ax: plt.Axes | None = None,
     rescaled: bool = False,
     obs_column_name: str = "rate",
+    is_binned: bool = False,
 ) -> None:
     """Scatter plot with optional best-fit simulation overlay.
     
     Parameters
     ----------
     df : DataFrame
-        Observational data with columns ``phase``, ``rate``.
+        Observational data with columns ``phase``, ``rate``, and optionally ``error``.
     output_path : str, optional
         Output filename to save the plot.
     sim_df : DataFrame, optional
@@ -500,13 +670,27 @@ def plot_phase(
         Whether the model was rescaled (optimized) or not.
     obs_column_name : str, default "rate"
         Name of the observable column being plotted (for labeling).
+    is_binned : bool, default False
+        Whether the data has been phase-binned. If True, plots with error bars.
     """
     if ax is None:
         plt.figure(figsize=(10, 6))
         ax = plt.gca()
 
+    # Check if we have error data
+    has_errors = 'error' in df.columns and not df['error'].isna().all()
+    
     for label, group in df.groupby("obs"):
-        ax.scatter(group["phase"], group["rate"], s=12, alpha=0.7, label=label)
+        if is_binned and has_errors:
+            # Plot with error bars for binned data
+            ax.errorbar(
+                group["phase"], group["rate"], yerr=group["error"],
+                fmt='o', markersize=5, alpha=0.8, capsize=2, elinewidth=1,
+                label=f"{label} (n={len(group)} bins)"
+            )
+        else:
+            # Scatter plot for unbinned data
+            ax.scatter(group["phase"], group["rate"], s=12, alpha=0.7, label=label)
 
     if sim_df is not None and shift is not None and scale is not None:
         # Prepare simulation curve for overlay
@@ -559,6 +743,7 @@ def plot_multi_column_fits(
     fit_results: List[tuple[float, float, float]],
     rescaled: bool = False,
     obs_column_name: str = "rate",
+    is_binned: bool = False,
 ) -> None:
     """Plot multiple fitted simulation columns in a grid layout.
     
@@ -578,6 +763,8 @@ def plot_multi_column_fits(
         Whether the models were rescaled (optimized) or not.
     obs_column_name : str, default "rate"
         Name of the observable column being plotted (for labeling).
+    is_binned : bool, default False
+        Whether the data has been phase-binned.
     """
     n_cols = len(sim_columns)
     
@@ -594,7 +781,7 @@ def plot_multi_column_fits(
     
     for i, (col, (shift, scale, chi2)) in enumerate(zip(sim_columns, fit_results)):
         ax = axes[i]
-        plot_phase(df, None, sim_df, shift, scale, col, chi2, ax, rescaled, obs_column_name)
+        plot_phase(df, None, sim_df, shift, scale, col, chi2, ax, rescaled, obs_column_name, is_binned)
     
     # Hide unused subplots
     for i in range(n_cols, len(axes)):
@@ -665,6 +852,14 @@ def main() -> None:
              "If not specified, will attempt to auto-detect based on --obs-column.",
     )
     parser.add_argument(
+        "--time-column",
+        type=str,
+        default=None,
+        help="Column name for timestamps (e.g., 'TIME', 'time'). "
+             "If not specified, will auto-detect by looking for a column named 'time'. "
+             "Useful for CIAO format files where time may be in a different column.",
+    )
+    parser.add_argument(
         "--sim-column",
         type=str,
         nargs='+',
@@ -683,6 +878,27 @@ def main() -> None:
         help="Optimize phase shift and flux scale to minimize χ². "
              "By default, chi-square is computed without rescaling (shift=0, scale=1).",
     )
+    
+    # Phase binning options
+    parser.add_argument(
+        "--n-phase-bins",
+        type=int,
+        default=50,
+        help="Number of phase bins for binning the data (default: 50). "
+             "Binning reduces scatter by averaging data within each phase bin.",
+    )
+    parser.add_argument(
+        "--no-phase-bin",
+        action="store_true",
+        help="Disable phase binning and use raw data points instead.",
+    )
+    parser.add_argument(
+        "--min-points-per-bin",
+        type=int,
+        default=3,
+        help="Minimum number of data points required per bin (default: 3). "
+             "Bins with fewer points are excluded.",
+    )
 
     args = parser.parse_args()
 
@@ -694,6 +910,7 @@ def main() -> None:
     # Determine observation column to use
     obs_column = args.obs_column if args.obs_column else "rate"
     obs_error_column = args.obs_error_column
+    time_column = args.time_column
     
     if args.obs_column:
         print(f"Using observation column: {obs_column}")
@@ -701,8 +918,10 @@ def main() -> None:
             print(f"Using error column: {obs_error_column}")
         else:
             print(f"Error column will be auto-detected")
+    if time_column:
+        print(f"Using time column: {time_column}")
     
-    df = load_data(args.data_dir, args.master_file, obs_column, obs_error_column)
+    df = load_data(args.data_dir, args.master_file, obs_column, obs_error_column, time_column)
     print(f"Loaded {len(df)} data point(s) from {df['obs'].nunique()} observation(s).")
     
     # Show which columns are present in the loaded data
@@ -710,6 +929,19 @@ def main() -> None:
         print(f"Using data column: '{obs_column}' (with error column)")
     else:
         print(f"Using data column: '{obs_column}' (no error column found)")
+    
+    # Apply phase binning if requested
+    is_binned = False
+    if not args.no_phase_bin:
+        df = phase_bin_data(
+            df,
+            n_bins=args.n_phase_bins,
+            min_points_per_bin=args.min_points_per_bin,
+            rate_column='rate',
+            error_column='error',
+            verbose=True
+        )
+        is_binned = True
 
     if args.fit:
         if not args.sim_file:
@@ -749,12 +981,14 @@ def main() -> None:
         if len(sim_columns) == 1:
             # Single column: use original plot
             shift, scale, chi2 = fit_results[0]
-            plot_phase(df, args.output, sim_df, shift, scale, sim_columns[0], chi2, rescaled=args.rescale, obs_column_name=obs_column)
+            plot_phase(df, args.output, sim_df, shift, scale, sim_columns[0], chi2, 
+                      rescaled=args.rescale, obs_column_name=obs_column, is_binned=is_binned)
         else:
             # Multiple columns: use grid plot
-            plot_multi_column_fits(df, args.output, sim_df, sim_columns, fit_results, rescaled=args.rescale, obs_column_name=obs_column)
+            plot_multi_column_fits(df, args.output, sim_df, sim_columns, fit_results, 
+                                  rescaled=args.rescale, obs_column_name=obs_column, is_binned=is_binned)
     else:
-        plot_phase(df, args.output, obs_column_name=obs_column)
+        plot_phase(df, args.output, obs_column_name=obs_column, is_binned=is_binned)
 
 
 if __name__ == "__main__":

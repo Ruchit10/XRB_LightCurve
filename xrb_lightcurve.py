@@ -780,7 +780,7 @@ def main():
         type=float,
         default=0.589537,
         help="Scaling parameter to convert flx to nH (in 1e22 cm^-2 units). "
-        "Default: 0.589537 (legacy). Use XSPEC fitted value (0.511314) for better accuracy. "
+        "Default: 0.589537 (legacy). Use XSPEC fitted value (0.572385) for better accuracy. "
         "Get XSPEC value with: python get_xspec_nH.py",
     )
     parser.add_argument(
