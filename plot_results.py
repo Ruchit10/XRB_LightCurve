@@ -9,11 +9,75 @@ import matplotlib.pyplot as plt
 import numpy as np
 import argparse
 import sys
+import re
+from typing import List, Dict, Tuple
+
+
+# Energy band display names and energy ranges (keV)
+BAND_INFO: Dict[str, Tuple[str, str]] = {
+    "ultrasoft": ("Ultra-soft", "0.2-0.5 keV"),
+    "soft": ("Soft", "0.5-2 keV"),
+    "medium": ("Medium", "2-4 keV"),
+    "hard": ("Hard", "2-10 keV"),
+    "broad": ("Broad", "0.5-10 keV"),
+}
+
+
+def detect_energy_bands(df: pd.DataFrame) -> List[str]:
+    """
+    Auto-detect available energy band columns in the DataFrame.
+    
+    Looks for columns matching patterns:
+    - nfl_{band}_av (accelerated velocity wind model)
+    - nfl_{band}_cv (constant velocity wind model)
+    
+    Args:
+        df: DataFrame with simulation results
+        
+    Returns:
+        List of detected band names (e.g., ['soft', 'hard', 'broad'])
+    """
+    bands = set()
+    pattern = re.compile(r"nfl_(\w+)_(av|cv)")
+    
+    for col in df.columns:
+        match = pattern.match(col)
+        if match:
+            bands.add(match.group(1))
+    
+    # Sort bands in a logical order if they match known bands
+    known_order = ["ultrasoft", "soft", "medium", "hard", "broad"]
+    sorted_bands = []
+    for band in known_order:
+        if band in bands:
+            sorted_bands.append(band)
+            bands.discard(band)
+    # Add any remaining unknown bands
+    sorted_bands.extend(sorted(bands))
+    
+    return sorted_bands
+
+
+def get_band_display_name(band: str) -> Tuple[str, str]:
+    """
+    Get display name and energy range for a band.
+    
+    Args:
+        band: Band name (e.g., 'soft', 'hard')
+        
+    Returns:
+        Tuple of (display_name, energy_range) or defaults if unknown
+    """
+    if band in BAND_INFO:
+        return BAND_INFO[band]
+    # For unknown bands, capitalize the name
+    return (band.replace("_", " ").title(), "")
 
 
 def plot_lightcurve(data_file, output_file=None):
     """
     Create comprehensive plots of the lightcurve simulation results.
+    Auto-detects available energy bands and creates appropriate subplots.
 
     Args:
         data_file: Path to the CSV file with simulation results
@@ -26,57 +90,91 @@ def plot_lightcurve(data_file, output_file=None):
         print(f"Error: File {data_file} not found!")
         return
 
+    # Auto-detect energy bands
+    bands = detect_energy_bands(df)
+    print(f"Detected energy bands: {bands}")
+    
+    # Determine number of plots needed:
+    # - 2 base plots (Flux vs Phase, Scaled Flux vs Phase) if flx/fl columns exist
+    # - 1 plot per detected energy band
+    has_base_flux = "flx" in df.columns and "fl" in df.columns
+    n_base_plots = 2 if has_base_flux else 0
+    n_band_plots = len(bands)
+    n_total_plots = n_base_plots + n_band_plots
+    
+    if n_total_plots == 0:
+        print("Error: No plottable columns found in data file!")
+        return
+    
+    # Calculate grid dimensions
+    n_cols = min(2, n_total_plots)
+    n_rows = int(np.ceil(n_total_plots / n_cols))
+    
     # Create figure with subplots
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows))
     fig.suptitle("XRB Lightcurve Simulation Results", fontsize=16, fontweight="bold")
+    
+    # Flatten axes array for easier indexing
+    if n_total_plots == 1:
+        axes = np.array([axes])
+    else:
+        axes = axes.flatten()
+    
+    plot_idx = 0
+    
+    # Plot base flux columns if available
+    if has_base_flux:
+        # Plot 1: Flux vs Phase (degrees)
+        ax = axes[plot_idx]
+        ax.plot(df["deg"], df["flx"], "b-", linewidth=2, label="Accelerated Wind")
+        if "flx2" in df.columns:
+            ax.plot(df["deg"], df["flx2"], "r--", linewidth=2, label="Constant Velocity Wind")
+        ax.set_xlabel("Phase (degrees)")
+        ax.set_ylabel("Flux")
+        ax.set_title("Flux vs Phase")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plot_idx += 1
 
-    # Plot 1: Flux vs Phase (degrees)
-    axes[0, 0].plot(df["deg"], df["flx"], "b-", linewidth=2, label="Accelerated Wind")
-    axes[0, 0].plot(
-        df["deg"], df["flx2"], "r--", linewidth=2, label="Constant Velocity Wind"
-    )
-    axes[0, 0].set_xlabel("Phase (degrees)")
-    axes[0, 0].set_ylabel("Flux")
-    axes[0, 0].set_title("Flux vs Phase")
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
+        # Plot 2: Scaled Flux vs Phase
+        ax = axes[plot_idx]
+        ax.plot(df["deg"], df["fl"], "g-", linewidth=2, label="Scaled Flux (Acc)")
+        if "fl2" in df.columns:
+            ax.plot(df["deg"], df["fl2"], "m--", linewidth=2, label="Scaled Flux (Const)")
+        ax.set_xlabel("Phase (degrees)")
+        ax.set_ylabel("Scaled Flux")
+        ax.set_title("Scaled Flux vs Phase")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plot_idx += 1
 
-    # Plot 2: Scaled Flux vs Phase
-    axes[0, 1].plot(df["deg"], df["fl"], "g-", linewidth=2, label="Scaled Flux (Acc)")
-    axes[0, 1].plot(
-        df["deg"], df["fl2"], "m--", linewidth=2, label="Scaled Flux (Const)"
-    )
-    axes[0, 1].set_xlabel("Phase (degrees)")
-    axes[0, 1].set_ylabel("Scaled Flux")
-    axes[0, 1].set_title("Scaled Flux vs Phase")
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # Plot 3: Hard Band Fluxes
-    axes[1, 0].plot(
-        df["deg"], df["nfl_hard_av"], "b-", linewidth=2, label="Hard Band (Acc)"
-    )
-    axes[1, 0].plot(
-        df["deg"], df["nfl_hard_cv"], "r--", linewidth=2, label="Hard Band (Const)"
-    )
-    axes[1, 0].set_xlabel("Phase (degrees)")
-    axes[1, 0].set_ylabel("Hard Band Flux")
-    axes[1, 0].set_title("Hard Band (2-10 keV) Flux")
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Plot 4: Soft Band Fluxes
-    axes[1, 1].plot(
-        df["deg"], df["nfl_soft_av"], "b-", linewidth=2, label="Soft Band (Acc)"
-    )
-    axes[1, 1].plot(
-        df["deg"], df["nfl_soft_cv"], "r--", linewidth=2, label="Soft Band (Const)"
-    )
-    axes[1, 1].set_xlabel("Phase (degrees)")
-    axes[1, 1].set_ylabel("Soft Band Flux")
-    axes[1, 1].set_title("Soft Band (0.3-2 keV) Flux")
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
+    # Plot each detected energy band
+    for band in bands:
+        ax = axes[plot_idx]
+        display_name, energy_range = get_band_display_name(band)
+        
+        # Check which columns exist for this band
+        av_col = f"nfl_{band}_av"
+        cv_col = f"nfl_{band}_cv"
+        
+        if av_col in df.columns:
+            ax.plot(df["deg"], df[av_col], "b-", linewidth=2, label=f"{display_name} (Acc)")
+        if cv_col in df.columns:
+            ax.plot(df["deg"], df[cv_col], "r--", linewidth=2, label=f"{display_name} (Const)")
+        
+        ax.set_xlabel("Phase (degrees)")
+        ax.set_ylabel(f"{display_name} Band Flux")
+        title = f"{display_name} Band"
+        if energy_range:
+            title += f" ({energy_range})"
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plot_idx += 1
+    
+    # Hide any unused subplots
+    for i in range(plot_idx, len(axes)):
+        axes[i].axis('off')
 
     plt.tight_layout()
 
