@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import math
 import os
+import sys
 import warnings
 from typing import Tuple, List, Optional, Dict
 from scipy.interpolate import interp1d
@@ -47,13 +48,16 @@ def create_grid(
     g1_th_flat = g1_th_mesh.flatten()
 
     # Filter points based on conditions
-    if gma < np.pi:
-        # Calculate distance from center
+    # Only apply eclipse filtering when emitter is BEHIND companion (sin(gma) > 0)
+    # When emitter is in front (sin(gma) <= 0), no occultation is possible
+    if np.sin(gma) > 0:
+        # Calculate distance from center - filter out points blocked by companion
         nn = np.sqrt(g1_r_flat**2 + l**2 - 2 * g1_r_flat * l * np.cos(g1_th_flat))
         mask = nn >= R
         g1_s_r = g1_r_flat[mask]
         g1_s_th = g1_th_flat[mask]
     else:
+        # Emitter is in front of companion - all points visible
         g1_s_r = g1_r_flat
         g1_s_th = g1_th_flat
 
@@ -498,9 +502,15 @@ def simulate_lightcurve(
         a = l**2 + r**2 - R**2
         b = 2 * abs(l) * r
         n = l / (R + r)
+        
+        # Track if emitter is fully eclipsed (blocked by companion)
+        is_eclipsed = False
 
-        if cur_gma <= np.pi:
+        # Only check for eclipse when emitter is BEHIND companion (sin(gma) > 0)
+        # When emitter is in front (sin(gma) <= 0), no occultation possible
+        if np.sin(cur_gma) > 0:
             if n >= 1:
+                # Emitter is behind but not overlapping with companion disk
                 av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
                 lw, lw2, icd_val, A2_val = wind_los_integral(
                     d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
@@ -519,11 +529,14 @@ def simulate_lightcurve(
                 n2 = a / b
                 n3 = l / (R - r)
                 if abs(n3) <= 1:
+                    # Total eclipse: emitter is completely behind companion
+                    is_eclipsed = True
                     flx_i = 0.0
                     flx2_i = 0.0
                     icd_i = 0.0
                     A2_i = 0.0
                 else:
+                    # Partial overlap - compute visible portion
                     av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
                     lw, lw2, icd_val, A2_val = wind_los_integral(
                         d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
@@ -539,6 +552,7 @@ def simulate_lightcurve(
                         icd_i = 0.0
                         A2_i = 0.0
         else:
+            # Emitter is in front of companion - fully visible, no eclipse possible
             av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
             lw, lw2, icd_val, A2_val = wind_los_integral(
                 d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
@@ -569,6 +583,7 @@ def simulate_lightcurve(
             l,
             L,
             h,
+            is_eclipsed,
         )
 
     # Compute phases, optionally in parallel
@@ -598,8 +613,8 @@ def simulate_lightcurve(
                 if verbose:
                     print(f"Phase: {out[5]:.2f} degrees")
 
-    # Unpack
-    flx, flx2, icd_vals, A2_vals, ph, deg, phase, time, l3, L3, h3 = map(
+    # Unpack (now includes is_eclipsed flag)
+    flx, flx2, icd_vals, A2_vals, ph, deg, phase, time, l3, L3, h3, is_eclipsed = map(
         list, zip(*results_list)
     )
 
@@ -617,6 +632,7 @@ def simulate_lightcurve(
             "l3": l3,
             "L3": L3,
             "h3": h3,
+            "is_eclipsed": is_eclipsed,
         }
     )
 
@@ -693,6 +709,17 @@ def simulate_lightcurve(
         
     else:
         raise ValueError(f"Invalid flux_method: {flux_method}. Must be 'legacy', 'interpolate', or 'refit'")
+
+    # Set all scaled flux columns to 0 when eclipsed
+    # During eclipse, the emitter is physically blocked - flux should be zero,
+    # not computed from absorption formula (which would give max flux when nH=0)
+    eclipse_mask = results["is_eclipsed"].values
+    if np.any(eclipse_mask):
+        # Find all flux columns (nfl_* and pho_count_*)
+        flux_cols = [col for col in results.columns 
+                     if col.startswith("nfl_") or col.startswith("pho_count_")]
+        for col in flux_cols:
+            results.loc[eclipse_mask, col] = 0.0
 
     return results
 
