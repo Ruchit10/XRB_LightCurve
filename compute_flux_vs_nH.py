@@ -11,9 +11,10 @@ using XSPEC via its Python API.
 
 Supported Instruments and Energy Bands:
   Chandra (default):
-    - broad: 0.5–8.0 keV (default)
+    - broad: 0.5–7.0 keV (default)
     - soft: 0.5–2.0 keV
-    - hard: 2.0–8.0 keV
+    - medium: 1.2–2.0 keV
+    - hard: 2.0–7.0 keV
 
 Run this under the conda environment that has XSPEC Python (e.g., `henv`).
 
@@ -66,9 +67,10 @@ except Exception as exc:
 
 INSTRUMENT_BANDS = {
     "chandra": {
-        "broad": (0.5, 8.0),    # Default broad band
+        "broad": (0.5, 7.0),    # Default broad band
         "soft": (0.5, 2.0),     # Soft band
-        "hard": (2.0, 8.0),     # Hard band
+        "medium": (1.2, 2.0),   # Medium band
+        "hard": (2.0, 7.0),     # Hard band
     },
     # Future instruments can be added here, e.g.:
     # "xmm": {
@@ -251,7 +253,7 @@ def integrate_photon_flux(E: np.ndarray, y: np.ndarray, band: Tuple[float, float
         mask[idx] = True
     if np.count_nonzero(mask) < 2:
         return float("nan")
-    return float(np.trapz(y[mask], E[mask]))
+    return float(np.trapz(y[mask], E[mask]))  # pyright: ignore[reportDeprecated]
 
 
 def compute_energy_flux_for_band(band: Tuple[float, float]) -> float:

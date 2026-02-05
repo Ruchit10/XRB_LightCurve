@@ -59,7 +59,7 @@ python xrb_lightcurve.py --r 0.001 --R 2.0 --d1 11.0 --d2 8.0 --gma0 -90.0 --i0 
 The simulation computes column densities, which are then converted to observable fluxes. Three methods are available:
 
 1. **legacy** (default): Uses hardcoded exponential fits derived from earlier XSPEC modeling:
-   - Hard band (2-10 keV): `flux = 9.524 * exp(-0.057 * nH)`
+- Hard band (2.0-7.0 keV): `flux = 9.524 * exp(-0.057 * nH)` (legacy coefficients; update via XSPEC CSV for exact band)
    - Soft band (0.3-2 keV): `flux = 9.3923 * exp(-2.5062 * nH)`
    - Where nH is in units of 1e22 cm^-2
 
@@ -120,7 +120,7 @@ The simulation generates a CSV file with the following columns:
 - `time`: Time calculations
 - `l3`, `L3`, `h3`: Geometric parameters
 - `fl`, `fl2`: Hydrogen column density nH in units of 1e22 cm^-2
-- `nfl_hard_av`, `nfl_hard_cv`: Hard band (2-10 keV) photon fluxes (photons/cm^2/s)
+- `nfl_hard_av`, `nfl_hard_cv`: Hard band (2.0-7.0 keV) photon fluxes (photons/cm^2/s)
 - `nfl_soft_av`, `nfl_soft_cv`: Soft band (0.3-2 keV) photon fluxes (photons/cm^2/s)
 - `pho_count_hard_av`, `pho_count_soft_av`: Photon counts (only in legacy mode)
 
@@ -134,7 +134,7 @@ The key unit conversions in the simulation:
    - Example: `fl = 1.0` means nH = 1.0 × 10^22 cm^-2
 3. **Photon flux**: Converted from nH using one of the three methods (legacy/interpolate/refit)
    - Units: photons/cm^2/s
-   - Hard band: 2-10 keV
+   - Hard band: 2.0-7.0 keV
    - Soft band: 0.3-2 keV
 
 ### Generating Flux vs nH CSV

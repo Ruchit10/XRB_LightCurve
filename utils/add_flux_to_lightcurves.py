@@ -36,7 +36,7 @@ def compute_conversion_factor_from_spectrum(band: str, nH: float, flux_csv_dir: 
     Parameters:
     -----------
     band : str
-        Energy band ('broad', 'soft', or 'hard')
+        Energy band ('broad', 'soft', 'medium', or 'hard')
     nH : float
         Column density in units of 1e22 cm^-2
     flux_csv_dir : str
@@ -86,7 +86,7 @@ def add_flux_column(input_file: str, output_file: str, conversion_factor: float 
     nH : float, optional
         Column density in 1e22 cm^-2 units (required if conversion_factor not given)
     band : str, optional
-        Energy band ('broad', 'soft', 'hard') - inferred from filename if not provided
+        Energy band ('broad', 'soft', 'medium', 'hard') - inferred from filename if not provided
     flux_csv_dir : str, optional
         Directory with flux_vs_nH CSV files (default: same directory as script)
     """
@@ -100,6 +100,8 @@ def add_flux_column(input_file: str, output_file: str, conversion_factor: float 
             band = 'broad'
         elif 'soft' in filename:
             band = 'soft'
+        elif 'medium' in filename:
+            band = 'medium'
         elif 'hard' in filename:
             band = 'hard'
         else:
@@ -169,7 +171,7 @@ Examples:
       --conversion-factor 2.5e-11
   
   # To get conversion factor from XSPEC:
-  # In XSPEC, after fitting: flux 0.5 8.0
+  # In XSPEC, after fitting: flux 0.5 7.0
   # Then: print "Conversion = ", <flux_value> / <count_rate_from_data>
   
   # To get conversion factor from WebPICT:
@@ -184,7 +186,7 @@ Examples:
                        help='Conversion factor: flux = count_rate * factor (erg/cm²/s per count/s)')
     parser.add_argument('--nH', type=float,
                        help='Column density in 1e22 cm^-2 (if not using conversion-factor)')
-    parser.add_argument('--band', choices=['broad', 'soft', 'hard'],
+    parser.add_argument('--band', choices=['broad', 'soft', 'medium', 'hard'],
                        help='Energy band (auto-detected from filename if not specified)')
     parser.add_argument('--flux-csv-dir', default=None,
                        help='Directory containing flux_vs_nH_*.csv files')

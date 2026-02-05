@@ -54,7 +54,7 @@ def main():
     print()
     print("-"*80)
     
-    bands = ['Broad', 'Soft', 'Hard']
+    bands = ['Broad', 'Soft', 'Medium', 'Hard']
     rates = {}
     
     for band in bands:

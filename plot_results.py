@@ -17,9 +17,9 @@ from typing import List, Dict, Tuple
 BAND_INFO: Dict[str, Tuple[str, str]] = {
     "ultrasoft": ("Ultra-soft", "0.2-0.5 keV"),
     "soft": ("Soft", "0.5-2 keV"),
-    "medium": ("Medium", "2-4 keV"),
-    "hard": ("Hard", "2-10 keV"),
-    "broad": ("Broad", "0.5-10 keV"),
+    "medium": ("Medium", "1.2-2.0 keV"),
+    "hard": ("Hard", "2.0-7.0 keV"),
+    "broad": ("Broad", "0.5-7.0 keV"),
 }
 
 

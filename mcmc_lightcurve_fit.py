@@ -379,7 +379,7 @@ class PrecomputedModelGrid:
         Parameters
         ----------
         band : str
-            Energy band ('broad', 'soft', 'hard')
+            Energy band ('broad', 'soft', 'medium', 'hard')
         flux_csv_path : str
             Path to flux vs nH CSV file
         wind_model : str
@@ -1725,7 +1725,7 @@ def main():
         "--band",
         type=str,
         required=True,
-        choices=['broad', 'soft', 'hard', 'all'],
+        choices=['broad', 'soft', 'medium', 'hard', 'all'],
         help="Energy band to fit (or 'all' to fit all bands)"
     )
     parser.add_argument(
@@ -2022,7 +2022,7 @@ def main():
     
     # Determine which bands to fit
     if args.band == 'all':
-        bands = ['broad', 'soft', 'hard']
+        bands = ['broad', 'soft', 'medium', 'hard']
     else:
         bands = [args.band]
     
