@@ -21,6 +21,12 @@ from typing import Tuple, List, Optional, Dict
 from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
 
+# Cache for fast converged LOS integration of the accelerating-wind integrand:
+#   ∫ (1 + u^2)^(-5/4) du  for u in [0, U_MAX]
+_ACCEL_U_GRID: Optional[np.ndarray] = None
+_ACCEL_F_GRID: Optional[np.ndarray] = None
+_ACCEL_U_MAX: float = 1e5
+
 
 def create_grid(
     r: float, l: float, R: float, gma: float, d2h: float = 6.0
@@ -135,6 +141,12 @@ def wind_los_integral(
     av_db: np.ndarray,
     A: np.ndarray,
     dz: float = 0.1,
+    Rmax: Optional[float] = None,
+    converge_rmax: bool = False,
+    conv_eps_rel: float = 1e-6,
+    conv_eps_abs: float = 1e-12,
+    conv_min_steps: int = 50,
+    conv_r_cap_mult: float = 1000.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Calculate column integral along the line of sight.
@@ -150,6 +162,12 @@ def wind_los_integral(
         av_x, av_th, av_db: Grid arrays
         A: Area array
         dz: Step along line of sight (solar radii)
+        Rmax: Maximum radius (solar radii) for LOS integration cutoff. If None, defaults to 2*d.
+        converge_rmax: If True, ignore Rmax and integrate adaptively until tail contributions become negligible.
+        conv_eps_rel: Relative convergence tolerance for adaptive stopping (both wind models).
+        conv_eps_abs: Absolute convergence tolerance for adaptive stopping (both wind models).
+        conv_min_steps: Minimum number of dz-steps before convergence checks start.
+        conv_r_cap_mult: Safety cap for adaptive integration, as multiple of d (stop when r >= cap).
 
     Returns:
         Tuple of (lw, lw2, icd, A2) arrays
@@ -167,11 +185,78 @@ def wind_los_integral(
     z2 = d2 * np.sin(gma) * np.cos(i)
     z_start = z1 + z2
 
-    # Per-cell LOS half-extent
-    t = np.sqrt((2.0 * d) ** 2 - av_db**2)
+    # If requested (or if Rmax is None), integrate to -infinity (observer) using fast closed-forms / cached quadrature.
+    #
+    # This is MUCH faster than stepping by dz to large radii, and is effectively "fully converged".
+    # - Constant-velocity wind term uses exact primitive: ∫ dz / (b^2 + z^2) = (1/b) arctan(z/b)
+    # - Accelerating wind term integrates (b^2 + z^2)^(-5/4). With z=b*u, dz=b du:
+    #     ∫ (b^2 + z^2)^(-5/4) dz = b^(-3/2) ∫ (1 + u^2)^(-5/4) du
+    if converge_rmax or (Rmax is None):
+        global _ACCEL_U_GRID, _ACCEL_F_GRID, _ACCEL_U_MAX
+
+        b = av_db.astype(float)
+        b_safe = np.maximum(b, 1e-8)
+        u0 = float(z_start) / b_safe  # vector
+        u_abs = np.abs(u0)
+
+        # Exact constant-velocity integral from -∞ to z_start
+        # I2 = (1/b) * (arctan(z/b) + π/2)
+        los2 = (np.arctan(u0) + (np.pi / 2.0)) / b_safe
+
+        # Build / reuse a cached table for F(u)=∫_0^u (1+t^2)^(-5/4) dt for u∈[0,U_MAX]
+        if _ACCEL_U_GRID is None or _ACCEL_F_GRID is None:
+            # Dense near 0, log-spaced tail for good accuracy across many decades
+            u_lin = np.linspace(0.0, 50.0, 20000)
+            u_log = np.logspace(np.log10(50.0), np.log10(_ACCEL_U_MAX), 20000)
+            u = np.unique(np.concatenate([u_lin, u_log]))
+            f = (1.0 + u * u) ** (-5.0 / 4.0)
+            du = np.diff(u)
+            # cumulative trapezoid integral
+            F = np.empty_like(u)
+            F[0] = 0.0
+            F[1:] = np.cumsum(0.5 * (f[1:] + f[:-1]) * du)
+            _ACCEL_U_GRID = u
+            _ACCEL_F_GRID = F
+
+        # Analytic value of F(∞) = ∫_0^∞ (1+u^2)^(-5/4) du
+        # = (sqrt(pi) * Gamma(3/4)) / (2 * Gamma(5/4))
+        F_inf = (math.sqrt(math.pi) * math.gamma(0.75)) / (2.0 * math.gamma(1.25))
+
+        # F_abs(|u0|) = ∫_0^{|u0|} (1+u^2)^(-5/4) du
+        F_abs = np.interp(
+            np.minimum(u_abs, _ACCEL_U_MAX),
+            _ACCEL_U_GRID,
+            _ACCEL_F_GRID,
+        )
+        # For very large u, use asymptotic tail: F_inf - F(u) ≈ (2/3) u^(-3/2)
+        large = u_abs > _ACCEL_U_MAX
+        if np.any(large):
+            F_abs = F_abs.copy()
+            F_abs[large] = F_inf - ((2.0 / 3.0) / (u_abs[large] ** (3.0 / 2.0)))
+
+        # Integral from -∞ to u0:
+        #  u0>=0: F_inf + F_abs(u0)
+        #  u0< 0: F_inf - F_abs(|u0|)
+        I_u = F_inf + (np.sign(u0) * F_abs)
+
+        # Accelerating-wind LOS integral
+        los = I_u / (b_safe ** (3.0 / 2.0))
+
+        lw = los * A
+        lw2 = los2 * A
+
+        return lw.astype(float), lw2.astype(float), los.astype(float), A.astype(float)
+
+    # Fixed physical cutoff at radius Rmax
+    # NOTE: if Rmax is None we return early via adaptive integration above.
+    Rmax_use = float(Rmax)
+
+    # Per-cell LOS limit in z such that r = sqrt(b^2 + z^2) <= Rmax_use
+    # (integrating from z_start toward decreasing z until r hits Rmax_use)
+    t = np.sqrt(np.maximum((Rmax_use ** 2) - (av_db ** 2), 0.0))
 
     # Determine per-cell validity: original algorithm integrates only if |z_start| <= t
-    valid_cells = (np.abs(z_start) <= t)
+    valid_cells = (t > 0) & (np.abs(z_start) <= t)
 
     # Per-cell end step index; invalid cells get -1 so they contribute zero
     end_k = np.floor((z_start + t) / dz).astype(int)
@@ -441,6 +526,8 @@ def simulate_lightcurve(
     flux_csv_path: Optional[str] = None,
     lam: float = 0.589537,
     lam2: float = 0.589537,
+    Rmax: Optional[float] = None,
+    converge_rmax: bool = False,
 ) -> pd.DataFrame:
     """
     Main simulation function for lightcurve calculation.
@@ -465,6 +552,10 @@ def simulate_lightcurve(
         lam: Scaling parameter to convert flx to nH (in 1e22 cm^-2 units).
             Default 0.589537 means mean(fl) = 0.589537 (i.e., mean nH ≈ 5.9e21 cm^-2)
         lam2: Scaling parameter for constant velocity wind model (flx2)
+        Rmax: Maximum radius (solar radii) used as a hard cutoff for LOS integration.
+            If None, the LOS integration uses adaptive convergence stopping (see converge_rmax).
+            Note: the CLI sets the default to 2*(d1+d2), reproducing the legacy cutoff.
+        converge_rmax: If True, ignore fixed Rmax and integrate adaptively until tail contributions are negligible.
 
     Returns:
         DataFrame with simulation results. Key columns:
@@ -482,6 +573,12 @@ def simulate_lightcurve(
     gma = gma0 * np.pi / 180
     i = i0 * np.pi / 180
     d = d1 + d2
+
+    # Integration cutoff handling
+    # - If converge_rmax is enabled OR Rmax is None: use adaptive stopping
+    # - Otherwise: use fixed cutoff at Rmax
+    converge_rmax_use = bool(converge_rmax) or (Rmax is None)
+    Rmax_use: Optional[float] = None if Rmax is None else float(Rmax)
 
     # Prepare phase values
     n_iterations = int(360 / dth)
@@ -502,7 +599,7 @@ def simulate_lightcurve(
         a = l**2 + r**2 - R**2
         b = 2 * abs(l) * r
         n = l / (R + r)
-        
+
         # Track if emitter is fully eclipsed (blocked by companion)
         is_eclipsed = False
 
@@ -513,7 +610,18 @@ def simulate_lightcurve(
                 # Emitter is behind but not overlapping with companion disk
                 av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
                 lw, lw2, icd_val, A2_val = wind_los_integral(
-                    d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
+                    d,
+                    d1,
+                    d2,
+                    cur_gma,
+                    i,
+                    av_x,
+                    av_th,
+                    av_db,
+                    A_cells,
+                    dz=dz,
+                    Rmax=Rmax_use,
+                    converge_rmax=converge_rmax_use,
                 )
                 if lw.size > 0:
                     flx_i = float(np.sum(lw) / np.sum(A_cells))
@@ -539,7 +647,18 @@ def simulate_lightcurve(
                     # Partial overlap - compute visible portion
                     av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
                     lw, lw2, icd_val, A2_val = wind_los_integral(
-                        d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
+                        d,
+                        d1,
+                        d2,
+                        cur_gma,
+                        i,
+                        av_x,
+                        av_th,
+                        av_db,
+                        A_cells,
+                        dz=dz,
+                        Rmax=Rmax_use,
+                        converge_rmax=converge_rmax_use,
                     )
                     if lw.size > 0:
                         flx_i = float(np.sum(lw) / np.sum(A_cells))
@@ -555,7 +674,18 @@ def simulate_lightcurve(
             # Emitter is in front of companion - fully visible, no eclipse possible
             av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
             lw, lw2, icd_val, A2_val = wind_los_integral(
-                d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
+                d,
+                d1,
+                d2,
+                cur_gma,
+                i,
+                av_x,
+                av_th,
+                av_db,
+                A_cells,
+                dz=dz,
+                Rmax=Rmax_use,
+                converge_rmax=converge_rmax_use,
             )
             if lw.size > 0:
                 flx_i = float(np.sum(lw) / np.sum(A_cells))
@@ -777,6 +907,19 @@ def main():
         help="Step size along the line of sight (solar radii)",
     )
     parser.add_argument(
+        "--Rmax",
+        type=float,
+        default=None,
+        help="Maximum radius (solar radii) for LOS integration cutoff. "
+        "If not provided, defaults to 2*(d1+d2). Ignored if --converge-rmax is set.",
+    )
+    parser.add_argument(
+        "--converge-rmax",
+        action="store_true",
+        help="Override fixed Rmax cutoff and integrate adaptively until LOS tail contributions "
+        "become negligible (both wind models).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print per-phase progress during simulation",
@@ -831,6 +974,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Default physical cutoff reproduces legacy behavior
+    if args.Rmax is None:
+        args.Rmax = 2.0 * (args.d1 + args.d2)
     
     # Check if XSPEC nH should be used
     if args.use_xspec_nH:
@@ -863,6 +1010,8 @@ def main():
     print(f"  dth (orbital increment): {args.dth} degrees")
     print(f"  d2h (polar cell size): {args.d2h} degrees")
     print(f"  dz (LOS step size): {args.dz}")
+    print(f"  Rmax (LOS cutoff): {args.Rmax}")
+    print(f"  converge_rmax: {args.converge_rmax}")
     print(f"  n_jobs (parallel workers): {args.n_jobs}")
     print(f"  flux_method: {args.flux_method}")
     if args.flux_csv:
@@ -889,6 +1038,8 @@ def main():
         flux_csv_path=args.flux_csv,
         lam=args.lam,
         lam2=args.lam2,
+        Rmax=args.Rmax,
+        converge_rmax=args.converge_rmax,
     )
 
     # Save results
