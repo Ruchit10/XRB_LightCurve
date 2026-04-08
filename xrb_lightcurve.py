@@ -370,7 +370,7 @@ def load_flux_vs_nh_csv(csv_path: str) -> Tuple[pd.DataFrame, List[str]]:
 
 
 def interpolate_flux_from_nh(
-    nh_1e22: np.ndarray, df: pd.DataFrame, band: str
+    nh_1e22: np.ndarray, df: pd.DataFrame, band: str, flux_type: str = "erg"
 ) -> np.ndarray:
     """
     Interpolate flux values for given nH array using CSV data.
@@ -379,19 +379,23 @@ def interpolate_flux_from_nh(
         nh_1e22: Array of nH values in 1e22 cm^-2 units
         df: DataFrame from load_flux_vs_nh_csv
         band: Band name (e.g., "soft", "hard", "broad", "medium")
+        flux_type: Which flux column to use — "erg" (erg/cm^2/s, default) or
+                   "ph" (photons/cm^2/s)
         
     Returns:
-        Array of interpolated flux values (photons/cm^2/s)
+        Array of interpolated flux values in units determined by flux_type
         
     Raises:
-        ValueError: If band column is not found in DataFrame
+        ValueError: If band/flux_type column is not found in DataFrame
     """
-    flux_col = f"flux_{band}_ph"
-    
+    flux_col = f"flux_{band}_{flux_type}"
+
     if flux_col not in df.columns:
         available = get_available_bands_from_csv(df)
         raise ValueError(
-            f"Band '{band}' not found in CSV. Available bands: {available}"
+            f"Column '{flux_col}' not found in CSV. "
+            f"Available bands: {available}. "
+            f"flux_type must be 'ph' or 'erg'."
         )
     
     # Sort by nH for interpolation
@@ -433,7 +437,9 @@ def interpolate_flux_from_nh(
     return flux
 
 
-def fit_exponential_to_csv(df: pd.DataFrame, band: str) -> Tuple[float, float]:
+def fit_exponential_to_csv(
+    df: pd.DataFrame, band: str, flux_type: str = "erg"
+) -> Tuple[float, float]:
     """
     Fit exponential function A * exp(-B * nH) to CSV flux data in LOG SPACE.
     
@@ -444,20 +450,24 @@ def fit_exponential_to_csv(df: pd.DataFrame, band: str) -> Tuple[float, float]:
     Args:
         df: DataFrame from load_flux_vs_nh_csv
         band: Band name (e.g., "soft", "hard", "broad", "medium")
+        flux_type: Which flux column to use — "erg" (erg/cm^2/s, default) or
+                   "ph" (photons/cm^2/s)
         
     Returns:
         Tuple of (A, B) coefficients for flux = A * exp(-B * nH_1e22)
-        where flux is in photons/cm²/s (raw units from CSV)
+        in units determined by flux_type
         
     Raises:
-        ValueError: If band column is not found or fit fails without fallback
+        ValueError: If band/flux_type column is not found or fit fails without fallback
     """
-    flux_col = f"flux_{band}_ph"
-    
+    flux_col = f"flux_{band}_{flux_type}"
+
     if flux_col not in df.columns:
         available = get_available_bands_from_csv(df)
         raise ValueError(
-            f"Band '{band}' not found in CSV. Available bands: {available}"
+            f"Column '{flux_col}' not found in CSV. "
+            f"Available bands: {available}. "
+            f"flux_type must be 'ph' or 'erg'."
         )
     
     # Get data
@@ -499,15 +509,17 @@ def fit_exponential_to_csv(df: pd.DataFrame, band: str) -> Tuple[float, float]:
         return float(A), float(B)
         
     except Exception as e:
-        # Try fallback for legacy bands (with proper scaling)
-        if band == "hard":
-            warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy values.")
-            return 9.524e-13, 0.057  # Legacy hard band coefficients (converted to raw units)
-        elif band == "soft":
-            warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy values.")
-            return 9.3923e-13, 2.5062  # Legacy soft band coefficients (converted to raw units)
-        else:
-            raise ValueError(f"Exponential fit failed for {band} band: {e}") from e
+        # Fallback legacy values are photon-flux-based; only apply for flux_type="ph"
+        if flux_type == "ph":
+            if band == "hard":
+                warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy ph values.")
+                return 9.524e-13, 0.057
+            elif band == "soft":
+                warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy ph values.")
+                return 9.3923e-13, 2.5062
+        raise ValueError(
+            f"Exponential fit failed for {band} band (flux_type='{flux_type}'): {e}"
+        ) from e
 
 
 def simulate_lightcurve(
@@ -524,6 +536,7 @@ def simulate_lightcurve(
     n_jobs: int = 1,
     flux_method: str = "legacy",
     flux_csv_path: Optional[str] = None,
+    flux_type: str = "erg",
     lam: float = 0.589537,
     lam2: float = 0.589537,
     Rmax: Optional[float] = None,
@@ -549,9 +562,12 @@ def simulate_lightcurve(
             - "interpolate": Interpolate from CSV flux vs nH data
             - "refit": Fit new exponentials to CSV data
         flux_csv_path: Path to CSV file from compute_flux_vs_nH.py (required if flux_method != "legacy")
-        lam: Scaling parameter to convert flx to nH (in 1e22 cm^-2 units).
-            Default 0.589537 means mean(fl) = 0.589537 (i.e., mean nH ≈ 5.9e21 cm^-2)
-        lam2: Scaling parameter for constant velocity wind model (flx2)
+        flux_type: Which flux column from the CSV to use — "erg" (erg/cm^2/s, default)
+            or "ph" (photons/cm^2/s). Only applies when flux_method is "interpolate" or "refit".
+        lam: Target mean nH in 1e22 cm^-2 units. The raw wind integral (flx) is
+            scaled so that mean(fl) = lam. Default 0.589537 (i.e., mean nH ≈ 5.9e21 cm^-2).
+        lam2: Target mean nH for constant velocity wind model (flx2).
+            Typically set to the same value as lam.
         Rmax: Maximum radius (solar radii) used as a hard cutoff for LOS integration.
             If None, the LOS integration uses adaptive convergence stopping (see converge_rmax).
             Note: the CLI sets the default to 2*(d1+d2), reproducing the legacy cutoff.
@@ -564,9 +580,9 @@ def simulate_lightcurve(
             - pho_count_hard_av, pho_count_soft_av: Photon counts (legacy mode only)
             
     Notes:
-        - The column density integral (flx) has units of (atoms/solar_radius^4)
-        - Scaling by lam converts this to nH in units of 1e22 cm^-2
-        - Example: fl=1.0 means nH = 1.0e22 cm^-2
+        - The column density integral (flx) has arbitrary units
+        - The scaling factor is computed as lam / mean(flx), so mean(fl) = lam
+        - fl values are in units of 1e22 cm^-2 (e.g., fl=1.0 means nH = 1.0e22 cm^-2)
         - Photon count columns are only included when flux_method="legacy"
     """
     # Convert angles to radians
@@ -766,17 +782,14 @@ def simulate_lightcurve(
         }
     )
 
-    # Calculate additional flux parameters
-    # Compute scaling factors (use auto-scaling if lam not explicitly set)
-    lam_computed = 0.589537 / np.mean(flx) if np.mean(flx) > 0 else 1
-    lam2_computed = 0.589537 / np.mean(flx2) if np.mean(flx2) > 0 else 1
-    
-    # Use provided lam if different from default, otherwise use computed
-    lam_use = lam if lam != 0.589537 else lam_computed
-    lam2_use = lam2 if lam2 != 0.589537 else lam2_computed
+    # Scale raw wind integrals so that mean(fl) = lam (target mean nH)
+    mean_flx = np.mean(flx)
+    mean_flx2 = np.mean(flx2)
+    lam_scale = lam / mean_flx if mean_flx > 0 else 1.0
+    lam2_scale = lam2 / mean_flx2 if mean_flx2 > 0 else 1.0
 
-    fl = np.array(flx) * lam_use
-    fl2 = np.array(flx2) * lam2_use
+    fl = np.array(flx) * lam_scale
+    fl2 = np.array(flx2) * lam2_scale
 
     # Calculate scaled fluxes based on method
     if flux_method == "legacy":
@@ -812,8 +825,8 @@ def simulate_lightcurve(
         # Dynamically compute flux for all available bands
         for band in available_bands:
             try:
-                results[f"nfl_{band}_av"] = interpolate_flux_from_nh(fl, df_flux, band)
-                results[f"nfl_{band}_cv"] = interpolate_flux_from_nh(fl2, df_flux, band)
+                results[f"nfl_{band}_av"] = interpolate_flux_from_nh(fl, df_flux, band, flux_type=flux_type)
+                results[f"nfl_{band}_cv"] = interpolate_flux_from_nh(fl2, df_flux, band, flux_type=flux_type)
             except Exception as e:
                 warnings.warn(f"Failed to interpolate flux for band '{band}': {e}")
         
@@ -831,7 +844,7 @@ def simulate_lightcurve(
         # Dynamically fit and compute flux for all available bands
         for band in available_bands:
             try:
-                A, B = fit_exponential_to_csv(df_flux, band)
+                A, B = fit_exponential_to_csv(df_flux, band, flux_type=flux_type)
                 results[f"nfl_{band}_av"] = A * np.exp(-B * fl)
                 results[f"nfl_{band}_cv"] = A * np.exp(-B * fl2)
             except Exception as e:
@@ -946,25 +959,27 @@ def main():
         "(required if flux_method is not 'legacy')",
     )
     parser.add_argument(
+        "--flux_type",
+        type=str,
+        choices=["erg", "ph"],
+        default="erg",
+        help="Which flux column from the CSV to use: "
+        "'erg' (erg/cm^2/s, default) or 'ph' (photons/cm^2/s). "
+        "Only applies when --flux_method is 'interpolate' or 'refit'.",
+    )
+    parser.add_argument(
         "--lam",
         type=float,
         default=0.589537,
-        help="Scaling parameter to convert flx to nH (in 1e22 cm^-2 units). "
-        "Default: 0.589537 (legacy). Use XSPEC fitted value (0.572385) for better accuracy. "
-        "Get XSPEC value with: python get_xspec_nH.py",
+        help="Target mean nH in 1e22 cm^-2 units. The raw wind integral is "
+        "scaled so that mean(fl) = lam. Default: 0.589537.",
     )
     parser.add_argument(
         "--lam2",
         type=float,
         default=0.589537,
-        help="Scaling parameter for constant velocity wind model (flx2). "
-        "Default: 0.589537 (legacy). Typically set to same value as --lam",
-    )
-    parser.add_argument(
-        "--use_xspec_nH",
-        action="store_true",
-        help="Automatically use nH from XSPEC fit (reads from xspec_nH.txt). "
-        "Overrides --lam if specified. Run 'python get_xspec_nH.py' first.",
+        help="Target mean nH for constant velocity wind model (flx2). "
+        "Default: 0.589537. Typically set to same value as --lam.",
     )
     parser.add_argument(
         "--output",
@@ -978,22 +993,6 @@ def main():
     # Default physical cutoff reproduces legacy behavior
     if args.Rmax is None:
         args.Rmax = 2.0 * (args.d1 + args.d2)
-    
-    # Check if XSPEC nH should be used
-    if args.use_xspec_nH:
-        try:
-            with open('xspec_nH.txt', 'r') as f:
-                xspec_nH = float(f.read().strip())
-            print(f"Using XSPEC fitted nH: {xspec_nH} × 10²² cm⁻²")
-            args.lam = xspec_nH
-            args.lam2 = xspec_nH
-        except FileNotFoundError:
-            print("Error: xspec_nH.txt not found!")
-            print("Run 'python get_xspec_nH.py' first to extract nH from XSPEC fit.")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error reading xspec_nH.txt: {e}")
-            sys.exit(1)
     
     # Validate arguments
     if args.flux_method in ["interpolate", "refit"] and args.flux_csv is None:
@@ -1016,6 +1015,7 @@ def main():
     print(f"  flux_method: {args.flux_method}")
     if args.flux_csv:
         print(f"  flux_csv: {args.flux_csv}")
+        print(f"  flux_type: {args.flux_type}")
     print(f"  lam: {args.lam}")
     print(f"  lam2: {args.lam2}")
     print(f"  Output file: {args.output}")
@@ -1036,6 +1036,7 @@ def main():
         n_jobs=args.n_jobs,
         flux_method=args.flux_method,
         flux_csv_path=args.flux_csv,
+        flux_type=args.flux_type,
         lam=args.lam,
         lam2=args.lam2,
         Rmax=args.Rmax,
