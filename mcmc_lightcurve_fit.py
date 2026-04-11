@@ -33,14 +33,23 @@ Usage:
     # Fit accelerated wind model (default)
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv
     
+    # Use zeus sampler (better mixing for correlated posteriors)
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --sampler zeus
+    
+    # Use Student-t likelihood (robust to outliers)
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --likelihood studentt --studentt-nu 5
+    
+    # Use jitter likelihood (adds free systematic error parameter)
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --likelihood jitter
+    
+    # Compute WAIC/LOO model comparison metrics
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --compute-waic
+    
     # Save grid for reuse
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --save-grid grids/broad_grid.npz
     
     # Load pre-computed grid (skip grid computation)
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --load-grid grids/broad_grid.npz
-    
-    # Fit both wind models using same grid
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --wind-model both --load-grid grids/broad_grid.npz
     
     # Custom simulation parameters (e.g., different nH scaling)
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --lam 0.511314
@@ -79,17 +88,29 @@ except ImportError:
     warnings.warn("tqdm not installed. Using basic progress output. Install with: pip install tqdm")
     HAS_TQDM = False
 
+try:
+    import zeus as zeus_sampler
+    HAS_ZEUS = True
+except ImportError:
+    HAS_ZEUS = False
+
+try:
+    import arviz as az
+    HAS_ARVIZ = True
+except ImportError:
+    HAS_ARVIZ = False
+
 from scipy.interpolate import RegularGridInterpolator
+from scipy.special import gammaln
 
 from xrb_lightcurve import simulate_lightcurve
-from chandra_phase_analysis import phase_bin_data as _phase_bin_data_base
-
-
-# =============================================================================
-# Constants (from chandra_phase_analysis.py)
-# =============================================================================
-REF_EPOCH: float = 278801348  # Reference time (t0) for phase zero (seconds)
-ORBITAL_PERIOD: float = 125431  # Orbital period in seconds (~34.8 hours)
+from chandra_phase_analysis import (
+    REF_EPOCH,
+    ORBITAL_PERIOD,
+    frac,
+    load_data as _load_data_base,
+    phase_bin_data as _phase_bin_data_base,
+)
 
 # Default priors based on IC 10 X-1 parameters
 DEFAULT_PRIORS = {
@@ -116,138 +137,120 @@ WIND_MODELS = {
     'cv': 'Constant Velocity Wind'
 }
 
+# Likelihood configuration
+LIKELIHOOD_TYPES = {
+    'chi2': 'Chi-squared (Gaussian)',
+    'jitter': 'Gaussian with systematic jitter',
+    'studentt': 'Student-t (robust to outliers)',
+}
+
+JITTER_PRIOR = {'mean': -3.0, 'std': 2.0, 'min': -10.0, 'max': 0.0}
+
+SAMPLER_TYPES = {
+    'emcee': 'emcee Ensemble Sampler (stretch moves)',
+    'zeus': 'zeus Ensemble Slice Sampler',
+}
+
+
+def get_param_config(likelihood: str = 'chi2'):
+    """Return (param_names, param_labels) for the given likelihood type."""
+    names = list(PARAM_NAMES)
+    labels = list(PARAM_LABELS)
+    if likelihood == 'jitter':
+        names.append('log_f')
+        labels.append(r'$\ln\,f$')
+    return names, labels
+
 
 # =============================================================================
 # Data Loading and Phase Binning
 # =============================================================================
 
-def frac(x: np.ndarray) -> np.ndarray:
-    """Return the fractional part of x (vectorized)."""
-    return np.abs(x - np.floor(x))
+def _resolve_band_directory(band: str, data_dir: str) -> str:
+    """Resolve the directory containing light curve files for *band*.
+
+    Tries several common layouts in order:
+      1. data_dir itself contains .txt files              (direct path)
+      2. data_dir/{Band}_with_flux/                       (old converted layout)
+      3. data_dir/{band}/single/                          (CIAO single-obs layout)
+      4. data_dir/{band}/                                 (CIAO band folder)
+    """
+    candidates = [
+        data_dir,
+        os.path.join(data_dir, f"{band.capitalize()}_with_flux"),
+        os.path.join(data_dir, band.lower(), "single"),
+        os.path.join(data_dir, band.lower()),
+    ]
+    for path in candidates:
+        if os.path.isdir(path) and glob.glob(os.path.join(path, "*.txt")):
+            return path
+
+    tried = "\n  ".join(candidates)
+    raise FileNotFoundError(
+        f"No .txt light-curve files found for band '{band}'. "
+        f"Searched:\n  {tried}"
+    )
 
 
 def load_observed_lightcurves(
     band: str,
     data_dir: str = "data/IC_10_X1_LC",
     flux_column: str = "FLUX",
-    error_column: str = "FLUX_ERR"
+    error_column: str = "FLUX_ERR",
+    time_column: str = None
 ) -> pd.DataFrame:
-    """
-    Load all observed light curve files for a given energy band.
-    
+    """Load all observed light curve files for a given energy band.
+
+    Delegates file reading to :func:`chandra_phase_analysis.load_data`
+    and remaps the output columns to the MCMC convention
+    (``flux`` / ``flux_err`` / ``obs_id``).
+
     Parameters
     ----------
     band : str
-        Energy band: 'broad', 'soft', or 'hard'
+        Energy band: 'broad', 'soft', 'medium', or 'hard'
     data_dir : str
-        Base directory containing IC_10_X1_LC subdirectories
+        Base directory (or direct path) containing light curve data.
+        The function tries several sub-directory conventions automatically.
     flux_column : str
-        Column name for flux values
+        Column name for flux values in the data files
     error_column : str
-        Column name for flux errors
-        
+        Column name for flux errors in the data files
+    time_column : str, optional
+        Column name for timestamps (e.g. 'TIME', 't_raw'). Auto-detected if None.
+
     Returns
     -------
     DataFrame with columns: time, flux, flux_err, phase, obs_id
     """
-    band_dir = os.path.join(data_dir, f"{band.capitalize()}_with_flux")
-    
-    if not os.path.isdir(band_dir):
-        raise FileNotFoundError(f"Band directory not found: {band_dir}")
-    
-    txt_files = sorted(glob.glob(os.path.join(band_dir, "*.txt")))
-    
-    if not txt_files:
-        raise FileNotFoundError(f"No .txt files found in {band_dir}")
-    
-    all_data = []
-    
-    for filepath in txt_files:
-        obs_id = os.path.basename(filepath).split('_')[0]
-        
-        # Read file with header detection
-        try:
-            with open(filepath, 'r') as f:
-                header_line = None
-                for line in f:
-                    if line.strip().startswith('#'):
-                        # Check for column header line
-                        if 'TIME' in line.upper() and 'FLUX' in line.upper():
-                            header_line = line.strip().lstrip('#').strip()
-                    else:
-                        break
-            
-            # Read data
-            df = pd.read_csv(filepath, delim_whitespace=True, comment='#', header=None)
-            
-            if header_line:
-                col_names = header_line.split()
-                if len(col_names) == len(df.columns):
-                    df.columns = col_names
-            
-            # Extract required columns
-            time_col = None
-            for col in df.columns:
-                if str(col).upper() == 'TIME':
-                    time_col = col
-                    break
-            
-            if time_col is None:
-                # Assume first column is time
-                time_col = df.columns[0]
-            
-            # Get flux and error columns
-            if flux_column in df.columns:
-                flux_col = flux_column
-            else:
-                # Try case-insensitive match
-                flux_col = None
-                for col in df.columns:
-                    if str(col).upper() == flux_column.upper():
-                        flux_col = col
-                        break
-                if flux_col is None:
-                    continue
-            
-            if error_column in df.columns:
-                err_col = error_column
-            else:
-                err_col = None
-                for col in df.columns:
-                    if str(col).upper() == error_column.upper():
-                        err_col = col
-                        break
-            
-            obs_df = pd.DataFrame({
-                'time': df[time_col].astype(float),
-                'flux': df[flux_col].astype(float),
-                'flux_err': df[err_col].astype(float) if err_col else np.nan,
-                'obs_id': obs_id
-            })
-            
-            # Filter out invalid data
-            obs_df = obs_df[
-                (obs_df['flux'] > 0) & 
-                np.isfinite(obs_df['flux']) &
-                np.isfinite(obs_df['time'])
-            ]
-            
-            all_data.append(obs_df)
-            
-        except Exception as e:
-            warnings.warn(f"Failed to read {filepath}: {e}")
-            continue
-    
-    if not all_data:
-        raise ValueError(f"No valid data loaded for band '{band}'")
-    
-    combined = pd.concat(all_data, ignore_index=True)
-    
-    # Convert time to orbital phase
-    combined['phase'] = frac((combined['time'] - REF_EPOCH) / ORBITAL_PERIOD)
-    
-    print(f"Loaded {len(combined)} data points from {len(txt_files)} files for {band} band")
-    
+    band_dir = _resolve_band_directory(band, data_dir)
+    print(f"Loading {band} band data from: {band_dir}")
+
+    raw = _load_data_base(
+        band_dir,
+        obs_column=flux_column,
+        obs_error_column=error_column,
+        time_column=time_column,
+    )
+
+    combined = pd.DataFrame({
+        'time': raw['time'].astype(float),
+        'flux': raw['rate'].astype(float),
+        'flux_err': raw['error'].astype(float) if 'error' in raw.columns else np.nan,
+        'obs_id': raw['obs'] if 'obs' in raw.columns else 'data',
+    })
+
+    if 'phase' in raw.columns:
+        combined['phase'] = raw['phase'].astype(float)
+    else:
+        combined['phase'] = frac((combined['time'] - REF_EPOCH) / ORBITAL_PERIOD)
+
+    valid = (combined['flux'] > 0) & np.isfinite(combined['flux']) & np.isfinite(combined['time'])
+    combined = combined.loc[valid].reset_index(drop=True)
+
+    n_files = len(glob.glob(os.path.join(band_dir, "*.txt")))
+    print(f"Loaded {len(combined)} data points from {n_files} file(s) for {band} band")
+
     return combined
 
 
@@ -541,37 +544,34 @@ class PrecomputedModelGrid:
             print(f"Valid grid coverage: AV={valid_av*100:.1f}%, CV={valid_cv*100:.1f}%")
     
     def _setup_interpolators(self):
-        """Setup interpolators for the current wind model."""
-        # Select which grid to use based on wind model
+        """Setup a single 6D interpolator (params + phase) for vectorized evaluation."""
         if self.wind_model == 'av':
             self.flux_grid = self.flux_grid_av
         else:
             self.flux_grid = self.flux_grid_cv
-        
-        # Create interpolator for each phase point
-        self.interpolators = []
-        
-        d1_grid = self.param_grids['d1']
-        d2_grid = self.param_grids['d2']
-        r_grid = self.param_grids['r']
-        R_grid = self.param_grids['R']
-        i0_grid = self.param_grids['i0']
-        
-        for i_phase in range(len(self.phase_grid)):
-            flux_slice = self.flux_grid[:, :, :, :, :, i_phase].copy()
-            
-            # Replace NaN with mean for interpolation stability
-            if np.any(np.isnan(flux_slice)):
-                flux_slice = np.where(np.isnan(flux_slice), np.nanmean(flux_slice), flux_slice)
-            
-            interp = RegularGridInterpolator(
-                (d1_grid, d2_grid, r_grid, R_grid, i0_grid),
-                flux_slice,
-                method='linear',
-                bounds_error=False,
-                fill_value=np.nan
+
+        flux_grid_clean = self.flux_grid.copy()
+        if np.any(np.isnan(flux_grid_clean)):
+            flux_grid_clean = np.where(
+                np.isnan(flux_grid_clean),
+                np.nanmean(flux_grid_clean),
+                flux_grid_clean,
             )
-            self.interpolators.append(interp)
+
+        self._interp_6d = RegularGridInterpolator(
+            (
+                self.param_grids['d1'],
+                self.param_grids['d2'],
+                self.param_grids['r'],
+                self.param_grids['R'],
+                self.param_grids['i0'],
+                self.phase_grid,
+            ),
+            flux_grid_clean,
+            method='linear',
+            bounds_error=False,
+            fill_value=np.nan,
+        )
     
     def switch_wind_model(self, wind_model: str):
         """
@@ -711,6 +711,9 @@ class PrecomputedModelGrid:
         """
         Evaluate the model at given parameters using grid interpolation.
         
+        Uses a single vectorized 6D interpolation call (params + phase)
+        instead of looping over per-phase interpolators.
+        
         Parameters
         ----------
         d1, d2, r, R, i0 : float
@@ -723,23 +726,74 @@ class PrecomputedModelGrid:
         np.ndarray
             Interpolated flux values at requested phases
         """
-        # Get flux at each grid phase point
-        point = np.array([d1, d2, r, R, i0])
-        
-        grid_flux = np.array([interp(point)[0] for interp in self.interpolators])
-        
+        n_phase = len(self.phase_grid)
+        points = np.empty((n_phase, 6))
+        points[:, 0] = d1
+        points[:, 1] = d2
+        points[:, 2] = r
+        points[:, 3] = R
+        points[:, 4] = i0
+        points[:, 5] = self.phase_grid
+
+        grid_flux = self._interp_6d(points)
+
         if np.any(np.isnan(grid_flux)):
             return np.full_like(obs_phases, np.nan, dtype=float)
-        
-        # Interpolate to requested phases (with wrap-around)
+
         phase_extended = np.concatenate([
             self.phase_grid - 1,
             self.phase_grid,
             self.phase_grid + 1
         ])
         flux_extended = np.concatenate([grid_flux, grid_flux, grid_flux])
-        
+
         return np.interp(obs_phases, phase_extended, flux_extended)
+
+    def evaluate_direct(
+        self,
+        d1: float, d2: float, r: float, R: float, i0: float,
+        obs_phases: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate the model by running ``simulate_lightcurve`` directly.
+
+        Unlike :meth:`evaluate`, this bypasses the pre-computed grid and
+        produces the exact model curve.  Use this for final best-fit
+        evaluation and chi-square reporting.
+        """
+        flux_column = f"nfl_{self.band}_{self.wind_model}"
+        try:
+            results = simulate_lightcurve(
+                r=r, R=R, d1=d1, d2=d2,
+                gma0=self.sim_params.get('gma0', -90.0),
+                i0=i0,
+                dth=self.dth,
+                d2h=self.sim_params.get('d2h', 6.0),
+                dz=self.sim_params.get('dz', 0.1),
+                flux_method="interpolate",
+                flux_csv_path=self.flux_csv_path,
+                lam=self.sim_params.get('lam', 0.589537),
+                lam2=self.sim_params.get('lam2', 0.589537),
+                verbose=False,
+            )
+        except Exception as e:
+            warnings.warn(f"Direct model evaluation failed: {e}")
+            return np.full_like(obs_phases, np.nan)
+
+        if flux_column not in results.columns:
+            return np.full_like(obs_phases, np.nan)
+
+        model_phase = results['phase'].values
+        model_flux = results[flux_column].values
+        sort_idx = np.argsort(model_phase)
+
+        phase_ext = np.concatenate([
+            model_phase[sort_idx] - 1,
+            model_phase[sort_idx],
+            model_phase[sort_idx] + 1,
+        ])
+        flux_ext = np.tile(model_flux[sort_idx], 3)
+
+        return np.interp(obs_phases, phase_ext, flux_ext)
 
 
 # =============================================================================
@@ -826,61 +880,120 @@ class DirectLightCurveModel:
 
 
 # =============================================================================
-# MCMC Sampler
+# Likelihood Functions
 # =============================================================================
 
-def log_prior(theta: np.ndarray, priors: Dict = DEFAULT_PRIORS) -> float:
-    """Log prior probability for parameters."""
-    d1, d2, r, R, i0 = theta
-    
-    # Check hard bounds
-    if not (priors['d1']['min'] < d1 < priors['d1']['max']):
-        return -np.inf
-    if not (priors['d2']['min'] < d2 < priors['d2']['max']):
-        return -np.inf
-    if not (priors['r']['min'] < r < priors['r']['max']):
-        return -np.inf
-    if not (priors['R']['min'] < R < priors['R']['max']):
-        return -np.inf
-    if not (priors['i0']['min'] < i0 < priors['i0']['max']):
-        return -np.inf
-    
-    # Physical constraint: compact object must be inside the orbit
-    if r >= R:
-        return -np.inf
-    
-    # Gaussian priors (log probability)
-    log_p = 0.0
-    for param, value in zip(PARAM_NAMES, theta):
-        mean = priors[param]['mean']
-        std = priors[param]['std']
-        log_p += -0.5 * ((value - mean) / std) ** 2
-    
-    return log_p
+def _evaluate_model(theta, model, obs_phase):
+    """Evaluate the physical model. Returns model_flux or None on failure."""
+    d1, d2, r, R, i0 = theta[:5]
+    try:
+        model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
+    except Exception:
+        return None
+    if np.any(~np.isfinite(model_flux)):
+        return None
+    return model_flux
 
 
-def log_likelihood(
+def log_likelihood_chi2(
     theta: np.ndarray,
     model,
     obs_phase: np.ndarray,
     obs_flux: np.ndarray,
-    obs_err: np.ndarray
+    obs_err: np.ndarray,
 ) -> float:
-    """Log likelihood (chi-square statistic)."""
-    d1, d2, r, R, i0 = theta
-    
-    try:
-        model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
-    except Exception:
+    """Standard Gaussian log-likelihood (chi-squared)."""
+    model_flux = _evaluate_model(theta, model, obs_phase)
+    if model_flux is None:
         return -np.inf
-    
-    if np.any(~np.isfinite(model_flux)):
-        return -np.inf
-    
-    # Chi-square
     chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
-    
     return -0.5 * chi2
+
+
+def log_likelihood_jitter(
+    theta: np.ndarray,
+    model,
+    obs_phase: np.ndarray,
+    obs_flux: np.ndarray,
+    obs_err: np.ndarray,
+) -> float:
+    """Gaussian log-likelihood with a free fractional systematic error term.
+
+    theta must have 6 elements: [d1, d2, r, R, i0, log_f].
+    The effective variance per point is  sigma_obs^2 + (f * model)^2
+    where f = exp(log_f).  The log(sigma2) normalisation is included
+    so that inflating errors is properly penalised.
+    """
+    model_flux = _evaluate_model(theta, model, obs_phase)
+    if model_flux is None:
+        return -np.inf
+    f = np.exp(theta[5])
+    sigma2 = obs_err ** 2 + (f * model_flux) ** 2
+    return -0.5 * np.sum((obs_flux - model_flux) ** 2 / sigma2 + np.log(sigma2))
+
+
+def log_likelihood_studentt(
+    theta: np.ndarray,
+    model,
+    obs_phase: np.ndarray,
+    obs_flux: np.ndarray,
+    obs_err: np.ndarray,
+    nu: float = 5.0,
+) -> float:
+    """Student-t log-likelihood (heavier tails than Gaussian).
+
+    ``nu`` controls tail weight; nu -> inf recovers the Gaussian.
+    """
+    model_flux = _evaluate_model(theta, model, obs_phase)
+    if model_flux is None:
+        return -np.inf
+    resid = (obs_flux - model_flux) / obs_err
+    ll = (
+        gammaln(0.5 * (nu + 1))
+        - gammaln(0.5 * nu)
+        - 0.5 * np.log(nu * np.pi)
+        - np.log(obs_err)
+        - 0.5 * (nu + 1) * np.log(1.0 + resid ** 2 / nu)
+    )
+    return float(np.sum(ll))
+
+
+# Keep the old name as an alias so existing imports keep working
+log_likelihood = log_likelihood_chi2
+
+
+# =============================================================================
+# Prior & Posterior
+# =============================================================================
+
+def log_prior(
+    theta: np.ndarray,
+    priors: Dict = DEFAULT_PRIORS,
+    likelihood: str = 'chi2',
+) -> float:
+    """Log prior probability for physical + nuisance parameters."""
+    d1, d2, r, R, i0 = theta[:5]
+
+    for i, param in enumerate(PARAM_NAMES):
+        if not (priors[param]['min'] < theta[i] < priors[param]['max']):
+            return -np.inf
+
+    if r >= R:
+        return -np.inf
+
+    log_p = 0.0
+    for param, value in zip(PARAM_NAMES, theta[:5]):
+        mean = priors[param]['mean']
+        std = priors[param]['std']
+        log_p += -0.5 * ((value - mean) / std) ** 2
+
+    if likelihood == 'jitter':
+        log_f = theta[5]
+        if not (JITTER_PRIOR['min'] < log_f < JITTER_PRIOR['max']):
+            return -np.inf
+        log_p += -0.5 * ((log_f - JITTER_PRIOR['mean']) / JITTER_PRIOR['std']) ** 2
+
+    return log_p
 
 
 def log_probability(
@@ -889,17 +1002,28 @@ def log_probability(
     obs_phase: np.ndarray,
     obs_flux: np.ndarray,
     obs_err: np.ndarray,
-    priors: Dict = DEFAULT_PRIORS
+    priors: Dict = DEFAULT_PRIORS,
+    likelihood: str = 'chi2',
+    studentt_nu: float = 5.0,
 ) -> float:
-    """Log posterior probability = log prior + log likelihood."""
-    lp = log_prior(theta, priors)
+    """Log posterior = log prior + log likelihood."""
+    lp = log_prior(theta, priors, likelihood=likelihood)
     if not np.isfinite(lp):
         return -np.inf
-    
-    ll = log_likelihood(theta, model, obs_phase, obs_flux, obs_err)
-    
+
+    if likelihood == 'jitter':
+        ll = log_likelihood_jitter(theta, model, obs_phase, obs_flux, obs_err)
+    elif likelihood == 'studentt':
+        ll = log_likelihood_studentt(theta, model, obs_phase, obs_flux, obs_err, nu=studentt_nu)
+    else:
+        ll = log_likelihood_chi2(theta, model, obs_phase, obs_flux, obs_err)
+
     return lp + ll
 
+
+# =============================================================================
+# MCMC Sampler (emcee / zeus)
+# =============================================================================
 
 def run_mcmc(
     model,
@@ -911,10 +1035,13 @@ def run_mcmc(
     n_burn: int = 1000,
     priors: Dict = DEFAULT_PRIORS,
     progress: bool = True,
-    n_threads: int = 1
-) -> Tuple[emcee.EnsembleSampler, np.ndarray]:
+    n_threads: int = 1,
+    sampler_type: str = 'emcee',
+    likelihood: str = 'chi2',
+    studentt_nu: float = 5.0,
+) -> Tuple:
     """
-    Run MCMC sampling.
+    Run MCMC sampling with emcee or zeus.
     
     Parameters
     ----------
@@ -934,100 +1061,112 @@ def run_mcmc(
         Show progress bar
     n_threads : int
         Number of threads for parallel MCMC (1 = serial)
-        Note: With pre-computed grid, parallelization may not help much
+    sampler_type : str
+        'emcee' or 'zeus'
+    likelihood : str
+        'chi2', 'jitter', or 'studentt'
+    studentt_nu : float
+        Degrees-of-freedom for Student-t likelihood
         
     Returns
     -------
-    sampler : emcee.EnsembleSampler
-        The MCMC sampler object
+    sampler : emcee.EnsembleSampler or zeus.EnsembleSampler
     samples : np.ndarray
         Flattened chain samples (after burn-in)
+    active_param_names : list of str
+    active_param_labels : list of str
     """
-    n_dim = len(PARAM_NAMES)
-    
-    # Initialize walkers around prior means with small scatter
+    active_names, active_labels = get_param_config(likelihood)
+    n_dim = len(active_names)
+
+    # Initial positions for physical parameters
     initial = np.array([priors[p]['mean'] for p in PARAM_NAMES])
     scatter = np.array([priors[p]['std'] * 0.1 for p in PARAM_NAMES])
-    
-    # Generate initial positions
+    if likelihood == 'jitter':
+        initial = np.append(initial, JITTER_PRIOR['mean'])
+        scatter = np.append(scatter, JITTER_PRIOR['std'] * 0.1)
+
     pos = initial + scatter * np.random.randn(n_walkers, n_dim)
-    
-    # Ensure initial positions are within bounds
+
     for i, param in enumerate(PARAM_NAMES):
-        pos[:, i] = np.clip(pos[:, i], 
-                           priors[param]['min'] * 1.01, 
-                           priors[param]['max'] * 0.99)
-    
-    # Ensure r < R for all walkers
+        pos[:, i] = np.clip(pos[:, i],
+                            priors[param]['min'] * 1.01,
+                            priors[param]['max'] * 0.99)
+    if likelihood == 'jitter':
+        pos[:, 5] = np.clip(pos[:, 5],
+                            JITTER_PRIOR['min'] * 0.99,
+                            JITTER_PRIOR['max'] * 0.99)
     for j in range(n_walkers):
-        if pos[j, 2] >= pos[j, 3]:  # r >= R
+        if pos[j, 2] >= pos[j, 3]:
             pos[j, 2] = pos[j, 3] * 0.1
-    
+
     parallel_info = f", {n_threads} threads" if n_threads > 1 else " (serial)"
-    print(f"\nStarting MCMC with {n_walkers} walkers, {n_steps} steps{parallel_info}...")
+    print(f"\nStarting MCMC ({sampler_type}) with {n_walkers} walkers, "
+          f"{n_steps} steps{parallel_info}")
+    print(f"Likelihood: {LIKELIHOOD_TYPES[likelihood]}")
     print(f"Initial parameter values (first walker): {pos[0]}")
-    
-    # Create sampler (optionally with multiprocessing)
-    if n_threads > 1:
-        from multiprocessing import Pool as MPPool
-        with MPPool(n_threads) as pool:
+
+    log_prob_args = (model, obs_phase, obs_flux, obs_err, priors, likelihood, studentt_nu)
+
+    start_time = time.time()
+
+    if sampler_type == 'zeus':
+        if not HAS_ZEUS:
+            raise ImportError("zeus not installed. Install with: pip install zeus-mcmc")
+        sampler = zeus_sampler.EnsembleSampler(
+            n_walkers, n_dim, log_probability, args=log_prob_args
+        )
+        sampler.run_mcmc(pos, n_steps, progress=progress)
+    else:
+        if n_threads > 1:
+            from multiprocessing import Pool as MPPool
+            with MPPool(n_threads) as pool:
+                sampler = emcee.EnsembleSampler(
+                    n_walkers, n_dim, log_probability,
+                    args=log_prob_args, pool=pool,
+                )
+                if progress and HAS_TQDM:
+                    for _ in tqdm(sampler.sample(pos, iterations=n_steps),
+                                  total=n_steps, desc="MCMC Sampling"):
+                        pass
+                else:
+                    sampler.run_mcmc(pos, n_steps, progress=progress)
+        else:
             sampler = emcee.EnsembleSampler(
                 n_walkers, n_dim, log_probability,
-                args=(model, obs_phase, obs_flux, obs_err, priors),
-                pool=pool
+                args=log_prob_args,
             )
-            
-            # Run MCMC
-            start_time = time.time()
             if progress and HAS_TQDM:
-                for _ in tqdm(sampler.sample(pos, iterations=n_steps), 
+                for _ in tqdm(sampler.sample(pos, iterations=n_steps),
                               total=n_steps, desc="MCMC Sampling"):
                     pass
             else:
                 sampler.run_mcmc(pos, n_steps, progress=progress)
-            elapsed = time.time() - start_time
-    else:
-        sampler = emcee.EnsembleSampler(
-            n_walkers, n_dim, log_probability,
-            args=(model, obs_phase, obs_flux, obs_err, priors)
-        )
-        
-        # Run MCMC with timing and progress bar
-        start_time = time.time()
-        
-        if progress and HAS_TQDM:
-            for _ in tqdm(sampler.sample(pos, iterations=n_steps), 
-                          total=n_steps, desc="MCMC Sampling"):
-                pass
-        else:
-            sampler.run_mcmc(pos, n_steps, progress=progress)
-        
-        elapsed = time.time() - start_time
-    
-    # Get samples after burn-in
+
+    elapsed = time.time() - start_time
+
     samples = sampler.get_chain(discard=n_burn, flat=True)
-    
+
     print(f"\nMCMC completed in {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
     print(f"Time per step: {elapsed/n_steps*1000:.1f} ms")
     print(f"Final chain shape: {samples.shape}")
-    
-    return sampler, samples
+
+    return sampler, samples, active_names, active_labels
 
 
 # =============================================================================
 # Output and Diagnostics
 # =============================================================================
 
-def compute_statistics(samples: np.ndarray) -> Dict:
+def compute_statistics(samples: np.ndarray, param_names: List[str] = None) -> Dict:
     """Compute summary statistics from MCMC samples."""
+    if param_names is None:
+        param_names = PARAM_NAMES
     stats = {}
-    
-    for i, param in enumerate(PARAM_NAMES):
+
+    for i, param in enumerate(param_names):
         param_samples = samples[:, i]
-        
-        # Percentiles
         p16, p50, p84 = np.percentile(param_samples, [16, 50, 84])
-        
         stats[param] = {
             'median': p50,
             'lower': p50 - p16,
@@ -1035,7 +1174,7 @@ def compute_statistics(samples: np.ndarray) -> Dict:
             'mean': np.mean(param_samples),
             'std': np.std(param_samples)
         }
-    
+
     return stats
 
 
@@ -1187,67 +1326,79 @@ def compute_chi2_for_samples(
         print(f"Chi-square data saved to: {output_path} ({file_size:.1f} KB)")
 
 
-def print_results(stats: Dict, band: str, wind_model: str):
+def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str] = None):
     """Print formatted results table."""
+    if param_names is None:
+        param_names = PARAM_NAMES
     print(f"\n{'='*60}")
     print(f"MCMC Results for {band.upper()} band - {WIND_MODELS[wind_model]}")
     print('='*60)
     print(f"{'Parameter':<15} {'Median':<12} {'Lower σ':<12} {'Upper σ':<12}")
     print('-'*60)
-    
-    for param in PARAM_NAMES:
+
+    for param in param_names:
         s = stats[param]
         print(f"{param:<15} {s['median']:<12.6f} {s['lower']:<12.6f} {s['upper']:<12.6f}")
-    
+
     print('='*60)
 
 
-def plot_corner(samples: np.ndarray, band: str, wind_model: str, output_path: str):
+def plot_corner(samples: np.ndarray, band: str, wind_model: str, output_path: str,
+                param_labels: List[str] = None):
     """Generate corner plot of posterior distributions."""
     if corner is None:
         warnings.warn("corner package not installed, skipping corner plot")
         return
-    
+    if param_labels is None:
+        param_labels = PARAM_LABELS
+
     fig = corner.corner(
         samples,
-        labels=PARAM_LABELS,
+        labels=param_labels,
         quantiles=[0.16, 0.5, 0.84],
         show_titles=True,
         title_kwargs={"fontsize": 12},
         title_fmt=".4f"
     )
-    
-    fig.suptitle(f"Posterior Distributions - {band.upper()} band ({wind_model.upper()})", 
+
+    fig.suptitle(f"Posterior Distributions - {band.upper()} band ({wind_model.upper()})",
                  fontsize=14, y=1.02)
-    
+
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     print(f"Corner plot saved to: {output_path}")
 
 
-def plot_trace(sampler: emcee.EnsembleSampler, band: str, wind_model: str, output_path: str):
+def plot_trace(sampler, band: str, wind_model: str, output_path: str,
+               param_labels: List[str] = None, n_burn: int = None):
     """Generate trace plots for convergence diagnostics."""
     chain = sampler.get_chain()
     n_steps, n_walkers, n_dim = chain.shape
-    
+    if param_labels is None:
+        param_labels = PARAM_LABELS
+    if n_burn is None:
+        n_burn = n_steps // 5
+
     fig, axes = plt.subplots(n_dim, 1, figsize=(10, 2*n_dim), sharex=True)
-    
+    if n_dim == 1:
+        axes = [axes]
+
     for i, ax in enumerate(axes):
         for j in range(n_walkers):
             ax.plot(chain[:, j, i], alpha=0.3, lw=0.5)
-        ax.set_ylabel(PARAM_LABELS[i])
-        ax.axvline(x=sampler.iteration // 5, color='r', linestyle='--', 
+        ax.set_ylabel(param_labels[i] if i < len(param_labels) else f"param {i}")
+        ax.axvline(x=n_burn, color='r', linestyle='--',
                    alpha=0.5, label='Burn-in' if i == 0 else None)
-    
+
     axes[-1].set_xlabel("Step")
     axes[0].legend(loc='upper right')
     fig.suptitle(f"MCMC Trace Plots - {band.upper()} band ({wind_model.upper()})", fontsize=14)
-    
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     print(f"Trace plot saved to: {output_path}")
 
 
@@ -1260,15 +1411,11 @@ def plot_best_fit(
     band: str,
     wind_model: str,
     output_path: str,
-    samples: np.ndarray = None,
-    n_samples_for_ci: int = 200,
-    ci_percentiles: Tuple[float, float] = (16, 84),
-    ci_style: str = 'band',
-    ci_method: str = 'bounds'
+    param_names: List[str] = None,
 ):
     """
-    Plot observed data with best-fit model overlay and confidence intervals.
-    
+    Plot observed data with best-fit model overlay.
+
     Parameters
     ----------
     model : PrecomputedModelGrid or DirectLightCurveModel
@@ -1283,170 +1430,311 @@ def plot_best_fit(
         Wind model name
     output_path : str
         Path to save the plot
-    samples : np.ndarray, optional
-        MCMC samples array (n_samples, n_params). If provided and ci_method='samples',
-        confidence intervals are computed from these samples.
-    n_samples_for_ci : int
-        Number of random samples to use for computing confidence intervals.
-        Default is 200 for balance between accuracy and speed.
-    ci_percentiles : tuple
-        Lower and upper percentiles for confidence interval (default: 16, 84 = 1-sigma)
-    ci_style : str
-        Style for displaying confidence interval:
-        - 'band': Shaded region between percentiles (default)
-        - 'lines': Dashed lines at percentile bounds
-        - 'both': Both shaded band and dashed lines
-    ci_method : str
-        Method for computing confidence intervals:
-        - 'bounds': Use +/- parameter ranges from MCMC summary (faster, default)
-        - 'samples': Draw from full posterior samples (more accurate for correlated params)
     """
-    # Get best-fit parameters
-    best_params = [stats[p]['median'] for p in PARAM_NAMES]
-    
-    # Generate model curve at fine phase resolution
+    if param_names is None:
+        param_names = PARAM_NAMES
+    phys_names = PARAM_NAMES
+
+    best_params = [stats[p]['median'] for p in phys_names]
+
+    # Use direct simulation (exact) instead of grid interpolation.
+    eval_fn = getattr(model, 'evaluate_direct', model.evaluate)
+
     model_phases = np.linspace(0, 1, 360)
-    model_flux = model.evaluate(*best_params, model_phases)
-    
-    # Compute chi-square
-    obs_model = model.evaluate(*best_params, obs_phase)
+    model_flux = eval_fn(*best_params, model_phases)
+
+    obs_model = eval_fn(*best_params, obs_phase)
     chi2 = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
-    dof = len(obs_flux) - len(PARAM_NAMES)
+    dof = len(obs_flux) - len(phys_names)
     red_chi2 = chi2 / dof if dof > 0 else np.nan
-    
-    # Compute confidence intervals
-    ci_lower = None
-    ci_upper = None
-    
-    if ci_method == 'bounds':
-        # Use +/- parameter bounds directly from MCMC summary
-        print("Computing confidence intervals from parameter bounds...")
-        
-        # Lower bound: median - lower_sigma for each parameter
-        lower_params = [stats[p]['median'] - stats[p]['lower'] for p in PARAM_NAMES]
-        # Upper bound: median + upper_sigma for each parameter
-        upper_params = [stats[p]['median'] + stats[p]['upper'] for p in PARAM_NAMES]
-        
-        ci_lower_flux = model.evaluate(*lower_params, model_phases)
-        ci_upper_flux = model.evaluate(*upper_params, model_phases)
-        
-        # Take the min/max at each phase to form the envelope
-        if np.all(np.isfinite(ci_lower_flux)) and np.all(np.isfinite(ci_upper_flux)):
-            ci_lower = np.minimum(ci_lower_flux, ci_upper_flux)
-            ci_upper = np.maximum(ci_lower_flux, ci_upper_flux)
-            print("  Using parameter bounds for confidence envelope")
-        else:
-            print("  Warning: Could not evaluate bounds, skipping CI")
-    
-    elif ci_method == 'samples' and samples is not None and len(samples) > 0:
-        print(f"Computing confidence intervals from {min(n_samples_for_ci, len(samples))} posterior samples...")
-        
-        # Randomly select samples for CI computation
-        n_use = min(n_samples_for_ci, len(samples))
-        sample_indices = np.random.choice(len(samples), size=n_use, replace=False)
-        
-        # Compute model flux for each sample
-        all_model_fluxes = []
-        for idx in sample_indices:
-            sample_params = samples[idx]
-            sample_flux = model.evaluate(*sample_params, model_phases)
-            if np.all(np.isfinite(sample_flux)):
-                all_model_fluxes.append(sample_flux)
-        
-        if len(all_model_fluxes) > 10:  # Need enough valid samples
-            all_model_fluxes = np.array(all_model_fluxes)
-            ci_lower = np.percentile(all_model_fluxes, ci_percentiles[0], axis=0)
-            ci_upper = np.percentile(all_model_fluxes, ci_percentiles[1], axis=0)
-            print(f"  Used {len(all_model_fluxes)} valid samples for confidence bands")
-        else:
-            print(f"  Warning: Only {len(all_model_fluxes)} valid samples, skipping CI")
-    
-    # Plot
+
     fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # Plot confidence interval first (so it's behind other elements)
-    if ci_lower is not None and ci_upper is not None:
-        if ci_style in ['band', 'both']:
-            ax.fill_between(
-                model_phases, ci_lower, ci_upper,
-                alpha=0.3, color='red',
-                label=f'{ci_percentiles[0]:.0f}-{ci_percentiles[1]:.0f}% CI'
-            )
-        if ci_style in ['lines', 'both']:
-            ax.plot(model_phases, ci_lower, 'r--', lw=1, alpha=0.7,
-                    label=f'{ci_percentiles[0]:.0f}% bound' if ci_style == 'lines' else None)
-            ax.plot(model_phases, ci_upper, 'r--', lw=1, alpha=0.7,
-                    label=f'{ci_percentiles[1]:.0f}% bound' if ci_style == 'lines' else None)
-    
-    # Observed data with error bars
-    ax.errorbar(obs_phase, obs_flux, yerr=obs_err, fmt='o', 
+
+    ax.errorbar(obs_phase, obs_flux, yerr=obs_err, fmt='o',
                 markersize=4, alpha=0.7, label='Observed (phase-binned)',
                 capsize=2, elinewidth=1, color='C0', zorder=5)
-    
-    # Best-fit model (solid line on top)
-    ax.plot(model_phases, model_flux, 'r-', lw=2, 
+
+    ax.plot(model_phases, model_flux, 'r-', lw=2,
             label=f'Best-fit model ({WIND_MODELS[wind_model]})', zorder=10)
-    
+
     ax.set_xlabel('Orbital Phase', fontsize=12)
     ax.set_ylabel('Flux (erg/cm²/s)', fontsize=12)
-    ax.set_title(f'{band.upper()} Band - {wind_model.upper()} Wind (χ²/dof = {red_chi2:.2f})', 
-                 fontsize=14)
+    ax.set_title(f'{band.upper()} Band - {wind_model.upper()} Wind '
+                 f'(χ²/dof = {red_chi2:.2f})', fontsize=14)
     ax.legend(loc='best')
     ax.grid(alpha=0.3)
-    
-    # Add parameter annotation
+
     param_text = '\n'.join([
-        f"{p}: {stats[p]['median']:.4f} ± {(stats[p]['lower']+stats[p]['upper'])/2:.4f}"
-        for p in PARAM_NAMES
+        f"{p}: {stats[p]['median']:.4f} +/- {(stats[p]['lower']+stats[p]['upper'])/2:.4f}"
+        for p in param_names
     ])
     ax.text(0.02, 0.98, param_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     print(f"Best-fit plot saved to: {output_path}")
-    
+
     return red_chi2
 
 
-def print_diagnostics(sampler: emcee.EnsembleSampler):
-    """Print MCMC diagnostics."""
+def print_diagnostics(sampler, sampler_type: str = 'emcee',
+                      param_names: List[str] = None):
+    """Print MCMC diagnostics (works for emcee and zeus)."""
+    if param_names is None:
+        param_names = PARAM_NAMES
     print("\n" + "="*60)
-    print("MCMC Diagnostics")
+    print(f"MCMC Diagnostics  ({sampler_type})")
     print("="*60)
-    
-    # Acceptance fraction
-    acc_frac = np.mean(sampler.acceptance_fraction)
-    print(f"Mean acceptance fraction: {acc_frac:.3f}")
-    if acc_frac < 0.2:
-        print("  ⚠️  Low acceptance fraction - consider adjusting priors")
-    elif acc_frac > 0.5:
-        print("  ⚠️  High acceptance fraction - chain may not be mixing well")
-    else:
-        print("  ✓ Acceptance fraction in optimal range (0.2-0.5)")
-    
+
+    # Acceptance fraction (emcee only)
+    if sampler_type == 'emcee' and hasattr(sampler, 'acceptance_fraction'):
+        acc_frac = np.mean(sampler.acceptance_fraction)
+        print(f"Mean acceptance fraction: {acc_frac:.3f}")
+        if acc_frac < 0.2:
+            print("  WARNING: Low acceptance fraction - consider adjusting priors")
+        elif acc_frac > 0.5:
+            print("  WARNING: High acceptance fraction - chain may not be mixing well")
+        else:
+            print("  OK: Acceptance fraction in optimal range (0.2-0.5)")
+
     # Autocorrelation time
     try:
-        tau = sampler.get_autocorr_time(quiet=True)
-        print(f"\nAutocorrelation times:")
-        for i, param in enumerate(PARAM_NAMES):
-            print(f"  {param}: {tau[i]:.1f} steps")
-        
-        n_steps = sampler.iteration
-        n_independent = n_steps / np.max(tau)
-        print(f"\nEffective independent samples: ~{int(n_independent * sampler.nwalkers)}")
-        
-        if n_steps < 50 * np.max(tau):
-            print("  ⚠️  Chain may not be converged. Consider running longer.")
+        if sampler_type == 'emcee' and hasattr(sampler, 'get_autocorr_time'):
+            tau = sampler.get_autocorr_time(quiet=True)
         else:
-            print("  ✓ Chain appears well-converged")
+            chain = sampler.get_chain()
+            tau = np.array([
+                emcee.autocorr.integrated_time(chain[:, :, i].mean(axis=1), quiet=True)[0]
+                for i in range(chain.shape[2])
+            ])
+        print(f"\nAutocorrelation times:")
+        for i, param in enumerate(param_names):
+            if i < len(tau):
+                print(f"  {param}: {tau[i]:.1f} steps")
+
+        chain = sampler.get_chain()
+        n_steps = chain.shape[0]
+        n_walkers = chain.shape[1]
+        n_independent = n_steps / np.max(tau)
+        print(f"\nEffective independent samples: ~{int(n_independent * n_walkers)}")
+
+        if n_steps < 50 * np.max(tau):
+            print("  WARNING: Chain may not be converged. Consider running longer.")
+        else:
+            print("  OK: Chain appears well-converged")
     except Exception:
         print("\nAutocorrelation time: Could not compute (chain too short)")
-    
+
     print("="*60)
+
+
+# =============================================================================
+# ArviZ Diagnostics & Model Comparison
+# =============================================================================
+
+def compute_pointwise_loglik(
+    samples: np.ndarray,
+    model,
+    obs_phase: np.ndarray,
+    obs_flux: np.ndarray,
+    obs_err: np.ndarray,
+    likelihood: str = 'chi2',
+    studentt_nu: float = 5.0,
+    n_samples: int = 200,
+) -> np.ndarray:
+    """Compute per-observation log-likelihood for a subset of posterior samples.
+
+    Returns array of shape (n_samples_used, n_obs).
+    """
+    n_total = len(samples)
+    n_use = min(n_samples, n_total)
+    indices = np.random.choice(n_total, size=n_use, replace=False)
+    n_obs = len(obs_phase)
+    log_lik = np.full((n_use, n_obs), np.nan)
+
+    for k, idx in enumerate(indices):
+        theta = samples[idx]
+        model_flux = _evaluate_model(theta, model, obs_phase)
+        if model_flux is None:
+            continue
+
+        if likelihood == 'jitter':
+            f = np.exp(theta[5])
+            sigma2 = obs_err ** 2 + (f * model_flux) ** 2
+            log_lik[k] = -0.5 * ((obs_flux - model_flux) ** 2 / sigma2
+                                  + np.log(sigma2) + np.log(2 * np.pi))
+        elif likelihood == 'studentt':
+            nu = studentt_nu
+            resid = (obs_flux - model_flux) / obs_err
+            log_lik[k] = (
+                gammaln(0.5 * (nu + 1)) - gammaln(0.5 * nu)
+                - 0.5 * np.log(nu * np.pi) - np.log(obs_err)
+                - 0.5 * (nu + 1) * np.log(1.0 + resid ** 2 / nu)
+            )
+        else:
+            log_lik[k] = (
+                -0.5 * ((obs_flux - model_flux) / obs_err) ** 2
+                - np.log(obs_err) - 0.5 * np.log(2 * np.pi)
+            )
+
+    valid = ~np.any(np.isnan(log_lik), axis=1)
+    return log_lik[valid]
+
+
+def _build_inference_data(posterior_dict, log_lik_dict=None):
+    """Construct an ArviZ inference object from plain numpy dicts.
+
+    Works across ArviZ versions: legacy (<= 0.17) uses InferenceData,
+    modern (1.0+) uses xarray.DataTree via ``az.from_dict``.
+
+    Parameters
+    ----------
+    posterior_dict : dict[str, ndarray]
+        {param_name: array(chain, draw)}
+    log_lik_dict : dict[str, ndarray] or None
+        {name: array(chain, draw, obs)}
+    """
+    groups = {"posterior": posterior_dict}
+    if log_lik_dict is not None:
+        groups["log_likelihood"] = log_lik_dict
+
+    # ArviZ >= 1.0: from_dict takes a single positional dict
+    #   az.from_dict({"posterior": {...}, "log_likelihood": {...}})
+    try:
+        return az.from_dict(groups)
+    except (TypeError, AttributeError):
+        pass
+
+    # ArviZ < 1.0: from_dict takes keyword arguments
+    #   az.from_dict(posterior={...}, log_likelihood={...})
+    try:
+        return az.from_dict(**groups)
+    except (TypeError, AttributeError):
+        pass
+
+    raise RuntimeError(
+        f"Could not build inference data with arviz {getattr(az, '__version__', '?')}. "
+        "Try: pip install --upgrade arviz"
+    )
+
+
+def run_arviz_diagnostics(
+    sampler=None,
+    param_names: List[str] = None,
+    n_burn: int = 0,
+    model=None,
+    obs_phase: np.ndarray = None,
+    obs_flux: np.ndarray = None,
+    obs_err: np.ndarray = None,
+    likelihood: str = 'chi2',
+    studentt_nu: float = 5.0,
+    compute_waic: bool = False,
+    n_samples_waic: int = 200,
+    output_dir: str = None,
+    suffix: str = '',
+    chain: np.ndarray = None,
+    samples_flat: np.ndarray = None,
+):
+    """Run ArviZ convergence diagnostics and optionally WAIC/LOO.
+
+    Accepts either a live *sampler* object or pre-saved arrays
+    (*chain* and/or *samples_flat*) so diagnostics can be run
+    without re-running MCMC.
+
+    Parameters
+    ----------
+    sampler : emcee/zeus sampler, optional
+        Live sampler (used when called right after MCMC).
+    chain : np.ndarray, optional
+        Saved chain array of shape (steps, walkers, dim).
+        Used when *sampler* is None (e.g. loaded from disk).
+    samples_flat : np.ndarray, optional
+        Flat samples array (n_samples, dim). Derived from *chain*
+        or *sampler* if not provided.
+
+    Returns the ArviZ inference object (or None if ArviZ is unavailable).
+    """
+    if not HAS_ARVIZ:
+        print("arviz not installed. Install with: pip install arviz")
+        return None
+    if param_names is None:
+        param_names = PARAM_NAMES
+
+    # Obtain chain and flat samples from whichever source is available
+    if chain is None and sampler is not None:
+        chain = sampler.get_chain(discard=n_burn)
+    if samples_flat is None:
+        if sampler is not None:
+            samples_flat = sampler.get_chain(discard=n_burn, flat=True)
+        elif chain is not None:
+            n_steps, n_walkers, n_dim = chain.shape
+            samples_flat = chain.reshape(-1, n_dim)
+
+    if chain is None:
+        print("No chain data available for ArviZ diagnostics.")
+        return None
+
+    # posterior_dict: ArviZ wants (chain=walkers, draw=steps)
+    posterior_dict = {
+        name: chain[:, :, i].T for i, name in enumerate(param_names)
+    }
+
+    log_lik_dict = None
+    if compute_waic and model is not None and samples_flat is not None:
+        print(f"Computing per-point log-likelihoods for WAIC/LOO ({n_samples_waic} samples)...")
+        ll = compute_pointwise_loglik(
+            samples_flat, model, obs_phase, obs_flux, obs_err,
+            likelihood=likelihood, studentt_nu=studentt_nu,
+            n_samples=n_samples_waic,
+        )
+        if ll.shape[0] > 10:
+            log_lik_dict = {"obs": ll[np.newaxis, :, :]}
+
+    idata = _build_inference_data(posterior_dict, log_lik_dict)
+
+    print("\n--- ArviZ Summary ---")
+    summary = az.summary(idata)
+    print(summary)
+
+    has_ll = (
+        hasattr(idata, "log_likelihood")
+        or (hasattr(idata, "children") and "log_likelihood" in idata.children)
+    )
+    if has_ll:
+        if hasattr(az, "waic"):
+            try:
+                waic = az.waic(idata)
+                waic_val = getattr(waic, "elpd_waic", None) or getattr(waic, "waic", None)
+                waic_se = getattr(waic, "se", getattr(waic, "waic_se", None))
+                print(f"\nWAIC: {waic_val:.2f}" + (f" +/- {waic_se:.2f}" if waic_se else ""))
+            except Exception as e:
+                print(f"WAIC computation failed: {e}")
+        else:
+            print("\nWAIC: not available in this ArviZ version (removed in 1.0); using LOO instead.")
+        try:
+            loo = az.loo(idata)
+            loo_val = getattr(loo, "elpd", None) or getattr(loo, "elpd_loo", None) or getattr(loo, "loo", None)
+            loo_se = getattr(loo, "se", getattr(loo, "loo_se", None))
+            if loo_val is not None:
+                msg = f"LOO:  {loo_val:.2f}"
+                if loo_se is not None:
+                    msg += f" +/- {loo_se:.2f}"
+                print(msg)
+            else:
+                print(f"LOO:  {loo}")
+        except Exception as e:
+            print(f"LOO computation failed: {e}")
+
+    if output_dir:
+        csv_path = os.path.join(output_dir, f"{suffix}_arviz_summary.csv" if suffix else "arviz_summary.csv")
+        summary.to_csv(csv_path)
+        print(f"ArviZ summary saved to: {csv_path}")
+
+    return idata
 
 
 # =============================================================================
@@ -1520,8 +1808,13 @@ def run_single_fit(
         if args.save_grid:
             model.save(args.save_grid)
     
+    # Resolve sampler / likelihood from CLI args
+    sampler_type = getattr(args, 'sampler', 'emcee')
+    likelihood = getattr(args, 'likelihood', 'chi2')
+    studentt_nu = getattr(args, 'studentt_nu', 5.0)
+
     # Run MCMC
-    sampler, samples = run_mcmc(
+    sampler, samples, active_names, active_labels = run_mcmc(
         model=model,
         obs_phase=obs_phase,
         obs_flux=obs_flux,
@@ -1531,56 +1824,82 @@ def run_single_fit(
         n_burn=args.n_burn,
         priors=priors,
         progress=not args.quiet,
-        n_threads=args.n_threads
+        n_threads=args.n_threads,
+        sampler_type=sampler_type,
+        likelihood=likelihood,
+        studentt_nu=studentt_nu,
     )
-    
+
     # Compute statistics
-    stats = compute_statistics(samples)
-    print_results(stats, band, wind_model)
-    print_diagnostics(sampler)
-    
+    stats = compute_statistics(samples, param_names=active_names)
+    print_results(stats, band, wind_model, param_names=active_names)
+    print_diagnostics(sampler, sampler_type=sampler_type, param_names=active_names)
+
+    # ArviZ diagnostics
+    compute_waic = getattr(args, 'compute_waic', False)
+    run_arviz_diagnostics(
+        sampler, active_names, args.n_burn,
+        model=model, obs_phase=obs_phase, obs_flux=obs_flux, obs_err=obs_err,
+        likelihood=likelihood, studentt_nu=studentt_nu,
+        compute_waic=compute_waic,
+        output_dir=args.output_dir,
+        suffix=f"{band}_{wind_model}",
+    )
+
     # Generate file suffix
     suffix = f"{band}_{wind_model}"
-    
+
     # Generate plots
     if not args.no_plots:
         plot_corner(
             samples, band, wind_model,
-            os.path.join(args.output_dir, f"{suffix}_corner.png")
+            os.path.join(args.output_dir, f"{suffix}_corner.png"),
+            param_labels=active_labels,
         )
         plot_trace(
             sampler, band, wind_model,
-            os.path.join(args.output_dir, f"{suffix}_trace.png")
+            os.path.join(args.output_dir, f"{suffix}_trace.png"),
+            param_labels=active_labels,
+            n_burn=args.n_burn,
         )
-        # Parse CI percentiles
-        ci_percentiles = (16, 84)  # default
-        if hasattr(args, 'ci_percentiles') and args.ci_percentiles:
-            try:
-                parts = [float(x.strip()) for x in args.ci_percentiles.split(',')]
-                if len(parts) == 2:
-                    ci_percentiles = tuple(parts)
-            except (ValueError, AttributeError):
-                pass
-        
         red_chi2 = plot_best_fit(
             model, obs_phase, obs_flux, obs_err, stats, band, wind_model,
             os.path.join(args.output_dir, f"{suffix}_bestfit.png"),
-            samples=samples,
-            n_samples_for_ci=getattr(args, 'n_samples_ci', 200),
-            ci_percentiles=ci_percentiles,
-            ci_style=getattr(args, 'ci_style', 'band'),
-            ci_method=getattr(args, 'ci_method', 'bounds')
+            param_names=active_names,
         )
         stats['reduced_chi2'] = red_chi2
-    
-    # Save samples
-    samples_df = pd.DataFrame(samples, columns=PARAM_NAMES)
+
+    # Save samples with log-probability (flat CSV)
+    samples_df = pd.DataFrame(samples, columns=active_names)
+    try:
+        log_prob = sampler.get_log_prob(discard=args.n_burn, flat=True)
+        samples_df['log_prob'] = log_prob
+    except Exception:
+        pass
     samples_df.to_csv(
         os.path.join(args.output_dir, f"{suffix}_samples.csv"),
         index=False
     )
     print(f"Samples saved to: {args.output_dir}/{suffix}_samples.csv")
-    
+
+    # Save full chain (walkers preserved) for post-hoc diagnostics / WAIC
+    try:
+        chain_full = sampler.get_chain(discard=args.n_burn)
+        log_prob_chain = sampler.get_log_prob(discard=args.n_burn)
+        chain_path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
+        np.savez_compressed(
+            chain_path,
+            chain=chain_full,
+            log_prob=log_prob_chain,
+            param_names=active_names,
+            n_burn=args.n_burn,
+            likelihood=likelihood,
+            studentt_nu=studentt_nu,
+        )
+        print(f"Full chain saved to: {chain_path}")
+    except Exception as e:
+        warnings.warn(f"Could not save full chain: {e}")
+
     # Optionally save chi-square for all samples
     if getattr(args, 'save_chi2', False):
         chi2_path = os.path.join(args.output_dir, f"{suffix}_chi2.csv.gz")
@@ -1590,7 +1909,7 @@ def run_single_fit(
             n_samples=getattr(args, 'chi2_n_samples', None),
             verbose=True
         )
-    
+
     stats['wind_model'] = wind_model
     return stats, model
 
@@ -1670,37 +1989,51 @@ def replot_from_existing(
     )
     
     suffix = f"{band}_{wind_model}"
-    
-    # Parse CI percentiles
-    ci_percentiles = (16, 84)  # default
-    if hasattr(args, 'ci_percentiles') and args.ci_percentiles:
-        try:
-            parts = [float(x.strip()) for x in args.ci_percentiles.split(',')]
-            if len(parts) == 2:
-                ci_percentiles = tuple(parts)
-        except (ValueError, AttributeError):
-            pass
-    
+
     # Generate plots
     if not args.no_plots:
-        # Corner plot
         plot_corner(
             samples, band, wind_model,
             os.path.join(args.output_dir, f"{suffix}_corner.png")
         )
-        
-        # Best-fit plot with confidence intervals
+
         red_chi2 = plot_best_fit(
             model, obs_phase, obs_flux, obs_err, stats, band, wind_model,
             os.path.join(args.output_dir, f"{suffix}_bestfit.png"),
-            samples=samples,
-            n_samples_for_ci=getattr(args, 'n_samples_ci', 200),
-            ci_percentiles=ci_percentiles,
-            ci_style=getattr(args, 'ci_style', 'band'),
-            ci_method=getattr(args, 'ci_method', 'bounds')
         )
         stats['reduced_chi2'] = red_chi2
-    
+
+    # Post-hoc ArviZ diagnostics / WAIC from saved chain
+    compute_waic = getattr(args, 'compute_waic', False)
+    if HAS_ARVIZ or compute_waic:
+        chain_path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
+        if os.path.exists(chain_path):
+            print(f"\nLoading saved chain from: {chain_path}")
+            chain_data = np.load(chain_path, allow_pickle=True)
+            saved_chain = chain_data['chain']
+            saved_names = list(chain_data['param_names'])
+            saved_likelihood = str(chain_data.get('likelihood', 'chi2'))
+            saved_nu = float(chain_data.get('studentt_nu', 5.0))
+            print(f"  Chain shape: {saved_chain.shape} "
+                  f"(likelihood={saved_likelihood})")
+
+            run_arviz_diagnostics(
+                param_names=saved_names,
+                chain=saved_chain,
+                model=model,
+                obs_phase=obs_phase,
+                obs_flux=obs_flux,
+                obs_err=obs_err,
+                likelihood=saved_likelihood,
+                studentt_nu=saved_nu,
+                compute_waic=compute_waic,
+                output_dir=args.output_dir,
+                suffix=suffix,
+            )
+        elif compute_waic:
+            print(f"Chain file not found: {chain_path}")
+            print("  Re-run MCMC to generate it, or skip --compute-waic.")
+
     # Optionally compute and save chi-square for all samples
     if getattr(args, 'save_chi2', False):
         chi2_path = os.path.join(args.output_dir, f"{suffix}_chi2.csv.gz")
@@ -1710,7 +2043,7 @@ def replot_from_existing(
             n_samples=getattr(args, 'chi2_n_samples', None),
             verbose=True
         )
-    
+
     return stats
 
 
@@ -1749,7 +2082,27 @@ def main():
         "--data-dir",
         type=str,
         default="data/IC_10_X1_LC",
-        help="Directory containing light curve data"
+        help="Base directory containing light curve data. Accepts a direct path to "
+             ".txt files, or a parent directory with {Band}_with_flux/ or {band}/single/ sub-folders."
+    )
+    parser.add_argument(
+        "--obs-column",
+        type=str,
+        default="FLUX",
+        help="Column name for the observable in data files (e.g. FLUX, flux_t, rate, ECF)"
+    )
+    parser.add_argument(
+        "--obs-error-column",
+        type=str,
+        default=None,
+        help="Column name for errors. If omitted, auto-detected from --obs-column "
+             "(e.g. FLUX -> FLUX_ERR, rate -> rate_err)"
+    )
+    parser.add_argument(
+        "--time-column",
+        type=str,
+        default=None,
+        help="Column name for timestamps (e.g. TIME, t_raw). Auto-detected if omitted."
     )
     parser.add_argument(
         "--n-phase-bins",
@@ -1764,6 +2117,30 @@ def main():
     )
     
     # MCMC options
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        choices=['emcee', 'zeus'],
+        default='emcee',
+        help="MCMC sampler: 'emcee' (stretch-move ensemble) or 'zeus' (slice-sampling ensemble, "
+             "better mixing for correlated posteriors). Install zeus with: pip install zeus-mcmc"
+    )
+    parser.add_argument(
+        "--likelihood",
+        type=str,
+        choices=['chi2', 'jitter', 'studentt'],
+        default='chi2',
+        help="Likelihood function: 'chi2' (standard Gaussian/chi-squared), "
+             "'jitter' (Gaussian with free systematic error term — adds log_f parameter), "
+             "'studentt' (Student-t, robust to outliers)"
+    )
+    parser.add_argument(
+        "--studentt-nu",
+        type=float,
+        default=5.0,
+        help="Degrees of freedom for Student-t likelihood (only used with --likelihood studentt). "
+             "Lower values give heavier tails; nu -> inf recovers Gaussian."
+    )
     parser.add_argument(
         "--n-walkers",
         type=int,
@@ -1788,6 +2165,13 @@ def main():
         default=1,
         help="Number of threads for parallel MCMC sampling (1 = serial). "
              "Note: With pre-computed grid, parallelization may not help much."
+    )
+    parser.add_argument(
+        "--compute-waic",
+        action="store_true",
+        help="Compute WAIC and LOO model comparison metrics via ArviZ "
+             "(requires arviz: pip install arviz). Slower but useful for comparing "
+             "likelihoods and binning strategies."
     )
     
     # Model grid options
@@ -1843,37 +2227,6 @@ def main():
         "--quiet",
         action="store_true",
         help="Suppress progress bar"
-    )
-    
-    # Confidence interval options for best-fit plot
-    parser.add_argument(
-        "--n-samples-ci",
-        type=int,
-        default=200,
-        help="Number of posterior samples to use for computing confidence intervals"
-    )
-    parser.add_argument(
-        "--ci-style",
-        type=str,
-        choices=['band', 'lines', 'both'],
-        default='band',
-        help="Style for confidence interval display: 'band' (shaded region), "
-             "'lines' (dashed bounds), or 'both'"
-    )
-    parser.add_argument(
-        "--ci-percentiles",
-        type=str,
-        default="16,84",
-        metavar="LOW,HIGH",
-        help="Percentiles for confidence interval (default: 16,84 for 1-sigma)"
-    )
-    parser.add_argument(
-        "--ci-method",
-        type=str,
-        choices=['bounds', 'samples'],
-        default='bounds',
-        help="Method for computing confidence intervals: 'bounds' uses the +/- parameter "
-             "ranges from MCMC summary (faster, default), 'samples' draws from the full posterior"
     )
     
     # Replot option - regenerate plots from existing MCMC results
@@ -2038,7 +2391,12 @@ def main():
     for band in bands:
         # Load data once per band
         try:
-            obs_df = load_observed_lightcurves(band, args.data_dir)
+            obs_df = load_observed_lightcurves(
+                band, args.data_dir,
+                flux_column=args.obs_column,
+                error_column=args.obs_error_column or args.obs_column + "_ERR",
+                time_column=args.time_column,
+            )
             
             if not args.no_phase_bin:
                 obs_df = phase_bin_data(obs_df, n_bins=args.n_phase_bins)
@@ -2104,13 +2462,16 @@ def main():
             f.write("MCMC Light Curve Fitting Results\n")
             f.write("="*60 + "\n\n")
             
+            likelihood = getattr(args, 'likelihood', 'chi2')
+            active_names, _ = get_param_config(likelihood)
             for key, stats in all_results.items():
                 band, wind_model = key.rsplit('_', 1)
                 f.write(f"{band.upper()} Band - {WIND_MODELS[wind_model]}\n")
                 f.write("-"*40 + "\n")
-                for param in PARAM_NAMES:
-                    s = stats[param]
-                    f.write(f"{param}: {s['median']:.6f} (+{s['upper']:.6f}/-{s['lower']:.6f})\n")
+                for param in active_names:
+                    if param in stats:
+                        s = stats[param]
+                        f.write(f"{param}: {s['median']:.6f} (+{s['upper']:.6f}/-{s['lower']:.6f})\n")
                 if 'reduced_chi2' in stats:
                     f.write(f"Reduced chi-square: {stats['reduced_chi2']:.3f}\n")
                 f.write("\n")

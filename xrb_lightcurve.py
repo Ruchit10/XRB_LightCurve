@@ -21,12 +21,161 @@ from typing import Tuple, List, Optional, Dict
 from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
 
+try:
+    import numba
+    from numba import njit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
+    def njit(*args, **kwargs):                    # noqa: E303
+        """No-op decorator when numba is not installed."""
+        def _decorator(func):
+            return func
+        if args and callable(args[0]):
+            return args[0]
+        return _decorator
+
+    prange = range  # type: ignore[assignment]
+
 # Cache for fast converged LOS integration of the accelerating-wind integrand:
 #   ∫ (1 + u^2)^(-5/4) du  for u in [0, U_MAX]
 _ACCEL_U_GRID: Optional[np.ndarray] = None
 _ACCEL_F_GRID: Optional[np.ndarray] = None
 _ACCEL_U_MAX: float = 1e5
 
+
+# =============================================================================
+# Numba-accelerated LOS integration kernels
+# =============================================================================
+
+def _ensure_accel_cache():
+    """Build the cached quadrature table for the accelerating-wind integrand if needed."""
+    global _ACCEL_U_GRID, _ACCEL_F_GRID
+    if _ACCEL_U_GRID is not None and _ACCEL_F_GRID is not None:
+        return _ACCEL_U_GRID, _ACCEL_F_GRID
+    u_lin = np.linspace(0.0, 50.0, 20000)
+    u_log = np.logspace(np.log10(50.0), np.log10(_ACCEL_U_MAX), 20000)
+    u = np.unique(np.concatenate([u_lin, u_log]))
+    f = (1.0 + u * u) ** (-5.0 / 4.0)
+    du = np.diff(u)
+    F = np.empty_like(u)
+    F[0] = 0.0
+    F[1:] = np.cumsum(0.5 * (f[1:] + f[:-1]) * du)
+    _ACCEL_U_GRID = u
+    _ACCEL_F_GRID = F
+    return _ACCEL_U_GRID, _ACCEL_F_GRID
+
+
+@njit(cache=True)
+def _interp_scalar(x, xp, fp):
+    """Fast scalar linear interpolation (binary search) for use inside @njit."""
+    n = len(xp)
+    if x <= xp[0]:
+        return fp[0]
+    if x >= xp[n - 1]:
+        return fp[n - 1]
+    lo = 0
+    hi = n - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if xp[mid] <= x:
+            lo = mid
+        else:
+            hi = mid
+    t = (x - xp[lo]) / (xp[hi] - xp[lo])
+    return fp[lo] + t * (fp[hi] - fp[lo])
+
+
+@njit(cache=True)
+def _wind_los_converged_numba(av_db, A, z_start, accel_u_grid, accel_f_grid, F_inf):
+    """Numba-accelerated converged (adaptive) LOS integration.
+
+    Replaces the vectorised numpy path when Numba is available.
+    Eliminates temporary array allocation and fuses per-cell math.
+    """
+    N = len(av_db)
+    lw = np.empty(N)
+    lw2 = np.empty(N)
+    los_arr = np.empty(N)
+
+    u_max = accel_u_grid[-1]
+
+    for i in range(N):
+        b = av_db[i]
+        if b < 1e-8:
+            b = 1e-8
+        u0 = z_start / b
+        u_abs = abs(u0)
+
+        # Constant-velocity integral: (arctan(u) + pi/2) / b
+        los2_val = (math.atan(u0) + math.pi * 0.5) / b
+
+        # F_abs(|u0|) via table lookup
+        if u_abs <= u_max:
+            F_abs_val = _interp_scalar(u_abs, accel_u_grid, accel_f_grid)
+        else:
+            F_abs_val = F_inf - (2.0 / 3.0) / (u_abs ** 1.5)
+
+        # Integral from -inf to u0
+        if u0 >= 0.0:
+            I_u = F_inf + F_abs_val
+        else:
+            I_u = F_inf - F_abs_val
+
+        los_val = I_u / (b ** 1.5)
+
+        lw[i] = los_val * A[i]
+        lw2[i] = los2_val * A[i]
+        los_arr[i] = los_val
+
+    return lw, lw2, los_arr
+
+
+@njit(cache=True)
+def _wind_los_fixed_rmax_numba(av_db, A, z_start_scalar, dz, Rmax):
+    """Numba-accelerated fixed-Rmax LOS integration.
+
+    Avoids the large (N, K+1) broadcasted arrays used in the numpy path.
+    """
+    N = len(av_db)
+    lw = np.zeros(N)
+    lw2 = np.zeros(N)
+    los_arr = np.zeros(N)
+    Rmax2 = Rmax * Rmax
+
+    for i in range(N):
+        b2 = av_db[i] * av_db[i]
+        t2 = Rmax2 - b2
+        if t2 <= 0.0:
+            continue
+        t = math.sqrt(t2)
+        if abs(z_start_scalar) > t:
+            continue
+
+        end_k = int(math.floor((z_start_scalar + t) / dz))
+        con_sum = 0.0
+        con2_sum = 0.0
+
+        for k in range(end_k + 1):
+            z = z_start_scalar - dz * k
+            denom = b2 + z * z
+            con_sum += denom ** (-1.25)
+            con2_sum += 1.0 / denom
+
+        los_val = dz * con_sum
+        los2_val = dz * con2_sum
+
+        lw[i] = los_val * A[i]
+        lw2[i] = los2_val * A[i]
+        los_arr[i] = los_val
+
+    return lw, lw2, los_arr
+
+
+# =============================================================================
+# Grid construction
+# =============================================================================
 
 def create_grid(
     r: float, l: float, R: float, gma: float, d2h: float = 6.0
@@ -185,80 +334,54 @@ def wind_los_integral(
     z2 = d2 * np.sin(gma) * np.cos(i)
     z_start = z1 + z2
 
-    # If requested (or if Rmax is None), integrate to -infinity (observer) using fast closed-forms / cached quadrature.
-    #
-    # This is MUCH faster than stepping by dz to large radii, and is effectively "fully converged".
-    # - Constant-velocity wind term uses exact primitive: ∫ dz / (b^2 + z^2) = (1/b) arctan(z/b)
-    # - Accelerating wind term integrates (b^2 + z^2)^(-5/4). With z=b*u, dz=b du:
-    #     ∫ (b^2 + z^2)^(-5/4) dz = b^(-3/2) ∫ (1 + u^2)^(-5/4) du
+    # Converged (adaptive) path: integrate to -infinity using analytical / cached quadrature
     if converge_rmax or (Rmax is None):
-        global _ACCEL_U_GRID, _ACCEL_F_GRID, _ACCEL_U_MAX
-
-        b = av_db.astype(float)
-        b_safe = np.maximum(b, 1e-8)
-        u0 = float(z_start) / b_safe  # vector
-        u_abs = np.abs(u0)
-
-        # Exact constant-velocity integral from -∞ to z_start
-        # I2 = (1/b) * (arctan(z/b) + π/2)
-        los2 = (np.arctan(u0) + (np.pi / 2.0)) / b_safe
-
-        # Build / reuse a cached table for F(u)=∫_0^u (1+t^2)^(-5/4) dt for u∈[0,U_MAX]
-        if _ACCEL_U_GRID is None or _ACCEL_F_GRID is None:
-            # Dense near 0, log-spaced tail for good accuracy across many decades
-            u_lin = np.linspace(0.0, 50.0, 20000)
-            u_log = np.logspace(np.log10(50.0), np.log10(_ACCEL_U_MAX), 20000)
-            u = np.unique(np.concatenate([u_lin, u_log]))
-            f = (1.0 + u * u) ** (-5.0 / 4.0)
-            du = np.diff(u)
-            # cumulative trapezoid integral
-            F = np.empty_like(u)
-            F[0] = 0.0
-            F[1:] = np.cumsum(0.5 * (f[1:] + f[:-1]) * du)
-            _ACCEL_U_GRID = u
-            _ACCEL_F_GRID = F
-
-        # Analytic value of F(∞) = ∫_0^∞ (1+u^2)^(-5/4) du
-        # = (sqrt(pi) * Gamma(3/4)) / (2 * Gamma(5/4))
+        accel_u, accel_f = _ensure_accel_cache()
         F_inf = (math.sqrt(math.pi) * math.gamma(0.75)) / (2.0 * math.gamma(1.25))
 
-        # F_abs(|u0|) = ∫_0^{|u0|} (1+u^2)^(-5/4) du
+        if HAS_NUMBA:
+            lw, lw2, los = _wind_los_converged_numba(
+                av_db.astype(np.float64), A.astype(np.float64),
+                float(z_start), accel_u, accel_f, F_inf,
+            )
+            return lw, lw2, los, A.astype(np.float64)
+
+        # --- numpy fallback (original vectorised path) ---
+        b = av_db.astype(float)
+        b_safe = np.maximum(b, 1e-8)
+        u0 = float(z_start) / b_safe
+        u_abs = np.abs(u0)
+
+        los2 = (np.arctan(u0) + (np.pi / 2.0)) / b_safe
+
         F_abs = np.interp(
-            np.minimum(u_abs, _ACCEL_U_MAX),
-            _ACCEL_U_GRID,
-            _ACCEL_F_GRID,
+            np.minimum(u_abs, _ACCEL_U_MAX), accel_u, accel_f,
         )
-        # For very large u, use asymptotic tail: F_inf - F(u) ≈ (2/3) u^(-3/2)
         large = u_abs > _ACCEL_U_MAX
         if np.any(large):
             F_abs = F_abs.copy()
             F_abs[large] = F_inf - ((2.0 / 3.0) / (u_abs[large] ** (3.0 / 2.0)))
 
-        # Integral from -∞ to u0:
-        #  u0>=0: F_inf + F_abs(u0)
-        #  u0< 0: F_inf - F_abs(|u0|)
         I_u = F_inf + (np.sign(u0) * F_abs)
-
-        # Accelerating-wind LOS integral
         los = I_u / (b_safe ** (3.0 / 2.0))
 
         lw = los * A
         lw2 = los2 * A
-
         return lw.astype(float), lw2.astype(float), los.astype(float), A.astype(float)
 
-    # Fixed physical cutoff at radius Rmax
-    # NOTE: if Rmax is None we return early via adaptive integration above.
+    # Fixed-Rmax path
     Rmax_use = float(Rmax)
 
-    # Per-cell LOS limit in z such that r = sqrt(b^2 + z^2) <= Rmax_use
-    # (integrating from z_start toward decreasing z until r hits Rmax_use)
+    if HAS_NUMBA:
+        lw, lw2, los = _wind_los_fixed_rmax_numba(
+            av_db.astype(np.float64), A.astype(np.float64),
+            float(z_start), float(dz), Rmax_use,
+        )
+        return lw, lw2, los, A.astype(np.float64)
+
+    # --- numpy fallback (original broadcasted path) ---
     t = np.sqrt(np.maximum((Rmax_use ** 2) - (av_db ** 2), 0.0))
-
-    # Determine per-cell validity: original algorithm integrates only if |z_start| <= t
     valid_cells = (t > 0) & (np.abs(z_start) <= t)
-
-    # Per-cell end step index; invalid cells get -1 so they contribute zero
     end_k = np.floor((z_start + t) / dz).astype(int)
     end_k = np.where(valid_cells, end_k, -1)
 
@@ -271,30 +394,21 @@ def wind_los_integral(
             np.zeros_like(av_db),
         )
 
-    # Broadcasted z values across steps
-    k = np.arange(max_steps + 1, dtype=float)  # shape (K+1,)
-    z_vals = z_start - dz * k  # shape (K+1,)
-
-    # Broadcast to (N, K+1)
-    cl2 = (av_db**2)[:, None]  # (N,1)
-    z2_vals = z_vals[None, :] ** 2  # (1, K+1)
-
-    denom = cl2 + z2_vals  # (N, K+1)
-
-    # Masks to include only valid steps per cell (k from 0..end_k inclusive)
+    k = np.arange(max_steps + 1, dtype=float)
+    z_vals = z_start - dz * k
+    cl2 = (av_db**2)[:, None]
+    z2_vals = z_vals[None, :] ** 2
+    denom = cl2 + z2_vals
     step_mask = (k[None, :] <= end_k[:, None]) & valid_cells[:, None]
 
-    # Compute sums
     con_sum = np.sum((denom ** (-5.0 / 4.0)) * step_mask, axis=1)
     con2_sum = np.sum((denom ** (-1.0)) * step_mask, axis=1)
 
     los = dz * con_sum
     los2 = dz * con2_sum
-
     lw = los * A
     lw2 = los2 * A
 
-    # icd is los for each cell, A2 is A
     return lw.astype(float), lw2.astype(float), los.astype(float), A.astype(float)
 
 
