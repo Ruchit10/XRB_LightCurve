@@ -59,6 +59,7 @@ Usage:
 """
 
 import argparse
+import copy
 import glob
 import os
 import time
@@ -131,6 +132,52 @@ PARAM_LABELS = [
     r'$i$ (deg)'
 ]
 
+# Reparameterized priors: (d1, d2) -> (a = d1+d2, q = d1/(d1+d2))
+# a is the orbital separation; q is a mass-ratio proxy bounded to (0, 1).
+REPARAM_PRIORS = {
+    'a':  {'mean': 19.0, 'std': 4.0,  'min': 8.0,    'max': 35.0},
+    'q':  {'mean': 0.58, 'std': 0.15, 'min': 0.01,   'max': 0.99},
+    'r':  {'mean': 0.001, 'std': 0.001, 'min': 0.0001, 'max': 0.1},
+    'R':  {'mean': 2.0,  'std': 0.5,  'min': 1.0,    'max': 5.0},
+    'i0': {'mean': 26.0, 'std': 20.0, 'min': 10.0,   'max': 85.0},
+}
+
+REPARAM_PARAM_NAMES = ['a', 'q', 'r', 'R', 'i0']
+REPARAM_PARAM_LABELS = [
+    r'$a$ (R$_\odot$)',
+    r'$q$',
+    r'$r$ (R$_\odot$)',
+    r'$R$ (R$_\odot$)',
+    r'$i$ (deg)'
+]
+
+
+def _grid_priors_from_reparam(reparam_priors: Dict) -> Dict:
+    """Derive ``(d1, d2, r, R, i0)`` grid bounds from ``(a, q)`` priors.
+
+    The precomputed grid is always built in physical ``(d1, d2)`` space.
+    This helper converts the reparameterized prior bounds into the
+    corresponding physical-parameter bounds so the grid covers the
+    region the MCMC chain will explore.
+    """
+    a_min = reparam_priors['a']['min']
+    a_max = reparam_priors['a']['max']
+    q_min = reparam_priors['q']['min']
+    q_max = reparam_priors['q']['max']
+    d1_min = a_min * q_min
+    d1_max = a_max * q_max
+    d2_min = a_min * (1.0 - q_max)
+    d2_max = a_max * (1.0 - q_min)
+    return {
+        'd1': {'mean': (d1_min + d1_max) / 2, 'std': (d1_max - d1_min) / 4,
+               'min': d1_min, 'max': d1_max},
+        'd2': {'mean': (d2_min + d2_max) / 2, 'std': (d2_max - d2_min) / 4,
+               'min': d2_min, 'max': d2_max},
+        'r':  reparam_priors['r'].copy(),
+        'R':  reparam_priors['R'].copy(),
+        'i0': reparam_priors['i0'].copy(),
+    }
+
 # Wind model descriptions
 WIND_MODELS = {
     'av': 'Accelerated Velocity Wind',
@@ -152,10 +199,18 @@ SAMPLER_TYPES = {
 }
 
 
-def get_param_config(likelihood: str = 'chi2'):
-    """Return (param_names, param_labels) for the given likelihood type."""
-    names = list(PARAM_NAMES)
-    labels = list(PARAM_LABELS)
+def get_param_config(likelihood: str = 'chi2', reparam: bool = False):
+    """Return (param_names, param_labels) for the given likelihood type.
+
+    When *reparam* is True the first two geometric parameters are
+    ``(a, q)`` instead of ``(d1, d2)``.
+    """
+    if reparam:
+        names = list(REPARAM_PARAM_NAMES)
+        labels = list(REPARAM_PARAM_LABELS)
+    else:
+        names = list(PARAM_NAMES)
+        labels = list(PARAM_LABELS)
     if likelihood == 'jitter':
         names.append('log_f')
         labels.append(r'$\ln\,f$')
@@ -883,9 +938,17 @@ class DirectLightCurveModel:
 # Likelihood Functions
 # =============================================================================
 
-def _evaluate_model(theta, model, obs_phase):
+def _to_physical(theta, reparam: bool = False):
+    """Convert sampling-space parameters to physical ``(d1, d2, r, R, i0)``."""
+    if reparam:
+        a, q = theta[0], theta[1]
+        return a * q, a * (1.0 - q), theta[2], theta[3], theta[4]
+    return theta[0], theta[1], theta[2], theta[3], theta[4]
+
+
+def _evaluate_model(theta, model, obs_phase, reparam: bool = False):
     """Evaluate the physical model. Returns model_flux or None on failure."""
-    d1, d2, r, R, i0 = theta[:5]
+    d1, d2, r, R, i0 = _to_physical(theta, reparam=reparam)
     try:
         model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
     except Exception:
@@ -901,9 +964,10 @@ def log_likelihood_chi2(
     obs_phase: np.ndarray,
     obs_flux: np.ndarray,
     obs_err: np.ndarray,
+    reparam: bool = False,
 ) -> float:
     """Standard Gaussian log-likelihood (chi-squared)."""
-    model_flux = _evaluate_model(theta, model, obs_phase)
+    model_flux = _evaluate_model(theta, model, obs_phase, reparam=reparam)
     if model_flux is None:
         return -np.inf
     chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
@@ -916,15 +980,17 @@ def log_likelihood_jitter(
     obs_phase: np.ndarray,
     obs_flux: np.ndarray,
     obs_err: np.ndarray,
+    reparam: bool = False,
 ) -> float:
     """Gaussian log-likelihood with a free fractional systematic error term.
 
-    theta must have 6 elements: [d1, d2, r, R, i0, log_f].
+    theta must have 6 elements: [d1, d2, r, R, i0, log_f]
+    (or [a, q, r, R, i0, log_f] when *reparam* is True).
     The effective variance per point is  sigma_obs^2 + (f * model)^2
     where f = exp(log_f).  The log(sigma2) normalisation is included
     so that inflating errors is properly penalised.
     """
-    model_flux = _evaluate_model(theta, model, obs_phase)
+    model_flux = _evaluate_model(theta, model, obs_phase, reparam=reparam)
     if model_flux is None:
         return -np.inf
     f = np.exp(theta[5])
@@ -939,12 +1005,13 @@ def log_likelihood_studentt(
     obs_flux: np.ndarray,
     obs_err: np.ndarray,
     nu: float = 5.0,
+    reparam: bool = False,
 ) -> float:
     """Student-t log-likelihood (heavier tails than Gaussian).
 
     ``nu`` controls tail weight; nu -> inf recovers the Gaussian.
     """
-    model_flux = _evaluate_model(theta, model, obs_phase)
+    model_flux = _evaluate_model(theta, model, obs_phase, reparam=reparam)
     if model_flux is None:
         return -np.inf
     resid = (obs_flux - model_flux) / obs_err
@@ -970,22 +1037,34 @@ def log_prior(
     theta: np.ndarray,
     priors: Dict = DEFAULT_PRIORS,
     likelihood: str = 'chi2',
+    reparam: bool = False,
 ) -> float:
-    """Log prior probability for physical + nuisance parameters."""
-    d1, d2, r, R, i0 = theta[:5]
+    """Log prior probability for physical + nuisance parameters.
 
-    for i, param in enumerate(PARAM_NAMES):
+    When *reparam* is True, theta[:5] = (a, q, r, R, i0) and *priors*
+    must contain keys ``'a'`` and ``'q'`` instead of ``'d1'`` and ``'d2'``.
+    A Jacobian correction ``log(a)`` is added to account for the change
+    of variables ``d(d1) d(d2) = a · d(a) d(q)``.
+    """
+    pnames = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
+
+    for i, param in enumerate(pnames):
         if not (priors[param]['min'] < theta[i] < priors[param]['max']):
             return -np.inf
 
-    if r >= R:
+    # Physical constraint r < R (indices 2, 3 regardless of reparam)
+    if theta[2] >= theta[3]:
         return -np.inf
 
     log_p = 0.0
-    for param, value in zip(PARAM_NAMES, theta[:5]):
+    for param, value in zip(pnames, theta[:5]):
         mean = priors[param]['mean']
         std = priors[param]['std']
         log_p += -0.5 * ((value - mean) / std) ** 2
+
+    # Jacobian |d(d1,d2)/d(a,q)| = a
+    if reparam:
+        log_p += np.log(theta[0])
 
     if likelihood == 'jitter':
         log_f = theta[5]
@@ -1005,18 +1084,22 @@ def log_probability(
     priors: Dict = DEFAULT_PRIORS,
     likelihood: str = 'chi2',
     studentt_nu: float = 5.0,
+    reparam: bool = False,
 ) -> float:
     """Log posterior = log prior + log likelihood."""
-    lp = log_prior(theta, priors, likelihood=likelihood)
+    lp = log_prior(theta, priors, likelihood=likelihood, reparam=reparam)
     if not np.isfinite(lp):
         return -np.inf
 
     if likelihood == 'jitter':
-        ll = log_likelihood_jitter(theta, model, obs_phase, obs_flux, obs_err)
+        ll = log_likelihood_jitter(theta, model, obs_phase, obs_flux, obs_err,
+                                   reparam=reparam)
     elif likelihood == 'studentt':
-        ll = log_likelihood_studentt(theta, model, obs_phase, obs_flux, obs_err, nu=studentt_nu)
+        ll = log_likelihood_studentt(theta, model, obs_phase, obs_flux, obs_err,
+                                     nu=studentt_nu, reparam=reparam)
     else:
-        ll = log_likelihood_chi2(theta, model, obs_phase, obs_flux, obs_err)
+        ll = log_likelihood_chi2(theta, model, obs_phase, obs_flux, obs_err,
+                                 reparam=reparam)
 
     return lp + ll
 
@@ -1039,6 +1122,7 @@ def run_mcmc(
     sampler_type: str = 'emcee',
     likelihood: str = 'chi2',
     studentt_nu: float = 5.0,
+    reparam: bool = False,
 ) -> Tuple:
     """
     Run MCMC sampling with emcee or zeus.
@@ -1067,6 +1151,8 @@ def run_mcmc(
         'chi2', 'jitter', or 'studentt'
     studentt_nu : float
         Degrees-of-freedom for Student-t likelihood
+    reparam : bool
+        If True, sample in (a, q) space instead of (d1, d2).
         
     Returns
     -------
@@ -1076,19 +1162,20 @@ def run_mcmc(
     active_param_names : list of str
     active_param_labels : list of str
     """
-    active_names, active_labels = get_param_config(likelihood)
+    active_names, active_labels = get_param_config(likelihood, reparam=reparam)
+    phys_names = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
     n_dim = len(active_names)
 
     # Initial positions for physical parameters
-    initial = np.array([priors[p]['mean'] for p in PARAM_NAMES])
-    scatter = np.array([priors[p]['std'] * 0.1 for p in PARAM_NAMES])
+    initial = np.array([priors[p]['mean'] for p in phys_names])
+    scatter = np.array([priors[p]['std'] * 0.1 for p in phys_names])
     if likelihood == 'jitter':
         initial = np.append(initial, JITTER_PRIOR['mean'])
         scatter = np.append(scatter, JITTER_PRIOR['std'] * 0.1)
 
     pos = initial + scatter * np.random.randn(n_walkers, n_dim)
 
-    for i, param in enumerate(PARAM_NAMES):
+    for i, param in enumerate(phys_names):
         pos[:, i] = np.clip(pos[:, i],
                             priors[param]['min'] * 1.01,
                             priors[param]['max'] * 0.99)
@@ -1096,6 +1183,7 @@ def run_mcmc(
         pos[:, 5] = np.clip(pos[:, 5],
                             JITTER_PRIOR['min'] * 0.99,
                             JITTER_PRIOR['max'] * 0.99)
+    # Enforce r < R (indices 2, 3 regardless of reparam)
     for j in range(n_walkers):
         if pos[j, 2] >= pos[j, 3]:
             pos[j, 2] = pos[j, 3] * 0.1
@@ -1103,10 +1191,13 @@ def run_mcmc(
     parallel_info = f", {n_threads} threads" if n_threads > 1 else " (serial)"
     print(f"\nStarting MCMC ({sampler_type}) with {n_walkers} walkers, "
           f"{n_steps} steps{parallel_info}")
+    if reparam:
+        print("Reparameterization: (d1, d2) -> (a = d1+d2, q = d1/a)")
     print(f"Likelihood: {LIKELIHOOD_TYPES[likelihood]}")
     print(f"Initial parameter values (first walker): {pos[0]}")
 
-    log_prob_args = (model, obs_phase, obs_flux, obs_err, priors, likelihood, studentt_nu)
+    log_prob_args = (model, obs_phase, obs_flux, obs_err, priors, likelihood,
+                     studentt_nu, reparam)
 
     start_time = time.time()
 
@@ -1158,8 +1249,16 @@ def run_mcmc(
 # Output and Diagnostics
 # =============================================================================
 
-def compute_statistics(samples: np.ndarray, param_names: List[str] = None) -> Dict:
-    """Compute summary statistics from MCMC samples."""
+def compute_statistics(
+    samples: np.ndarray,
+    param_names: List[str] = None,
+    reparam: bool = False,
+) -> Dict:
+    """Compute summary statistics from MCMC samples.
+
+    When *reparam* is True, derived ``d1`` and ``d2`` statistics are
+    appended by transforming each sample: ``d1 = a*q``, ``d2 = a*(1-q)``.
+    """
     if param_names is None:
         param_names = PARAM_NAMES
     stats = {}
@@ -1175,13 +1274,31 @@ def compute_statistics(samples: np.ndarray, param_names: List[str] = None) -> Di
             'std': np.std(param_samples)
         }
 
+    if reparam:
+        a_samples = samples[:, 0]
+        q_samples = samples[:, 1]
+        for derived_name, derived_vals in [
+            ('d1', a_samples * q_samples),
+            ('d2', a_samples * (1.0 - q_samples)),
+        ]:
+            p16, p50, p84 = np.percentile(derived_vals, [16, 50, 84])
+            stats[derived_name] = {
+                'median': p50,
+                'lower': p50 - p16,
+                'upper': p84 - p50,
+                'mean': np.mean(derived_vals),
+                'std': np.std(derived_vals),
+                'derived': True,
+            }
+
     return stats
 
 
 def load_existing_results(
     output_dir: str,
     band: str,
-    wind_model: str
+    wind_model: str,
+    reparam: bool = False,
 ) -> Tuple[Optional[np.ndarray], Optional[Dict]]:
     """
     Load existing MCMC results from saved files.
@@ -1194,6 +1311,8 @@ def load_existing_results(
         Energy band name
     wind_model : str
         Wind model name ('av' or 'cv')
+    reparam : bool
+        Whether samples were saved in (a, q) parameterization
         
     Returns
     -------
@@ -1212,13 +1331,13 @@ def load_existing_results(
     print(f"Loading existing samples from: {samples_path}")
     samples_df = pd.read_csv(samples_path)
     
-    # Verify columns match expected parameters
-    if not all(p in samples_df.columns for p in PARAM_NAMES):
-        print(f"Error: Samples file missing required columns. Expected: {PARAM_NAMES}")
+    expected_names = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
+    if not all(p in samples_df.columns for p in expected_names):
+        print(f"Error: Samples file missing required columns. Expected: {expected_names}")
         return None, None
     
-    samples = samples_df[PARAM_NAMES].values
-    stats = compute_statistics(samples)
+    samples = samples_df[expected_names].values
+    stats = compute_statistics(samples, param_names=expected_names, reparam=reparam)
     
     print(f"  Loaded {len(samples)} samples")
     
@@ -1233,7 +1352,8 @@ def compute_chi2_for_samples(
     obs_err: np.ndarray,
     output_path: str,
     n_samples: int = None,
-    verbose: bool = True
+    verbose: bool = True,
+    reparam: bool = False,
 ) -> None:
     """
     Compute chi-square for all (or a subset of) MCMC samples and save to compressed file.
@@ -1252,6 +1372,8 @@ def compute_chi2_for_samples(
         Number of samples to compute chi-square for. If None, use all samples.
     verbose : bool
         Print progress messages
+    reparam : bool
+        If True, samples are in (a, q, r, R, i0) space.
     """
     import gzip
     
@@ -1260,16 +1382,15 @@ def compute_chi2_for_samples(
         n_samples = n_total
         sample_indices = np.arange(n_total)
     else:
-        # Randomly select samples
         sample_indices = np.random.choice(n_total, size=n_samples, replace=False)
-        sample_indices = np.sort(sample_indices)  # Keep order for reproducibility
+        sample_indices = np.sort(sample_indices)
     
     if verbose:
         print(f"Computing chi-square for {n_samples} samples...")
     
-    dof = len(obs_flux) - len(PARAM_NAMES)
+    n_phys = 5
+    dof = len(obs_flux) - n_phys
     
-    # Prepare output data
     results = []
     
     if HAS_TQDM and verbose:
@@ -1279,7 +1400,7 @@ def compute_chi2_for_samples(
     
     for idx in iterator:
         sample_params = samples[idx]
-        d1, d2, r, R, i0 = sample_params
+        d1, d2, r, R, i0 = _to_physical(sample_params, reparam=reparam)
         
         try:
             model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
@@ -1296,7 +1417,6 @@ def compute_chi2_for_samples(
         
         results.append([idx, d1, d2, r, R, i0, chi2, red_chi2])
     
-    # Create DataFrame
     columns = ['sample_idx', 'd1', 'd2', 'r', 'R', 'i0', 'chi2', 'reduced_chi2']
     results_df = pd.DataFrame(results, columns=columns)
     
@@ -1326,7 +1446,8 @@ def compute_chi2_for_samples(
         print(f"Chi-square data saved to: {output_path} ({file_size:.1f} KB)")
 
 
-def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str] = None):
+def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str] = None,
+                   reparam: bool = False):
     """Print formatted results table."""
     if param_names is None:
         param_names = PARAM_NAMES
@@ -1339,6 +1460,14 @@ def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str
     for param in param_names:
         s = stats[param]
         print(f"{param:<15} {s['median']:<12.6f} {s['lower']:<12.6f} {s['upper']:<12.6f}")
+
+    if reparam:
+        print('-'*60)
+        print("Derived physical parameters:")
+        for derived in ('d1', 'd2'):
+            if derived in stats:
+                s = stats[derived]
+                print(f"{derived:<15} {s['median']:<12.6f} {s['lower']:<12.6f} {s['upper']:<12.6f}")
 
     print('='*60)
 
@@ -1412,6 +1541,7 @@ def plot_best_fit(
     wind_model: str,
     output_path: str,
     param_names: List[str] = None,
+    reparam: bool = False,
 ):
     """
     Plot observed data with best-fit model overlay.
@@ -1430,14 +1560,21 @@ def plot_best_fit(
         Wind model name
     output_path : str
         Path to save the plot
+    reparam : bool
+        If True, stats contains (a, q) and derived (d1, d2) keys.
     """
     if param_names is None:
         param_names = PARAM_NAMES
-    phys_names = PARAM_NAMES
 
-    best_params = [stats[p]['median'] for p in phys_names]
+    # Always evaluate the model in physical (d1, d2, r, R, i0) space
+    if reparam:
+        best_d1 = stats['d1']['median']
+        best_d2 = stats['d2']['median']
+        best_params = [best_d1, best_d2, stats['r']['median'],
+                       stats['R']['median'], stats['i0']['median']]
+    else:
+        best_params = [stats[p]['median'] for p in PARAM_NAMES]
 
-    # Use direct simulation (exact) instead of grid interpolation.
     eval_fn = getattr(model, 'evaluate_direct', model.evaluate)
 
     model_phases = np.linspace(0, 1, 360)
@@ -1445,7 +1582,7 @@ def plot_best_fit(
 
     obs_model = eval_fn(*best_params, obs_phase)
     chi2 = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
-    dof = len(obs_flux) - len(phys_names)
+    dof = len(obs_flux) - 5
     red_chi2 = chi2 / dof if dof > 0 else np.nan
 
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -1464,9 +1601,13 @@ def plot_best_fit(
     ax.legend(loc='best')
     ax.grid(alpha=0.3)
 
+    # Show all sampled parameters plus derived d1/d2 when reparameterized
+    display_params = list(param_names)
+    if reparam:
+        display_params += ['d1', 'd2']
     param_text = '\n'.join([
         f"{p}: {stats[p]['median']:.4f} +/- {(stats[p]['lower']+stats[p]['upper'])/2:.4f}"
-        for p in param_names
+        for p in display_params if p in stats
     ])
     ax.text(0.02, 0.98, param_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', fontfamily='monospace',
@@ -1545,6 +1686,7 @@ def compute_pointwise_loglik(
     likelihood: str = 'chi2',
     studentt_nu: float = 5.0,
     n_samples: int = 200,
+    reparam: bool = False,
 ) -> np.ndarray:
     """Compute per-observation log-likelihood for a subset of posterior samples.
 
@@ -1558,7 +1700,7 @@ def compute_pointwise_loglik(
 
     for k, idx in enumerate(indices):
         theta = samples[idx]
-        model_flux = _evaluate_model(theta, model, obs_phase)
+        model_flux = _evaluate_model(theta, model, obs_phase, reparam=reparam)
         if model_flux is None:
             continue
 
@@ -1638,6 +1780,7 @@ def run_arviz_diagnostics(
     suffix: str = '',
     chain: np.ndarray = None,
     samples_flat: np.ndarray = None,
+    reparam: bool = False,
 ):
     """Run ArviZ convergence diagnostics and optionally WAIC/LOO.
 
@@ -1690,6 +1833,7 @@ def run_arviz_diagnostics(
             samples_flat, model, obs_phase, obs_flux, obs_err,
             likelihood=likelihood, studentt_nu=studentt_nu,
             n_samples=n_samples_waic,
+            reparam=reparam,
         )
         if ll.shape[0] > 10:
             log_lik_dict = {"obs": ll[np.newaxis, :, :]}
@@ -1750,14 +1894,18 @@ def run_single_fit(
     obs_err: np.ndarray,
     model_grid: PrecomputedModelGrid = None,
     priors: Dict = None,
-    sim_params: Dict = None
+    sim_params: Dict = None,
+    reparam: bool = False,
 ) -> Dict:
     """Run MCMC fit for a single band/wind_model combination."""
     
     if priors is None:
-        priors = DEFAULT_PRIORS
+        priors = REPARAM_PRIORS.copy() if reparam else DEFAULT_PRIORS.copy()
     if sim_params is None:
         sim_params = {}
+
+    # Grid always uses (d1, d2, r, R, i0) bounds
+    grid_priors = _grid_priors_from_reparam(priors) if reparam else priors
     
     print(f"\n{'#'*60}")
     print(f"# Fitting {band.upper()} band - {WIND_MODELS[wind_model]}")
@@ -1795,7 +1943,7 @@ def run_single_fit(
             band=band,
             flux_csv_path=args.flux_csv,
             wind_model=wind_model,
-            priors=priors,
+            priors=grid_priors,
             grid_points=grid_points,
             dth=args.dth,
             n_workers=args.n_workers,
@@ -1828,11 +1976,12 @@ def run_single_fit(
         sampler_type=sampler_type,
         likelihood=likelihood,
         studentt_nu=studentt_nu,
+        reparam=reparam,
     )
 
     # Compute statistics
-    stats = compute_statistics(samples, param_names=active_names)
-    print_results(stats, band, wind_model, param_names=active_names)
+    stats = compute_statistics(samples, param_names=active_names, reparam=reparam)
+    print_results(stats, band, wind_model, param_names=active_names, reparam=reparam)
     print_diagnostics(sampler, sampler_type=sampler_type, param_names=active_names)
 
     # ArviZ diagnostics
@@ -1844,6 +1993,7 @@ def run_single_fit(
         compute_waic=compute_waic,
         output_dir=args.output_dir,
         suffix=f"{band}_{wind_model}",
+        reparam=reparam,
     )
 
     # Generate file suffix
@@ -1866,6 +2016,7 @@ def run_single_fit(
             model, obs_phase, obs_flux, obs_err, stats, band, wind_model,
             os.path.join(args.output_dir, f"{suffix}_bestfit.png"),
             param_names=active_names,
+            reparam=reparam,
         )
         stats['reduced_chi2'] = red_chi2
 
@@ -1895,6 +2046,7 @@ def run_single_fit(
             n_burn=args.n_burn,
             likelihood=likelihood,
             studentt_nu=studentt_nu,
+            reparam=reparam,
         )
         print(f"Full chain saved to: {chain_path}")
     except Exception as e:
@@ -1907,7 +2059,8 @@ def run_single_fit(
             model, samples, obs_phase, obs_flux, obs_err,
             output_path=chi2_path,
             n_samples=getattr(args, 'chi2_n_samples', None),
-            verbose=True
+            verbose=True,
+            reparam=reparam,
         )
 
     stats['wind_model'] = wind_model
@@ -1922,7 +2075,8 @@ def replot_from_existing(
     obs_flux: np.ndarray,
     obs_err: np.ndarray,
     priors: Dict = None,
-    sim_params: Dict = None
+    sim_params: Dict = None,
+    reparam: bool = False,
 ) -> Optional[Dict]:
     """
     Regenerate plots from existing MCMC results without re-running MCMC.
@@ -1941,6 +2095,8 @@ def replot_from_existing(
         Prior specifications
     sim_params : Dict, optional
         Simulation parameters
+    reparam : bool
+        If True, samples are in (a, q) parameterization.
         
     Returns
     -------
@@ -1948,22 +2104,25 @@ def replot_from_existing(
         Statistics from loaded samples, or None if loading failed
     """
     if priors is None:
-        priors = DEFAULT_PRIORS
+        priors = REPARAM_PRIORS.copy() if reparam else DEFAULT_PRIORS.copy()
     if sim_params is None:
         sim_params = {}
+
+    grid_priors = _grid_priors_from_reparam(priors) if reparam else priors
     
     print(f"\n{'#'*60}")
     print(f"# Replotting {band.upper()} band - {WIND_MODELS[wind_model]}")
     print('#'*60)
     
     # Load existing samples
-    samples, stats = load_existing_results(args.output_dir, band, wind_model)
+    samples, stats = load_existing_results(args.output_dir, band, wind_model,
+                                           reparam=reparam)
     
     if samples is None or stats is None:
         print(f"Could not load existing results for {band}_{wind_model}")
         return None
     
-    print_results(stats, band, wind_model)
+    print_results(stats, band, wind_model, reparam=reparam)
     
     # Initialize model grid for plotting
     print("\nInitializing model grid for plotting...")
@@ -1979,7 +2138,7 @@ def replot_from_existing(
         band=band,
         flux_csv_path=args.flux_csv,
         wind_model=wind_model,
-        priors=priors,
+        priors=grid_priors,
         grid_points=grid_points,
         dth=args.dth,
         n_workers=args.n_workers,
@@ -1992,14 +2151,19 @@ def replot_from_existing(
 
     # Generate plots
     if not args.no_plots:
+        active_names, active_labels = get_param_config(
+            getattr(args, 'likelihood', 'chi2'), reparam=reparam)
         plot_corner(
             samples, band, wind_model,
-            os.path.join(args.output_dir, f"{suffix}_corner.png")
+            os.path.join(args.output_dir, f"{suffix}_corner.png"),
+            param_labels=active_labels,
         )
 
         red_chi2 = plot_best_fit(
             model, obs_phase, obs_flux, obs_err, stats, band, wind_model,
             os.path.join(args.output_dir, f"{suffix}_bestfit.png"),
+            param_names=active_names,
+            reparam=reparam,
         )
         stats['reduced_chi2'] = red_chi2
 
@@ -2014,6 +2178,7 @@ def replot_from_existing(
             saved_names = list(chain_data['param_names'])
             saved_likelihood = str(chain_data.get('likelihood', 'chi2'))
             saved_nu = float(chain_data.get('studentt_nu', 5.0))
+            saved_reparam = bool(chain_data.get('reparam', False))
             print(f"  Chain shape: {saved_chain.shape} "
                   f"(likelihood={saved_likelihood})")
 
@@ -2029,6 +2194,7 @@ def replot_from_existing(
                 compute_waic=compute_waic,
                 output_dir=args.output_dir,
                 suffix=suffix,
+                reparam=saved_reparam,
             )
         elif compute_waic:
             print(f"Chain file not found: {chain_path}")
@@ -2041,7 +2207,8 @@ def replot_from_existing(
             model, samples, obs_phase, obs_flux, obs_err,
             output_path=chi2_path,
             n_samples=getattr(args, 'chi2_n_samples', None),
-            verbose=True
+            verbose=True,
+            reparam=reparam,
         )
 
     return stats
@@ -2140,6 +2307,13 @@ def main():
         default=5.0,
         help="Degrees of freedom for Student-t likelihood (only used with --likelihood studentt). "
              "Lower values give heavier tails; nu -> inf recovers Gaussian."
+    )
+    parser.add_argument(
+        "--reparam",
+        action="store_true",
+        help="Reparameterize (d1, d2) as (a, q) where a = d1+d2 (orbital separation) "
+             "and q = d1/(d1+d2) (mass-ratio proxy). Decorrelates the two distance "
+             "parameters for faster MCMC convergence."
     )
     parser.add_argument(
         "--n-walkers",
@@ -2339,6 +2513,22 @@ def main():
         help="Prior for i0 (orbital inclination in degrees). "
              "Format: mean,std,min,max. Default: 26.0,20.0,10.0,85.0"
     )
+    prior_group.add_argument(
+        "--prior-a",
+        type=str,
+        default=None,
+        metavar="MEAN,STD,MIN,MAX",
+        help="Prior for a = d1+d2 (orbital separation, only with --reparam). "
+             "Format: mean,std,min,max. Default: 19.0,4.0,8.0,35.0"
+    )
+    prior_group.add_argument(
+        "--prior-q",
+        type=str,
+        default=None,
+        metavar="MEAN,STD,MIN,MAX",
+        help="Prior for q = d1/(d1+d2) (mass-ratio proxy, only with --reparam). "
+             "Format: mean,std,min,max. Default: 0.58,0.15,0.01,0.99"
+    )
     
     args = parser.parse_args()
     
@@ -2352,8 +2542,14 @@ def main():
     }
     
     # Build custom priors
-    priors = DEFAULT_PRIORS.copy()
-    for param in PARAM_NAMES:
+    reparam = getattr(args, 'reparam', False)
+    if reparam:
+        priors = copy.deepcopy(REPARAM_PRIORS)
+        base_names = REPARAM_PARAM_NAMES
+    else:
+        priors = DEFAULT_PRIORS.copy()
+        base_names = PARAM_NAMES
+    for param in base_names:
         prior_arg = getattr(args, f'prior_{param}', None)
         if prior_arg:
             try:
@@ -2424,7 +2620,8 @@ def main():
                             args, band, wind_model,
                             obs_phase, obs_flux, obs_err,
                             priors=priors,
-                            sim_params=sim_params
+                            sim_params=sim_params,
+                            reparam=reparam,
                         )
                         if stats is not None:
                             all_results[key] = stats
@@ -2435,7 +2632,8 @@ def main():
                             obs_phase, obs_flux, obs_err,
                             model_grid=model_grid if len(wind_models) > 1 else None,
                             priors=priors,
-                            sim_params=sim_params
+                            sim_params=sim_params,
+                            reparam=reparam,
                         )
                         all_results[key] = stats
                         
@@ -2463,7 +2661,7 @@ def main():
             f.write("="*60 + "\n\n")
             
             likelihood = getattr(args, 'likelihood', 'chi2')
-            active_names, _ = get_param_config(likelihood)
+            active_names, _ = get_param_config(likelihood, reparam=reparam)
             for key, stats in all_results.items():
                 band, wind_model = key.rsplit('_', 1)
                 f.write(f"{band.upper()} Band - {WIND_MODELS[wind_model]}\n")
@@ -2472,6 +2670,12 @@ def main():
                     if param in stats:
                         s = stats[param]
                         f.write(f"{param}: {s['median']:.6f} (+{s['upper']:.6f}/-{s['lower']:.6f})\n")
+                if reparam:
+                    for derived in ('d1', 'd2'):
+                        if derived in stats:
+                            s = stats[derived]
+                            f.write(f"{derived} (derived): {s['median']:.6f} "
+                                    f"(+{s['upper']:.6f}/-{s['lower']:.6f})\n")
                 if 'reduced_chi2' in stats:
                     f.write(f"Reduced chi-square: {stats['reduced_chi2']:.3f}\n")
                 f.write("\n")
