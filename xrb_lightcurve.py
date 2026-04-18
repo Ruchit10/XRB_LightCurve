@@ -14,8 +14,168 @@ import argparse
 import numpy as np
 import pandas as pd
 import math
-from typing import Tuple, List, Optional
+import os
+import sys
+import warnings
+from typing import Tuple, List, Optional, Dict
+from scipy.interpolate import interp1d
+from scipy.optimize import curve_fit
 
+try:
+    import numba
+    from numba import njit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
+    def njit(*args, **kwargs):                    # noqa: E303
+        """No-op decorator when numba is not installed."""
+        def _decorator(func):
+            return func
+        if args and callable(args[0]):
+            return args[0]
+        return _decorator
+
+    prange = range  # type: ignore[assignment]
+
+# Cache for fast converged LOS integration of the accelerating-wind integrand:
+#   ∫ (1 + u^2)^(-5/4) du  for u in [0, U_MAX]
+_ACCEL_U_GRID: Optional[np.ndarray] = None
+_ACCEL_F_GRID: Optional[np.ndarray] = None
+_ACCEL_U_MAX: float = 1e5
+
+
+# =============================================================================
+# Numba-accelerated LOS integration kernels
+# =============================================================================
+
+def _ensure_accel_cache():
+    """Build the cached quadrature table for the accelerating-wind integrand if needed."""
+    global _ACCEL_U_GRID, _ACCEL_F_GRID
+    if _ACCEL_U_GRID is not None and _ACCEL_F_GRID is not None:
+        return _ACCEL_U_GRID, _ACCEL_F_GRID
+    u_lin = np.linspace(0.0, 50.0, 20000)
+    u_log = np.logspace(np.log10(50.0), np.log10(_ACCEL_U_MAX), 20000)
+    u = np.unique(np.concatenate([u_lin, u_log]))
+    f = (1.0 + u * u) ** (-5.0 / 4.0)
+    du = np.diff(u)
+    F = np.empty_like(u)
+    F[0] = 0.0
+    F[1:] = np.cumsum(0.5 * (f[1:] + f[:-1]) * du)
+    _ACCEL_U_GRID = u
+    _ACCEL_F_GRID = F
+    return _ACCEL_U_GRID, _ACCEL_F_GRID
+
+
+@njit(cache=True)
+def _interp_scalar(x, xp, fp):
+    """Fast scalar linear interpolation (binary search) for use inside @njit."""
+    n = len(xp)
+    if x <= xp[0]:
+        return fp[0]
+    if x >= xp[n - 1]:
+        return fp[n - 1]
+    lo = 0
+    hi = n - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if xp[mid] <= x:
+            lo = mid
+        else:
+            hi = mid
+    t = (x - xp[lo]) / (xp[hi] - xp[lo])
+    return fp[lo] + t * (fp[hi] - fp[lo])
+
+
+@njit(cache=True)
+def _wind_los_converged_numba(av_db, A, z_start, accel_u_grid, accel_f_grid, F_inf):
+    """Numba-accelerated converged (adaptive) LOS integration.
+
+    Replaces the vectorised numpy path when Numba is available.
+    Eliminates temporary array allocation and fuses per-cell math.
+    """
+    N = len(av_db)
+    lw = np.empty(N)
+    lw2 = np.empty(N)
+    los_arr = np.empty(N)
+
+    u_max = accel_u_grid[-1]
+
+    for i in range(N):
+        b = av_db[i]
+        if b < 1e-8:
+            b = 1e-8
+        u0 = z_start / b
+        u_abs = abs(u0)
+
+        # Constant-velocity integral: (arctan(u) + pi/2) / b
+        los2_val = (math.atan(u0) + math.pi * 0.5) / b
+
+        # F_abs(|u0|) via table lookup
+        if u_abs <= u_max:
+            F_abs_val = _interp_scalar(u_abs, accel_u_grid, accel_f_grid)
+        else:
+            F_abs_val = F_inf - (2.0 / 3.0) / (u_abs ** 1.5)
+
+        # Integral from -inf to u0
+        if u0 >= 0.0:
+            I_u = F_inf + F_abs_val
+        else:
+            I_u = F_inf - F_abs_val
+
+        los_val = I_u / (b ** 1.5)
+
+        lw[i] = los_val * A[i]
+        lw2[i] = los2_val * A[i]
+        los_arr[i] = los_val
+
+    return lw, lw2, los_arr
+
+
+@njit(cache=True)
+def _wind_los_fixed_rmax_numba(av_db, A, z_start_scalar, dz, Rmax):
+    """Numba-accelerated fixed-Rmax LOS integration.
+
+    Avoids the large (N, K+1) broadcasted arrays used in the numpy path.
+    """
+    N = len(av_db)
+    lw = np.zeros(N)
+    lw2 = np.zeros(N)
+    los_arr = np.zeros(N)
+    Rmax2 = Rmax * Rmax
+
+    for i in range(N):
+        b2 = av_db[i] * av_db[i]
+        t2 = Rmax2 - b2
+        if t2 <= 0.0:
+            continue
+        t = math.sqrt(t2)
+        if abs(z_start_scalar) > t:
+            continue
+
+        end_k = int(math.floor((z_start_scalar + t) / dz))
+        con_sum = 0.0
+        con2_sum = 0.0
+
+        for k in range(end_k + 1):
+            z = z_start_scalar - dz * k
+            denom = b2 + z * z
+            con_sum += denom ** (-1.25)
+            con2_sum += 1.0 / denom
+
+        los_val = dz * con_sum
+        los2_val = dz * con2_sum
+
+        lw[i] = los_val * A[i]
+        lw2[i] = los2_val * A[i]
+        los_arr[i] = los_val
+
+    return lw, lw2, los_arr
+
+
+# =============================================================================
+# Grid construction
+# =============================================================================
 
 def create_grid(
     r: float, l: float, R: float, gma: float, d2h: float = 6.0
@@ -43,13 +203,16 @@ def create_grid(
     g1_th_flat = g1_th_mesh.flatten()
 
     # Filter points based on conditions
-    if gma < np.pi:
-        # Calculate distance from center
+    # Only apply eclipse filtering when emitter is BEHIND companion (sin(gma) > 0)
+    # When emitter is in front (sin(gma) <= 0), no occultation is possible
+    if np.sin(gma) > 0:
+        # Calculate distance from center - filter out points blocked by companion
         nn = np.sqrt(g1_r_flat**2 + l**2 - 2 * g1_r_flat * l * np.cos(g1_th_flat))
         mask = nn >= R
         g1_s_r = g1_r_flat[mask]
         g1_s_th = g1_th_flat[mask]
     else:
+        # Emitter is in front of companion - all points visible
         g1_s_r = g1_r_flat
         g1_s_th = g1_th_flat
 
@@ -127,6 +290,12 @@ def wind_los_integral(
     av_db: np.ndarray,
     A: np.ndarray,
     dz: float = 0.1,
+    Rmax: Optional[float] = None,
+    converge_rmax: bool = False,
+    conv_eps_rel: float = 1e-6,
+    conv_eps_abs: float = 1e-12,
+    conv_min_steps: int = 50,
+    conv_r_cap_mult: float = 1000.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Calculate column integral along the line of sight.
@@ -142,6 +311,12 @@ def wind_los_integral(
         av_x, av_th, av_db: Grid arrays
         A: Area array
         dz: Step along line of sight (solar radii)
+        Rmax: Maximum radius (solar radii) for LOS integration cutoff. If None, defaults to 2*d.
+        converge_rmax: If True, ignore Rmax and integrate adaptively until tail contributions become negligible.
+        conv_eps_rel: Relative convergence tolerance for adaptive stopping (both wind models).
+        conv_eps_abs: Absolute convergence tolerance for adaptive stopping (both wind models).
+        conv_min_steps: Minimum number of dz-steps before convergence checks start.
+        conv_r_cap_mult: Safety cap for adaptive integration, as multiple of d (stop when r >= cap).
 
     Returns:
         Tuple of (lw, lw2, icd, A2) arrays
@@ -155,17 +330,58 @@ def wind_los_integral(
         )
 
     # z start and bounds (identical for each cell within a phase)
-        z1 = d1 * np.sin(gma) * np.cos(i)
-        z2 = d2 * np.sin(gma) * np.cos(i)
+    z1 = d1 * np.sin(gma) * np.cos(i)
+    z2 = d2 * np.sin(gma) * np.cos(i)
     z_start = z1 + z2
 
-    # Per-cell LOS half-extent
-    t = np.sqrt((2.0 * d) ** 2 - av_db**2)
+    # Converged (adaptive) path: integrate to -infinity using analytical / cached quadrature
+    if converge_rmax or (Rmax is None):
+        accel_u, accel_f = _ensure_accel_cache()
+        F_inf = (math.sqrt(math.pi) * math.gamma(0.75)) / (2.0 * math.gamma(1.25))
 
-    # Determine per-cell validity: original algorithm integrates only if |z_start| <= t
-    valid_cells = (np.abs(z_start) <= t)
+        if HAS_NUMBA:
+            lw, lw2, los = _wind_los_converged_numba(
+                av_db.astype(np.float64), A.astype(np.float64),
+                float(z_start), accel_u, accel_f, F_inf,
+            )
+            return lw, lw2, los, A.astype(np.float64)
 
-    # Per-cell end step index; invalid cells get -1 so they contribute zero
+        # --- numpy fallback (original vectorised path) ---
+        b = av_db.astype(float)
+        b_safe = np.maximum(b, 1e-8)
+        u0 = float(z_start) / b_safe
+        u_abs = np.abs(u0)
+
+        los2 = (np.arctan(u0) + (np.pi / 2.0)) / b_safe
+
+        F_abs = np.interp(
+            np.minimum(u_abs, _ACCEL_U_MAX), accel_u, accel_f,
+        )
+        large = u_abs > _ACCEL_U_MAX
+        if np.any(large):
+            F_abs = F_abs.copy()
+            F_abs[large] = F_inf - ((2.0 / 3.0) / (u_abs[large] ** (3.0 / 2.0)))
+
+        I_u = F_inf + (np.sign(u0) * F_abs)
+        los = I_u / (b_safe ** (3.0 / 2.0))
+
+        lw = los * A
+        lw2 = los2 * A
+        return lw.astype(float), lw2.astype(float), los.astype(float), A.astype(float)
+
+    # Fixed-Rmax path
+    Rmax_use = float(Rmax)
+
+    if HAS_NUMBA:
+        lw, lw2, los = _wind_los_fixed_rmax_numba(
+            av_db.astype(np.float64), A.astype(np.float64),
+            float(z_start), float(dz), Rmax_use,
+        )
+        return lw, lw2, los, A.astype(np.float64)
+
+    # --- numpy fallback (original broadcasted path) ---
+    t = np.sqrt(np.maximum((Rmax_use ** 2) - (av_db ** 2), 0.0))
+    valid_cells = (t > 0) & (np.abs(z_start) <= t)
     end_k = np.floor((z_start + t) / dz).astype(int)
     end_k = np.where(valid_cells, end_k, -1)
 
@@ -178,31 +394,246 @@ def wind_los_integral(
             np.zeros_like(av_db),
         )
 
-    # Broadcasted z values across steps
-    k = np.arange(max_steps + 1, dtype=float)  # shape (K+1,)
-    z_vals = z_start - dz * k  # shape (K+1,)
-
-    # Broadcast to (N, K+1)
-    cl2 = (av_db**2)[:, None]  # (N,1)
-    z2_vals = z_vals[None, :] ** 2  # (1, K+1)
-
-    denom = cl2 + z2_vals  # (N, K+1)
-
-    # Masks to include only valid steps per cell (k from 0..end_k inclusive)
+    k = np.arange(max_steps + 1, dtype=float)
+    z_vals = z_start - dz * k
+    cl2 = (av_db**2)[:, None]
+    z2_vals = z_vals[None, :] ** 2
+    denom = cl2 + z2_vals
     step_mask = (k[None, :] <= end_k[:, None]) & valid_cells[:, None]
 
-    # Compute sums
     con_sum = np.sum((denom ** (-5.0 / 4.0)) * step_mask, axis=1)
     con2_sum = np.sum((denom ** (-1.0)) * step_mask, axis=1)
 
     los = dz * con_sum
     los2 = dz * con2_sum
-
     lw = los * A
     lw2 = los2 * A
 
-    # icd is los for each cell, A2 is A
     return lw.astype(float), lw2.astype(float), los.astype(float), A.astype(float)
+
+
+def get_available_bands_from_csv(df: pd.DataFrame) -> List[str]:
+    """
+    Detect available energy bands from CSV column names.
+    
+    Looks for columns matching pattern: flux_{band}_ph
+    
+    Args:
+        df: DataFrame from flux vs nH CSV
+        
+    Returns:
+        List of band names (e.g., ['broad', 'soft', 'medium', 'hard'])
+    """
+    bands = []
+    for col in df.columns:
+        if col.startswith("flux_") and col.endswith("_ph"):
+            # Extract band name from flux_{band}_ph
+            band = col[5:-3]  # Remove "flux_" prefix and "_ph" suffix
+            bands.append(band)
+    return sorted(bands)
+
+
+def load_flux_vs_nh_csv(csv_path: str) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Load flux vs nH CSV file generated by compute_flux_vs_nH.py.
+    Automatically detects available energy bands from column names.
+    
+    Args:
+        csv_path: Path to CSV file with columns like nH_1e22, flux_{band}_ph, flux_{band}_erg
+        
+    Returns:
+        Tuple of (DataFrame with flux vs nH data, list of available band names)
+        
+    Raises:
+        FileNotFoundError: If CSV file doesn't exist
+        ValueError: If CSV is missing required columns or has no valid bands
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Flux vs nH CSV file not found: {csv_path}")
+    
+    df = pd.read_csv(csv_path)
+    
+    # Check for nH column
+    if "nH_1e22" not in df.columns:
+        raise ValueError("CSV missing required column: nH_1e22")
+    
+    # Detect available bands
+    bands = get_available_bands_from_csv(df)
+    if not bands:
+        raise ValueError("No flux columns found in CSV. Expected columns like flux_{band}_ph")
+    
+    print(f"Detected energy bands in CSV: {', '.join(bands)}")
+    
+    # Filter out rows with invalid nH
+    df = df[df["nH_1e22"].notna() & (df["nH_1e22"] > 0)]
+    
+    # Filter out rows where all flux columns are NaN or negative
+    valid_mask = df["nH_1e22"].notna()
+    for band in bands:
+        flux_col = f"flux_{band}_ph"
+        if flux_col in df.columns:
+            # Keep row if at least one band has valid data
+            valid_mask = valid_mask & df[flux_col].notna()
+    
+    df = df[valid_mask]
+    
+    if len(df) == 0:
+        raise ValueError("No valid data points in CSV after filtering")
+    
+    return df, bands
+
+
+def interpolate_flux_from_nh(
+    nh_1e22: np.ndarray, df: pd.DataFrame, band: str, flux_type: str = "erg"
+) -> np.ndarray:
+    """
+    Interpolate flux values for given nH array using CSV data.
+    
+    Args:
+        nh_1e22: Array of nH values in 1e22 cm^-2 units
+        df: DataFrame from load_flux_vs_nh_csv
+        band: Band name (e.g., "soft", "hard", "broad", "medium")
+        flux_type: Which flux column to use — "erg" (erg/cm^2/s, default) or
+                   "ph" (photons/cm^2/s)
+        
+    Returns:
+        Array of interpolated flux values in units determined by flux_type
+        
+    Raises:
+        ValueError: If band/flux_type column is not found in DataFrame
+    """
+    flux_col = f"flux_{band}_{flux_type}"
+
+    if flux_col not in df.columns:
+        available = get_available_bands_from_csv(df)
+        raise ValueError(
+            f"Column '{flux_col}' not found in CSV. "
+            f"Available bands: {available}. "
+            f"flux_type must be 'ph' or 'erg'."
+        )
+    
+    # Sort by nH for interpolation
+    df_sorted = df.sort_values("nH_1e22")
+    nh_csv = df_sorted["nH_1e22"].values
+    flux_csv = df_sorted[flux_col].values
+    
+    # Filter out NaN/invalid flux values
+    valid = np.isfinite(flux_csv) & (flux_csv > 0)
+    if not np.any(valid):
+        raise ValueError(f"No valid flux data for band '{band}'")
+    
+    nh_csv = nh_csv[valid]
+    flux_csv = flux_csv[valid]
+    
+    # Check range coverage
+    nh_min, nh_max = nh_csv.min(), nh_csv.max()
+    if np.any(nh_1e22 < nh_min) or np.any(nh_1e22 > nh_max):
+        warnings.warn(
+            f"Some nH values are outside CSV range [{nh_min:.3f}, {nh_max:.3f}] 1e22 cm^-2 for band '{band}'. "
+            f"Extrapolation will be used (fill_value='extrapolate')."
+        )
+    
+    # Create interpolator (log-log space for better behavior)
+    interp_func = interp1d(
+        np.log10(nh_csv),
+        np.log10(flux_csv),
+        kind="linear",
+        fill_value="extrapolate",
+        bounds_error=False,
+    )
+    
+    # Interpolate (handle edge cases)
+    nh_1e22 = np.asarray(nh_1e22)
+    nh_1e22_safe = np.clip(nh_1e22, 1e-6, 1e6)  # Avoid log10(0)
+    log_flux = interp_func(np.log10(nh_1e22_safe))
+    flux = 10 ** log_flux
+    
+    return flux
+
+
+def fit_exponential_to_csv(
+    df: pd.DataFrame, band: str, flux_type: str = "erg"
+) -> Tuple[float, float]:
+    """
+    Fit exponential function A * exp(-B * nH) to CSV flux data in LOG SPACE.
+    
+    Fitting in log space: log(flux) = log(A) - B * nH
+    This gives equal weight to all data points regardless of magnitude,
+    appropriate for data spanning many orders of magnitude.
+    
+    Args:
+        df: DataFrame from load_flux_vs_nh_csv
+        band: Band name (e.g., "soft", "hard", "broad", "medium")
+        flux_type: Which flux column to use — "erg" (erg/cm^2/s, default) or
+                   "ph" (photons/cm^2/s)
+        
+    Returns:
+        Tuple of (A, B) coefficients for flux = A * exp(-B * nH_1e22)
+        in units determined by flux_type
+        
+    Raises:
+        ValueError: If band/flux_type column is not found or fit fails without fallback
+    """
+    flux_col = f"flux_{band}_{flux_type}"
+
+    if flux_col not in df.columns:
+        available = get_available_bands_from_csv(df)
+        raise ValueError(
+            f"Column '{flux_col}' not found in CSV. "
+            f"Available bands: {available}. "
+            f"flux_type must be 'ph' or 'erg'."
+        )
+    
+    # Get data
+    df_sorted = df.sort_values("nH_1e22")
+    nh = df_sorted["nH_1e22"].values
+    flux = df_sorted[flux_col].values
+    
+    # Filter out NaN/invalid values
+    valid = np.isfinite(nh) & np.isfinite(flux) & (flux > 0) & (nh > 0)
+    if not np.any(valid):
+        raise ValueError(f"No valid flux data for band '{band}'")
+    
+    nh = nh[valid]
+    flux = flux[valid]
+    
+    # Take logarithm for fitting in log space
+    log_flux = np.log(flux)
+    
+    # Fit linear function in log space: log(flux) = log(A) - B * nH
+    def linear_func(x, log_A, B):
+        return log_A - B * x
+    
+    try:
+        # Initial guess for log(A) and B from endpoints
+        log_A_guess = np.log(flux[0]) + 0.1 * nh[0]
+        B_guess = -(log_flux[-1] - log_flux[0]) / (nh[-1] - nh[0])
+        
+        popt, _ = curve_fit(
+            linear_func,
+            nh,
+            log_flux,
+            p0=[log_A_guess, max(B_guess, 0.01)],
+            maxfev=10000,
+        )
+        log_A, B = popt
+        A = np.exp(log_A)  # Convert back from log space
+        
+        print(f"Fitted exponential for {band} band: A={A:.6e}, B={B:.6f}")
+        return float(A), float(B)
+        
+    except Exception as e:
+        # Fallback legacy values are photon-flux-based; only apply for flux_type="ph"
+        if flux_type == "ph":
+            if band == "hard":
+                warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy ph values.")
+                return 9.524e-13, 0.057
+            elif band == "soft":
+                warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy ph values.")
+                return 9.3923e-13, 2.5062
+        raise ValueError(
+            f"Exponential fit failed for {band} band (flux_type='{flux_type}'): {e}"
+        ) from e
 
 
 def simulate_lightcurve(
@@ -217,6 +648,13 @@ def simulate_lightcurve(
     dz: float = 0.1,
     verbose: bool = False,
     n_jobs: int = 1,
+    flux_method: str = "legacy",
+    flux_csv_path: Optional[str] = None,
+    flux_type: str = "erg",
+    lam: float = 0.589537,
+    lam2: float = 0.589537,
+    Rmax: Optional[float] = None,
+    converge_rmax: bool = False,
 ) -> pd.DataFrame:
     """
     Main simulation function for lightcurve calculation.
@@ -232,14 +670,45 @@ def simulate_lightcurve(
         d2h: Angular cell size (degrees) for the polar grid used in the surface integral
         dz: Step size along the line of sight (solar radii)
         verbose: If True, prints per-phase progress
+        n_jobs: Number of parallel workers across phases (1 = serial)
+        flux_method: Method for converting nH to flux. Options:
+            - "legacy": Use hardcoded exponential coefficients (default)
+            - "interpolate": Interpolate from CSV flux vs nH data
+            - "refit": Fit new exponentials to CSV data
+        flux_csv_path: Path to CSV file from compute_flux_vs_nH.py (required if flux_method != "legacy")
+        flux_type: Which flux column from the CSV to use — "erg" (erg/cm^2/s, default)
+            or "ph" (photons/cm^2/s). Only applies when flux_method is "interpolate" or "refit".
+        lam: Target mean nH in 1e22 cm^-2 units. The raw wind integral (flx) is
+            scaled so that mean(fl) = lam. Default 0.589537 (i.e., mean nH ≈ 5.9e21 cm^-2).
+        lam2: Target mean nH for constant velocity wind model (flx2).
+            Typically set to the same value as lam.
+        Rmax: Maximum radius (solar radii) used as a hard cutoff for LOS integration.
+            If None, the LOS integration uses adaptive convergence stopping (see converge_rmax).
+            Note: the CLI sets the default to 2*(d1+d2), reproducing the legacy cutoff.
+        converge_rmax: If True, ignore fixed Rmax and integrate adaptively until tail contributions are negligible.
 
     Returns:
-        DataFrame with simulation results
+        DataFrame with simulation results. Key columns:
+            - fl, fl2: Scaled nH values (in 1e22 cm^-2 units)
+            - nfl_hard_av, nfl_soft_av: Photon fluxes (photons/cm^2/s) for hard/soft bands
+            - pho_count_hard_av, pho_count_soft_av: Photon counts (legacy mode only)
+            
+    Notes:
+        - The column density integral (flx) has arbitrary units
+        - The scaling factor is computed as lam / mean(flx), so mean(fl) = lam
+        - fl values are in units of 1e22 cm^-2 (e.g., fl=1.0 means nH = 1.0e22 cm^-2)
+        - Photon count columns are only included when flux_method="legacy"
     """
     # Convert angles to radians
     gma = gma0 * np.pi / 180
     i = i0 * np.pi / 180
     d = d1 + d2
+
+    # Integration cutoff handling
+    # - If converge_rmax is enabled OR Rmax is None: use adaptive stopping
+    # - Otherwise: use fixed cutoff at Rmax
+    converge_rmax_use = bool(converge_rmax) or (Rmax is None)
+    Rmax_use: Optional[float] = None if Rmax is None else float(Rmax)
 
     # Prepare phase values
     n_iterations = int(360 / dth)
@@ -261,11 +730,28 @@ def simulate_lightcurve(
         b = 2 * abs(l) * r
         n = l / (R + r)
 
-        if cur_gma <= np.pi:
+        # Track if emitter is fully eclipsed (blocked by companion)
+        is_eclipsed = False
+
+        # Only check for eclipse when emitter is BEHIND companion (sin(gma) > 0)
+        # When emitter is in front (sin(gma) <= 0), no occultation possible
+        if np.sin(cur_gma) > 0:
             if n >= 1:
+                # Emitter is behind but not overlapping with companion disk
                 av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
                 lw, lw2, icd_val, A2_val = wind_los_integral(
-                    d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
+                    d,
+                    d1,
+                    d2,
+                    cur_gma,
+                    i,
+                    av_x,
+                    av_th,
+                    av_db,
+                    A_cells,
+                    dz=dz,
+                    Rmax=Rmax_use,
+                    converge_rmax=converge_rmax_use,
                 )
                 if lw.size > 0:
                     flx_i = float(np.sum(lw) / np.sum(A_cells))
@@ -281,14 +767,28 @@ def simulate_lightcurve(
                 n2 = a / b
                 n3 = l / (R - r)
                 if abs(n3) <= 1:
+                    # Total eclipse: emitter is completely behind companion
+                    is_eclipsed = True
                     flx_i = 0.0
                     flx2_i = 0.0
                     icd_i = 0.0
                     A2_i = 0.0
                 else:
+                    # Partial overlap - compute visible portion
                     av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
                     lw, lw2, icd_val, A2_val = wind_los_integral(
-                        d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
+                        d,
+                        d1,
+                        d2,
+                        cur_gma,
+                        i,
+                        av_x,
+                        av_th,
+                        av_db,
+                        A_cells,
+                        dz=dz,
+                        Rmax=Rmax_use,
+                        converge_rmax=converge_rmax_use,
                     )
                     if lw.size > 0:
                         flx_i = float(np.sum(lw) / np.sum(A_cells))
@@ -301,9 +801,21 @@ def simulate_lightcurve(
                         icd_i = 0.0
                         A2_i = 0.0
         else:
+            # Emitter is in front of companion - fully visible, no eclipse possible
             av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma, d2h=d2h)
             lw, lw2, icd_val, A2_val = wind_los_integral(
-                d, d1, d2, cur_gma, i, av_x, av_th, av_db, A_cells, dz=dz
+                d,
+                d1,
+                d2,
+                cur_gma,
+                i,
+                av_x,
+                av_th,
+                av_db,
+                A_cells,
+                dz=dz,
+                Rmax=Rmax_use,
+                converge_rmax=converge_rmax_use,
             )
             if lw.size > 0:
                 flx_i = float(np.sum(lw) / np.sum(A_cells))
@@ -331,6 +843,7 @@ def simulate_lightcurve(
             l,
             L,
             h,
+            is_eclipsed,
         )
 
     # Compute phases, optionally in parallel
@@ -360,8 +873,8 @@ def simulate_lightcurve(
                 if verbose:
                     print(f"Phase: {out[5]:.2f} degrees")
 
-    # Unpack
-    flx, flx2, icd_vals, A2_vals, ph, deg, phase, time, l3, L3, h3 = map(
+    # Unpack (now includes is_eclipsed flag)
+    flx, flx2, icd_vals, A2_vals, ph, deg, phase, time, l3, L3, h3, is_eclipsed = map(
         list, zip(*results_list)
     )
 
@@ -379,33 +892,91 @@ def simulate_lightcurve(
             "l3": l3,
             "L3": L3,
             "h3": h3,
+            "is_eclipsed": is_eclipsed,
         }
     )
 
-    # Calculate additional flux parameters
-    lam = 0.589537 / np.mean(flx) if np.mean(flx) > 0 else 1
-    lam2 = 0.589537 / np.mean(flx2) if np.mean(flx2) > 0 else 1
+    # Scale raw wind integrals so that mean(fl) = lam (target mean nH)
+    mean_flx = np.mean(flx)
+    mean_flx2 = np.mean(flx2)
+    lam_scale = lam / mean_flx if mean_flx > 0 else 1.0
+    lam2_scale = lam2 / mean_flx2 if mean_flx2 > 0 else 1.0
 
-    fl = np.array(flx) * lam
-    fl2 = np.array(flx2) * lam2
+    fl = np.array(flx) * lam_scale
+    fl2 = np.array(flx2) * lam2_scale
 
-    # Calculate scaled fluxes
-    nfl_hard_av = 9.524 * np.exp(-fl * 0.057)
-    nfl_hard_cv = 9.524 * np.exp(-fl2 * 0.057)
-    nfl_soft_av = 9.3923 * np.exp(-fl * 2.5062)
-    nfl_soft_cv = 9.3923 * np.exp(-fl2 * 2.5062)
-    pho_count_hard_av = 0.0001464 * np.exp(-fl * 0.1066818)
-    pho_count_soft_av = 0.0005275 * np.exp(-fl * 2.7556631)
+    # Calculate scaled fluxes based on method
+    if flux_method == "legacy":
+        # Legacy hardcoded exponential coefficients
+        nfl_hard_av = 9.524 * np.exp(-fl * 0.057)
+        nfl_hard_cv = 9.524 * np.exp(-fl2 * 0.057)
+        nfl_soft_av = 9.3923 * np.exp(-fl * 2.5062)
+        nfl_soft_cv = 9.3923 * np.exp(-fl2 * 2.5062)
+        pho_count_hard_av = 0.0001464 * np.exp(-fl * 0.1066818)
+        pho_count_soft_av = 0.0005275 * np.exp(-fl * 2.7556631)
+        
+        # Add flux columns to results (legacy mode)
+        results["fl"] = fl
+        results["fl2"] = fl2
+        results["nfl_hard_av"] = nfl_hard_av
+        results["nfl_hard_cv"] = nfl_hard_cv
+        results["nfl_soft_av"] = nfl_soft_av
+        results["nfl_soft_cv"] = nfl_soft_cv
+        results["pho_count_hard_av"] = pho_count_hard_av
+        results["pho_count_soft_av"] = pho_count_soft_av
+        
+    elif flux_method == "interpolate":
+        # Interpolate from CSV data
+        if flux_csv_path is None:
+            raise ValueError("flux_csv_path required when flux_method='interpolate'")
+        
+        df_flux, available_bands = load_flux_vs_nh_csv(flux_csv_path)
+        
+        # Add base columns
+        results["fl"] = fl
+        results["fl2"] = fl2
+        
+        # Dynamically compute flux for all available bands
+        for band in available_bands:
+            try:
+                results[f"nfl_{band}_av"] = interpolate_flux_from_nh(fl, df_flux, band, flux_type=flux_type)
+                results[f"nfl_{band}_cv"] = interpolate_flux_from_nh(fl2, df_flux, band, flux_type=flux_type)
+            except Exception as e:
+                warnings.warn(f"Failed to interpolate flux for band '{band}': {e}")
+        
+    elif flux_method == "refit":
+        # Fit new exponentials to CSV data
+        if flux_csv_path is None:
+            raise ValueError("flux_csv_path required when flux_method='refit'")
+        
+        df_flux, available_bands = load_flux_vs_nh_csv(flux_csv_path)
+        
+        # Add base columns
+        results["fl"] = fl
+        results["fl2"] = fl2
+        
+        # Dynamically fit and compute flux for all available bands
+        for band in available_bands:
+            try:
+                A, B = fit_exponential_to_csv(df_flux, band, flux_type=flux_type)
+                results[f"nfl_{band}_av"] = A * np.exp(-B * fl)
+                results[f"nfl_{band}_cv"] = A * np.exp(-B * fl2)
+            except Exception as e:
+                warnings.warn(f"Failed to fit exponential for band '{band}': {e}")
+        
+    else:
+        raise ValueError(f"Invalid flux_method: {flux_method}. Must be 'legacy', 'interpolate', or 'refit'")
 
-    # Add flux columns to results
-    results["fl"] = fl
-    results["fl2"] = fl2
-    results["nfl_hard_av"] = nfl_hard_av
-    results["nfl_hard_cv"] = nfl_hard_cv
-    results["nfl_soft_av"] = nfl_soft_av
-    results["nfl_soft_cv"] = nfl_soft_cv
-    results["pho_count_hard_av"] = pho_count_hard_av
-    results["pho_count_soft_av"] = pho_count_soft_av
+    # Set all scaled flux columns to 0 when eclipsed
+    # During eclipse, the emitter is physically blocked - flux should be zero,
+    # not computed from absorption formula (which would give max flux when nH=0)
+    eclipse_mask = results["is_eclipsed"].values
+    if np.any(eclipse_mask):
+        # Find all flux columns (nfl_* and pho_count_*)
+        flux_cols = [col for col in results.columns 
+                     if col.startswith("nfl_") or col.startswith("pho_count_")]
+        for col in flux_cols:
+            results.loc[eclipse_mask, col] = 0.0
 
     return results
 
@@ -463,6 +1034,19 @@ def main():
         help="Step size along the line of sight (solar radii)",
     )
     parser.add_argument(
+        "--Rmax",
+        type=float,
+        default=None,
+        help="Maximum radius (solar radii) for LOS integration cutoff. "
+        "If not provided, defaults to 2*(d1+d2). Ignored if --converge-rmax is set.",
+    )
+    parser.add_argument(
+        "--converge-rmax",
+        action="store_true",
+        help="Override fixed Rmax cutoff and integrate adaptively until LOS tail contributions "
+        "become negligible (both wind models).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print per-phase progress during simulation",
@@ -474,6 +1058,44 @@ def main():
         help="Number of parallel workers across phases (1 = serial)",
     )
     parser.add_argument(
+        "--flux_method",
+        type=str,
+        choices=["legacy", "interpolate", "refit"],
+        default="legacy",
+        help="Method for converting nH to flux: 'legacy' (hardcoded exponentials), "
+        "'interpolate' (from CSV), or 'refit' (fit new exponentials to CSV)",
+    )
+    parser.add_argument(
+        "--flux_csv",
+        type=str,
+        default=None,
+        help="Path to flux vs nH CSV file from compute_flux_vs_nH.py "
+        "(required if flux_method is not 'legacy')",
+    )
+    parser.add_argument(
+        "--flux_type",
+        type=str,
+        choices=["erg", "ph"],
+        default="erg",
+        help="Which flux column from the CSV to use: "
+        "'erg' (erg/cm^2/s, default) or 'ph' (photons/cm^2/s). "
+        "Only applies when --flux_method is 'interpolate' or 'refit'.",
+    )
+    parser.add_argument(
+        "--lam",
+        type=float,
+        default=0.589537,
+        help="Target mean nH in 1e22 cm^-2 units. The raw wind integral is "
+        "scaled so that mean(fl) = lam. Default: 0.589537.",
+    )
+    parser.add_argument(
+        "--lam2",
+        type=float,
+        default=0.589537,
+        help="Target mean nH for constant velocity wind model (flx2). "
+        "Default: 0.589537. Typically set to same value as --lam.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="xrb_lightcurve_output.csv",
@@ -481,6 +1103,14 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Default physical cutoff reproduces legacy behavior
+    if args.Rmax is None:
+        args.Rmax = 2.0 * (args.d1 + args.d2)
+    
+    # Validate arguments
+    if args.flux_method in ["interpolate", "refit"] and args.flux_csv is None:
+        parser.error(f"--flux_csv is required when flux_method='{args.flux_method}'")
 
     print("Starting XRB Lightcurve Simulation...")
     print(f"Parameters:")
@@ -493,7 +1123,15 @@ def main():
     print(f"  dth (orbital increment): {args.dth} degrees")
     print(f"  d2h (polar cell size): {args.d2h} degrees")
     print(f"  dz (LOS step size): {args.dz}")
+    print(f"  Rmax (LOS cutoff): {args.Rmax}")
+    print(f"  converge_rmax: {args.converge_rmax}")
     print(f"  n_jobs (parallel workers): {args.n_jobs}")
+    print(f"  flux_method: {args.flux_method}")
+    if args.flux_csv:
+        print(f"  flux_csv: {args.flux_csv}")
+        print(f"  flux_type: {args.flux_type}")
+    print(f"  lam: {args.lam}")
+    print(f"  lam2: {args.lam2}")
     print(f"  Output file: {args.output}")
     print()
 
@@ -510,6 +1148,13 @@ def main():
         dz=args.dz,
         verbose=args.verbose,
         n_jobs=args.n_jobs,
+        flux_method=args.flux_method,
+        flux_csv_path=args.flux_csv,
+        flux_type=args.flux_type,
+        lam=args.lam,
+        lam2=args.lam2,
+        Rmax=args.Rmax,
+        converge_rmax=args.converge_rmax,
     )
 
     # Save results

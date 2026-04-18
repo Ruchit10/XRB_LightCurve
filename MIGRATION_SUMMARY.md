@@ -105,7 +105,7 @@ The simulation generates a comprehensive CSV file with columns:
 - `icd`: Integrated column density
 
 ### Energy Band Fluxes
-- `nfl_hard_av`, `nfl_hard_cv`: Hard band (2-10 keV)
+- `nfl_hard_av`, `nfl_hard_cv`: Hard band (2.0-7.0 keV)
 - `nfl_soft_av`, `nfl_soft_cv`: Soft band (0.3-2 keV)
 - `pho_count_hard_av`, `pho_count_soft_av`: Photon counts
 
