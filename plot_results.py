@@ -26,25 +26,23 @@ BAND_INFO: Dict[str, Tuple[str, str]] = {
 def detect_energy_bands(df: pd.DataFrame) -> List[str]:
     """
     Auto-detect available energy band columns in the DataFrame.
-    
-    Looks for columns matching patterns:
-    - nfl_{band}_av (accelerated velocity wind model)
-    - nfl_{band}_cv (constant velocity wind model)
-    
+
+    Looks for columns matching the pattern `nfl_{band}` (single wind model).
+
     Args:
         df: DataFrame with simulation results
-        
+
     Returns:
         List of detected band names (e.g., ['soft', 'hard', 'broad'])
     """
     bands = set()
-    pattern = re.compile(r"nfl_(\w+)_(av|cv)")
-    
+    pattern = re.compile(r"^nfl_(\w+)$")
+
     for col in df.columns:
         match = pattern.match(col)
         if match:
             bands.add(match.group(1))
-    
+
     # Sort bands in a logical order if they match known bands
     known_order = ["ultrasoft", "soft", "medium", "hard", "broad"]
     sorted_bands = []
@@ -52,9 +50,8 @@ def detect_energy_bands(df: pd.DataFrame) -> List[str]:
         if band in bands:
             sorted_bands.append(band)
             bands.discard(band)
-    # Add any remaining unknown bands
     sorted_bands.extend(sorted(bands))
-    
+
     return sorted_bands
 
 
@@ -126,9 +123,7 @@ def plot_lightcurve(data_file, output_file=None):
     if has_base_flux:
         # Plot 1: Flux vs Phase (degrees)
         ax = axes[plot_idx]
-        ax.plot(df["deg"], df["flx"], "b-", linewidth=2, label="Accelerated Wind")
-        if "flx2" in df.columns:
-            ax.plot(df["deg"], df["flx2"], "r--", linewidth=2, label="Constant Velocity Wind")
+        ax.plot(df["deg"], df["flx"], "b-", linewidth=2, label="Wind LOS integral")
         ax.set_xlabel("Phase (degrees)")
         ax.set_ylabel("Flux")
         ax.set_title("Flux vs Phase")
@@ -138,9 +133,7 @@ def plot_lightcurve(data_file, output_file=None):
 
         # Plot 2: Scaled Flux vs Phase
         ax = axes[plot_idx]
-        ax.plot(df["deg"], df["fl"], "g-", linewidth=2, label="Scaled Flux (Acc)")
-        if "fl2" in df.columns:
-            ax.plot(df["deg"], df["fl2"], "m--", linewidth=2, label="Scaled Flux (Const)")
+        ax.plot(df["deg"], df["fl"], "g-", linewidth=2, label="Scaled nH")
         ax.set_xlabel("Phase (degrees)")
         ax.set_ylabel("Scaled Flux")
         ax.set_title("Scaled Flux vs Phase")
@@ -152,16 +145,11 @@ def plot_lightcurve(data_file, output_file=None):
     for band in bands:
         ax = axes[plot_idx]
         display_name, energy_range = get_band_display_name(band)
-        
-        # Check which columns exist for this band
-        av_col = f"nfl_{band}_av"
-        cv_col = f"nfl_{band}_cv"
-        
-        if av_col in df.columns:
-            ax.plot(df["deg"], df[av_col], "b-", linewidth=2, label=f"{display_name} (Acc)")
-        if cv_col in df.columns:
-            ax.plot(df["deg"], df[cv_col], "r--", linewidth=2, label=f"{display_name} (Const)")
-        
+
+        col = f"nfl_{band}"
+        if col in df.columns:
+            ax.plot(df["deg"], df[col], "b-", linewidth=2, label=display_name)
+
         ax.set_xlabel("Phase (degrees)")
         ax.set_ylabel(f"{display_name} Band Flux")
         title = f"{display_name} Band"

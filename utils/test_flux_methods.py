@@ -52,8 +52,8 @@ def test_legacy_mode():
         print(f"✓ Legacy mode completed successfully")
         print(f"  Generated {len(results)} data points")
         print(f"  fl range: {results['fl'].min():.6f} to {results['fl'].max():.6f}")
-        print(f"  Hard flux range: {results['nfl_hard_av'].min():.3e} to {results['nfl_hard_av'].max():.3e}")
-        print(f"  Soft flux range: {results['nfl_soft_av'].min():.3e} to {results['nfl_soft_av'].max():.3e}")
+        print(f"  Hard flux range: {results['nfl_hard'].min():.3e} to {results['nfl_hard'].max():.3e}")
+        print(f"  Soft flux range: {results['nfl_soft'].min():.3e} to {results['nfl_soft'].max():.3e}")
         return True
     except Exception as e:
         print(f"✗ Legacy mode failed: {e}")
@@ -87,8 +87,8 @@ def test_interpolate_mode(csv_path):
         print(f"✓ Interpolate mode completed successfully")
         print(f"  Generated {len(results)} data points")
         print(f"  fl range: {results['fl'].min():.6f} to {results['fl'].max():.6f}")
-        print(f"  Hard flux range: {results['nfl_hard_av'].min():.3e} to {results['nfl_hard_av'].max():.3e}")
-        print(f"  Soft flux range: {results['nfl_soft_av'].min():.3e} to {results['nfl_soft_av'].max():.3e}")
+        print(f"  Hard flux range: {results['nfl_hard'].min():.3e} to {results['nfl_hard'].max():.3e}")
+        print(f"  Soft flux range: {results['nfl_soft'].min():.3e} to {results['nfl_soft'].max():.3e}")
         return True
     except Exception as e:
         print(f"✗ Interpolate mode failed: {e}")
@@ -124,8 +124,8 @@ def test_refit_mode(csv_path):
         print(f"✓ Refit mode completed successfully")
         print(f"  Generated {len(results)} data points")
         print(f"  fl range: {results['fl'].min():.6f} to {results['fl'].max():.6f}")
-        print(f"  Hard flux range: {results['nfl_hard_av'].min():.3e} to {results['nfl_hard_av'].max():.3e}")
-        print(f"  Soft flux range: {results['nfl_soft_av'].min():.3e} to {results['nfl_soft_av'].max():.3e}")
+        print(f"  Hard flux range: {results['nfl_hard'].min():.3e} to {results['nfl_hard'].max():.3e}")
+        print(f"  Soft flux range: {results['nfl_soft'].min():.3e} to {results['nfl_soft'].max():.3e}")
         return True
     except Exception as e:
         print(f"✗ Refit mode failed: {e}")

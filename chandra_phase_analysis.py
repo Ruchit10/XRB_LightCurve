@@ -39,15 +39,15 @@ $ python chandra_phase_analysis.py --data-dir data --fit --sim-file simulation.c
 
 # Fit specific flux columns:
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
-    --sim-column nfl_broad_av nfl_soft_av --output fit.png
+    --sim-column nfl_broad nfl_soft --output fit.png
 
 # Fit with specific observation column, without rescaling:
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
-    --obs-column FLUX --sim-column nfl_broad_av --output fit.png
+    --obs-column FLUX --sim-column nfl_broad --output fit.png
 
 # Fit with rescaling enabled:
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
-    --obs-column NET_RATE --sim-column nfl_broad_av --rescale --output fit.png
+    --obs-column NET_RATE --sim-column nfl_broad --rescale --output fit.png
 
 # Load CIAO format data (time in second column, flux as ECF):
 $ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
@@ -89,35 +89,24 @@ def frac(x: np.ndarray | float) -> np.ndarray | float:
 
 def detect_flux_columns(df: pd.DataFrame) -> List[str]:
     """Detect available flux columns in simulation DataFrame.
-    
-    Looks for columns matching common flux patterns:
-    - nfl_{band}_av (accretion velocity wind model, scaled by lam)
-    - nfl_{band}_cv (constant velocity wind model, scaled by lam)
-    - pho_count_{band}_av (photon counts)
-    
-    Note: fl and fl2 columns are excluded as they are unscaled column density values.
-    
+
+    Looks for columns matching `nfl_{band}` (normalized flux per band,
+    scaled by lam). With the unified wind model there is a single flux
+    column per band (no `_av` / `_cv` split).
+
+    Note: the unscaled `flx` and scaled `fl` column-density columns are
+    excluded — they are not per-band flux values.
+
     Parameters
     ----------
     df : DataFrame
         Simulation results DataFrame
-        
+
     Returns
     -------
     List of flux column names found in the DataFrame
     """
-    flux_columns = []
-    
-    # Check for nfl_* columns (normalized flux for various bands, scaled by lam)
-    for col in df.columns:
-        if col.startswith("nfl_") and (col.endswith("_av") or col.endswith("_cv")):
-            flux_columns.append(col)
-    
-    # Check for pho_count_* columns (photon counts)
-    for col in df.columns:
-        if col.startswith("pho_count_") and col.endswith("_av"):
-            flux_columns.append(col)
-    
+    flux_columns = [col for col in df.columns if col.startswith("nfl_")]
     return sorted(flux_columns)
 
 
@@ -915,7 +904,7 @@ def main() -> None:
         nargs='+',
         default=None,
         help="Column name(s) in simulation CSV to use as model flux. Can specify multiple columns separated by spaces. "
-             "If not specified, will auto-detect all available scaled flux columns (nfl_*, pho_count_*).",
+             "If not specified, will auto-detect all available scaled flux columns (nfl_*).",
     )
     parser.add_argument(
         "--fit",
@@ -1015,7 +1004,7 @@ def main() -> None:
             # Auto-detect all flux columns
             sim_columns = detect_flux_columns(sim_df)
             if not sim_columns:
-                parser.error("No scaled flux columns found in simulation file. Expected columns like nfl_* or pho_count_*")
+                parser.error("No scaled flux columns found in simulation file. Expected columns like nfl_*")
             print(f"Auto-detected {len(sim_columns)} scaled flux column(s): {sim_columns}")
         else:
             # Validate user-specified columns
