@@ -18,8 +18,9 @@ fitting, and inference stack since the original R port.
 9. [Phase 8 — MCMC Pipeline & Performance](#phase-8--mcmc-pipeline--performance)
 10. [Phase 9 — Convergence Improvements (Reparameterization)](#phase-9--convergence-improvements-reparameterization)
 11. [Phase 10 — Wind-Shape MCMC Parameters](#phase-10--wind-shape-mcmc-parameters)
-12. [Current File Inventory](#current-file-inventory)
-13. [Current Status & Quick Commands](#current-status--quick-commands)
+12. [Phase 11 — N-D Precomputed Grid for Shape-Fit MCMC](#phase-11--n-d-precomputed-grid-for-shape-fit-mcmc)
+13. [Current File Inventory](#current-file-inventory)
+14. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -183,11 +184,32 @@ emcee/zeus pipeline. Headline pieces:
   best-fit overlay with reduced χ².
 
 **Performance work** done in `xrb_lightcurve.py`:
-- Numba `@njit(cache=True[, parallel=True])` on `_g_profile`,
-  `_los_gl_quadrature`, `_wind_los_profile_numba`, `_simulate_phases_numba`.
-- Gauss-Legendre quadrature replaces the old fixed-step trapezoid.
-- Result: a single `simulate_lightcurve` call ≈ 63 ms, making the direct
-  path viable for MCMC even without a precomputed grid.
+
+- **Pre-optimization state (post Phase 7).** Introducing the unified wind
+  profile registry dropped per-LOS Python dispatch into the hot loop: the
+  LOS integral called back into Python for `g(r)` at every angular cell ×
+  every step on the `dz` grid × every phase. Combined with the fixed-step
+  trapezoid quadrature and per-cell eclipse checks, a *single*
+  `simulate_lightcurve` call had ballooned to **several seconds** (≈3–8 s
+  depending on `dz` / `d2h`), which made Phase 8-style MCMC
+  (10⁴–10⁵ model evaluations) completely infeasible without a precomputed
+  grid — and even the grid build was painfully slow.
+- **Fixes** (together ≈ 2 orders of magnitude):
+  1. `@njit(cache=True[, parallel=True])` on `_g_profile`, the LOS
+     integrand, `_los_gl_quadrature`, `_wind_los_profile_numba`, and the
+     full per-phase sweep `_simulate_phases_numba` (using `prange`).
+  2. **Gauss-Legendre quadrature** replaces the old fixed-step trapezoid;
+     far fewer integrand evaluations for the same accuracy, and the
+     GL nodes/weights are precomputed once.
+  3. **Inlined eclipse test** — eclipse gating collapsed into the kernel
+     so eclipsed phases early-exit without a Python round-trip.
+  4. All `wind_params` / sim params flattened to scalar JIT arguments at
+     the Python/Numba boundary; no dict lookups in the hot path.
+- **Result:** a single `simulate_lightcurve` call is now **< 1 s
+  (≈ 63 ms)** on a laptop, i.e. ~50–100× faster than the post-Phase-7
+  regression and 10⁵–10⁶× the sustained rate needed for MCMC. The
+  direct evaluator became viable for MCMC without a precomputed grid,
+  and the grid build itself dropped from minutes to seconds.
 
 GPU acceleration was evaluated and rejected (Intel Iris ≠ CUDA / JAX-Metal /
 PyTorch-MPS targets). NumPyro/NUTS port was scoped out for the same reason
@@ -262,9 +284,8 @@ params are constrained only by the LC shape.
 - `--wind-model {smooth_pl, beta_law, confinement}` (default `smooth_pl`).
   The legacy `av/cv/both` choices and the `'both'` loop are gone.
 - `--fit-wind-shape` — adds the wind model's active shape params to the
-  MCMC vector; auto-forces `--no-grid` (the precomputed grid is
-  geometry-only). Combining it with `--load-grid`/`--save-grid` is a hard
-  error.
+  MCMC vector. Works with either the precomputed grid (see Phase 11) or
+  `--no-grid` (direct evaluator).
 - Per-shape prior overrides: `--prior-Rb / -p / -beta / -fconf / -ell`
   using the same `mean,std,min,max` format as the geometry priors.
 - `--lam2` removed everywhere.
@@ -273,6 +294,57 @@ params are constrained only by the LC shape.
 `+Rb,p`), `beta_law` (`+beta`), `confinement` (`+fconf, ell`), plus a
 grid-path geometry-only run. All produce valid corner data, ArviZ
 summaries, samples CSV, and `mcmc_summary.txt`.
+
+---
+
+## Phase 11 — N-D Precomputed Grid for Shape-Fit MCMC
+
+After Phase 10 a short (`~1k-step`) shape-fit chain still took ~2 h
+because `--fit-wind-shape` auto-forced the direct evaluator
+(≈ 63 ms × 32 walkers × 1000 steps × all phases ≈ hours). The grid
+class was extended to cover wind-shape axes dynamically instead of
+forcing a slow path.
+
+- **`PrecomputedModelGrid` is now N-D.** `self.axis_names` holds the
+  ordered list of axes (geometry first, then the active shape axes for
+  the chosen `wind_model`). `self.param_grids` and `self.flux_grid`
+  extend correspondingly (geometry-only grids are unchanged shape-wise,
+  so the refactor is zero-cost for existing workflows).
+- **Worker path.** `_precompute_models` now iterates via `np.ndindex`
+  over the full axis set, resolves a per-combo `wind_params` dict
+  (fixed template + per-point shape values + `R_star = R` when the
+  model ties it), and hands it to `_compute_single_model`. The
+  `r >= R` geometry filter still applies.
+- **Evaluation.** A single `RegularGridInterpolator` spans
+  `(axes…, phase)`; `evaluate()` looks shape values up from the caller's
+  `wind_params` dict when shape axes are present, and falls back to the
+  fixed template for geometry-only grids.
+- **I/O** — `.npz` files persist `axis_names`, `shape_axes`,
+  `fit_wind_shape`, and one `<name>_grid` array per axis. Legacy
+  geometry-only `.npz` files (missing `axis_names`) still load unchanged
+  via a backward-compat branch in `_load_grid`.
+- **CLI** — `--fit-wind-shape` no longer force-disables the grid;
+  instead:
+  - Grid size expands by `(shape_grid_points)^k` for `k` shape axes, with
+    the new `--shape-grid-points N` knob (default 5). A `[notice]`
+    prints the expected total grid size up front.
+  - `--save-grid` / `--load-grid` work as usual and are now actually
+    useful for shape-fit MCMC (build once, run many chains).
+  - `--no-grid` stays as the escape hatch for short debugging chains.
+- **Logging cleanup.** `load_flux_vs_nh_csv(..., verbose=verbose)` and
+  `interpolate_flux_from_nh(..., warn_extrapolation=verbose)` now honor
+  the `verbose` flag that `simulate_lightcurve` already threads through.
+  MCMC calls with `verbose=False`, so the per-call "Detected energy
+  bands in CSV: …" print and repeated "nH outside CSV range /
+  Extrapolation will be used" `UserWarning` are gone (they only fire in
+  notebooks / interactive runs now). A belt-and-suspenders
+  `warnings.filterwarnings(...)` in `mcmc_lightcurve_fit.py` keeps the
+  extrapolation warning quiet even if a future callsite forgets to pass
+  `verbose=False`.
+- **Smoke verified** — N-D grid build + save/load round-trip (bit-exact),
+  end-to-end MCMC with `--fit-wind-shape` on `smooth_pl` (+ `Rb, p`) and
+  `beta_law` (+ `beta`), `--no-grid` shape-fit path, and legacy
+  geometry-only grid `.npz` backward compatibility all pass.
 
 ---
 
@@ -353,12 +425,20 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \
     --likelihood jitter --reparam --save-grid grids/broad_smooth.npz \
     --output-dir mcmc_results/broad_smooth
 
-# MCMC: shape-fit (auto disables grid; uses direct evaluator)
+# MCMC: shape-fit with N-D grid (Phase 11 — fast for long chains)
 python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \
     --data-dir data/IC_10_X1_LC_CIAO --wind-model smooth_pl \
     --fit-wind-shape --likelihood jitter \
+    --grid-points 8 --shape-grid-points 5 \
+    --save-grid grids/broad_smooth_shape.npz \
     --prior-Rb 5,3,1,30 --prior-p 4,1,2,8 \
     --output-dir mcmc_results/broad_smooth_shape
+
+# MCMC: shape-fit without grid (quick debug / short chains only)
+python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \
+    --data-dir data/IC_10_X1_LC_CIAO --wind-model smooth_pl \
+    --fit-wind-shape --no-grid --n-steps 200 \
+    --output-dir mcmc_results/broad_smooth_shape_quick
 ```
 
 ---
