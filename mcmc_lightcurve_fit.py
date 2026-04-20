@@ -5,57 +5,55 @@ MCMC Light Curve Fitting for X-ray Binary Systems
 This module performs Markov Chain Monte Carlo (MCMC) fitting to find optimal
 binary system parameters by fitting model light curves to observed Chandra data.
 
-WIND MODELS:
-- av: Accelerated velocity wind (beta-law wind profile)
-- cv: Constant velocity wind (uniform outflow)
+WIND MODELS (selected via --wind-model):
+- smooth_pl   : Smoothly broken power-law density profile (Rb, p, Delta)
+- beta_law    : CAK beta-law velocity-based density (R_star, beta, H)
+- confinement : Inner-confinement / compression amplification (R_star, fconf, ell)
 
-PERFORMANCE OPTIMIZATION:
-This code pre-computes a grid of model light curves and uses N-dimensional
-interpolation during MCMC sampling. This provides ~1000x speedup compared to
-calling simulate_lightcurve() for each MCMC step.
-
-The grid can be saved to disk and reloaded for subsequent MCMC runs.
-
-Parameters being fit:
+GEOMETRY parameters (always fit):
 - d1: Distance of compact object from center of mass (solar radii)
-- d2: Distance of companion star from center of mass (solar radii)  
-- r: Radius of compact object/accretion disk (solar radii)
-- R: Radius of companion star (solar radii)
+- d2: Distance of companion star from center of mass (solar radii)
+- r:  Radius of compact object/accretion disk (solar radii)
+- R:  Radius of companion star (solar radii)
 - i0: Orbital inclination (degrees)
 
+WIND-SHAPE parameters (added with --fit-wind-shape; the set depends on the
+chosen --wind-model):
+- smooth_pl   : Rb (break radius), p (inner slope). Delta is fixed at 2.
+- beta_law    : beta (CAK exponent). H is fixed; R_star is tied to R.
+- confinement : fconf (compression amplitude), ell (compression scale).
+                R_star is tied to R.
+
+The precomputed model grid is geometry-only. When --fit-wind-shape is set the
+code automatically falls back to direct simulate_lightcurve evaluation, which
+is now ~60 ms per LC thanks to the Gauss-Legendre mega-kernel.
+
 Simulation parameters (passed to simulate_lightcurve):
-- lam/lam2: Scaling parameter for nH conversion (affects flux normalization)
+- lam:  Target mean nH in 1e22 cm^-2 units (fixes overall normalization)
 - gma0: Starting phase angle
-- d2h: Angular cell size for polar grid
-- dz: Step size along line of sight
+- d2h:  Angular cell size for polar grid
+- dz:   Step size along line of sight (legacy fallback path only)
 
 Usage:
-    # Fit accelerated wind model (default)
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv
-    
-    # Use zeus sampler (better mixing for correlated posteriors)
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --sampler zeus
-    
-    # Use Student-t likelihood (robust to outliers)
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --likelihood studentt --studentt-nu 5
-    
-    # Use jitter likelihood (adds free systematic error parameter)
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --likelihood jitter
-    
-    # Compute WAIC/LOO model comparison metrics
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --compute-waic
-    
-    # Save grid for reuse
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --save-grid grids/broad_grid.npz
-    
-    # Load pre-computed grid (skip grid computation)
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --load-grid grids/broad_grid.npz
-    
-    # Custom simulation parameters (e.g., different nH scaling)
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --lam 0.511314
-    
-    # Custom priors (e.g., higher inclination starting point)
-    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv --prior-i0 65.0,15.0,30.0,85.0
+    # Geometry-only fit, smooth_pl wind, default shape params
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
+        --wind-model smooth_pl
+
+    # Geometry + wind-shape fit (smooth_pl: + Rb, p)
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
+        --wind-model smooth_pl --fit-wind-shape
+
+    # beta-law wind with shape fit (adds beta)
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
+        --wind-model beta_law --fit-wind-shape
+
+    # Use zeus sampler / Student-t / jitter as before
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
+        --wind-model smooth_pl --sampler zeus --likelihood jitter
+
+    # Custom shape-param prior (e.g. tighter Rb)
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
+        --wind-model smooth_pl --fit-wind-shape --prior-Rb 5.0,1.0,2.0,15.0
 """
 
 import argparse
@@ -104,7 +102,11 @@ except ImportError:
 from scipy.interpolate import RegularGridInterpolator
 from scipy.special import gammaln
 
-from xrb_lightcurve import simulate_lightcurve
+from xrb_lightcurve import (
+    simulate_lightcurve,
+    WIND_MODEL_PARAM_KEYS,
+    default_wind_params,
+)
 from chandra_phase_analysis import (
     REF_EPOCH,
     ORBITAL_PERIOD,
@@ -178,10 +180,51 @@ def _grid_priors_from_reparam(reparam_priors: Dict) -> Dict:
         'i0': reparam_priors['i0'].copy(),
     }
 
-# Wind model descriptions
+# Wind model descriptions (matches xrb_lightcurve.WIND_MODEL_IDS keys,
+# excluding broken_pl which is a special case of smooth_pl).
 WIND_MODELS = {
-    'av': 'Accelerated Velocity Wind',
-    'cv': 'Constant Velocity Wind'
+    'smooth_pl':   'Smoothly Broken Power-Law Wind',
+    'beta_law':    'CAK Beta-Law (Velocity-Based) Wind',
+    'confinement': 'Inner-Confinement / Compression Wind',
+}
+
+# Per-model wind-shape parameters that become free MCMC dimensions when the
+# user passes --fit-wind-shape. The remaining keys in WIND_SHAPE_FIXED are
+# always passed to simulate_lightcurve as constants. R_star (for beta_law /
+# confinement) is *tied* to the geometry parameter R and is therefore not
+# listed here; it is filled in by _to_wind_params().
+WIND_SHAPE_FIT = {
+    'smooth_pl':   ['Rb', 'p'],
+    'beta_law':    ['beta'],
+    'confinement': ['fconf', 'ell'],
+}
+
+# Fixed shape parameters that are passed inside wind_params but are NOT
+# fitted (poor identifiability or strong degeneracy).
+WIND_SHAPE_FIXED = {
+    'smooth_pl':   {'Delta': 2.0},
+    'beta_law':    {'H': 1.0},
+    'confinement': {},
+}
+
+# Pretty labels for corner plots / diagnostics.
+WIND_SHAPE_LABELS = {
+    'Rb':    r'$R_b$ (R$_\odot$)',
+    'p':     r'$p$',
+    'beta':  r'$\beta$',
+    'fconf': r'$f_\mathrm{conf}$',
+    'ell':   r'$\ell$ (R$_\odot$)',
+}
+
+# Default priors for wind-shape parameters (mean, std, min, max).
+# Box bounds are kept generous; the Gaussian acts as a weak preference toward
+# physically motivated values. Override with --prior-<name> on the CLI.
+WIND_SHAPE_PRIORS = {
+    'Rb':    {'mean': 5.0, 'std': 3.0,  'min': 0.5, 'max': 30.0},
+    'p':     {'mean': 4.0, 'std': 1.0,  'min': 2.0, 'max': 8.0},
+    'beta':  {'mean': 0.8, 'std': 0.3,  'min': 0.3, 'max': 2.0},
+    'fconf': {'mean': 5.0, 'std': 5.0,  'min': 0.0, 'max': 50.0},
+    'ell':   {'mean': 1.0, 'std': 0.7,  'min': 0.1, 'max': 10.0},
 }
 
 # Likelihood configuration
@@ -199,11 +242,22 @@ SAMPLER_TYPES = {
 }
 
 
-def get_param_config(likelihood: str = 'chi2', reparam: bool = False):
-    """Return (param_names, param_labels) for the given likelihood type.
+def get_param_config(
+    likelihood: str = 'chi2',
+    reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+):
+    """Return (param_names, param_labels) for the active MCMC vector.
 
-    When *reparam* is True the first two geometric parameters are
-    ``(a, q)`` instead of ``(d1, d2)``.
+    Layout:
+        geometry (5) -> [log_f if jitter] -> wind-shape params (if requested)
+
+    When *reparam* is True the first two geometric parameters are ``(a, q)``
+    instead of ``(d1, d2)``.
+
+    When *fit_wind_shape* is True the model-specific shape params from
+    ``WIND_SHAPE_FIT[wind_model]`` are appended (in their listed order).
     """
     if reparam:
         names = list(REPARAM_PARAM_NAMES)
@@ -214,7 +268,77 @@ def get_param_config(likelihood: str = 'chi2', reparam: bool = False):
     if likelihood == 'jitter':
         names.append('log_f')
         labels.append(r'$\ln\,f$')
+    if fit_wind_shape:
+        if wind_model not in WIND_SHAPE_FIT:
+            raise ValueError(
+                f"--fit-wind-shape is not supported for wind_model "
+                f"'{wind_model}'. Choose one of: {list(WIND_SHAPE_FIT)}"
+            )
+        for name in WIND_SHAPE_FIT[wind_model]:
+            names.append(name)
+            labels.append(WIND_SHAPE_LABELS.get(name, name))
     return names, labels
+
+
+def get_active_priors(
+    base_priors: Dict,
+    wind_model: str,
+    fit_wind_shape: bool,
+    likelihood: str,
+    shape_prior_overrides: Dict[str, Dict] = None,
+) -> Dict:
+    """Build the merged prior dict covering geometry + jitter + shape params.
+
+    *base_priors* is the geometry priors dict (DEFAULT_PRIORS or REPARAM_PRIORS,
+    possibly modified by CLI overrides). *shape_prior_overrides* is an
+    optional dict of {shape_name: {mean, std, min, max}} to override the
+    defaults in WIND_SHAPE_PRIORS.
+    """
+    out = dict(base_priors)
+    if likelihood == 'jitter':
+        out.setdefault('log_f', dict(JITTER_PRIOR))
+    if fit_wind_shape:
+        for name in WIND_SHAPE_FIT.get(wind_model, []):
+            prior = dict(WIND_SHAPE_PRIORS[name])
+            if shape_prior_overrides and name in shape_prior_overrides:
+                prior.update(shape_prior_overrides[name])
+            out[name] = prior
+    return out
+
+
+def _to_wind_params(
+    theta: np.ndarray,
+    active_names: List[str],
+    wind_model: str,
+    R_value: float,
+    fit_wind_shape: bool = False,
+) -> Dict[str, float]:
+    """Build the wind_params dict for simulate_lightcurve from a sample.
+
+    Pulls fittable shape values from *theta* using their position in
+    *active_names*; fills in fixed shape values from WIND_SHAPE_FIXED; and
+    ties R_star to the geometry R for the beta_law / confinement models.
+    """
+    wp: Dict[str, float] = dict(WIND_SHAPE_FIXED.get(wind_model, {}))
+
+    if fit_wind_shape:
+        for name in WIND_SHAPE_FIT.get(wind_model, []):
+            try:
+                idx = active_names.index(name)
+            except ValueError:
+                # Shape param expected but not in chain; fall back to default
+                wp[name] = float(WIND_SHAPE_PRIORS[name]['mean'])
+                continue
+            wp[name] = float(theta[idx])
+    else:
+        # Use prior means as the constant value of the would-be free params
+        for name in WIND_SHAPE_FIT.get(wind_model, []):
+            wp[name] = float(WIND_SHAPE_PRIORS[name]['mean'])
+
+    if wind_model in ('beta_law', 'confinement'):
+        wp['R_star'] = float(R_value)
+
+    return wp
 
 
 # =============================================================================
@@ -366,15 +490,24 @@ def phase_bin_data(
 # =============================================================================
 
 def _compute_single_model(args):
-    """Worker function to compute a single model (for parallel processing).
-    
-    Returns both av and cv flux arrays.
+    """Worker function to compute a single grid model (for parallel processing).
+
+    Returns the band-flux array sorted by phase, or None on failure.
     """
-    d1, d2, r, R, i0, flux_csv_path, band, dth, sim_params = args
-    
-    flux_column_av = f"nfl_{band}_av"
-    flux_column_cv = f"nfl_{band}_cv"
-    
+    (
+        d1, d2, r, R, i0,
+        flux_csv_path, band, dth,
+        sim_params, wind_model, wind_params_template,
+    ) = args
+
+    flux_column = f"nfl_{band}"
+
+    # For beta_law/confinement R_star is tied to R (varies in the grid). For
+    # smooth_pl/broken_pl the template is geometry-independent.
+    wind_params = dict(wind_params_template)
+    if wind_model in ('beta_law', 'confinement'):
+        wind_params['R_star'] = float(R)
+
     try:
         results = simulate_lightcurve(
             r=r, R=R, d1=d1, d2=d2,
@@ -382,58 +515,54 @@ def _compute_single_model(args):
             i0=i0,
             dth=dth,
             d2h=sim_params.get('d2h', 6.0),
-            dz=sim_params.get('dz', 0.1),
+            dz=sim_params.get('dz', 0.5),
             flux_method="interpolate",
             flux_csv_path=flux_csv_path,
             lam=sim_params.get('lam', 0.589537),
-            lam2=sim_params.get('lam2', 0.589537),
-            verbose=False
+            wind_model=wind_model,
+            wind_params=wind_params,
+            verbose=False,
         )
-        
-        # Check columns exist
-        if flux_column_av not in results.columns or flux_column_cv not in results.columns:
-            return None, None
-        
-        # Return flux values at standard phases
+
+        if flux_column not in results.columns:
+            return None
+
         model_phase = results['phase'].values
-        flux_av = results[flux_column_av].values
-        flux_cv = results[flux_column_cv].values
-        
-        # Sort by phase
+        flux = results[flux_column].values
         sort_idx = np.argsort(model_phase)
-        return flux_av[sort_idx], flux_cv[sort_idx]
-        
+        return flux[sort_idx]
+
     except Exception:
-        return None, None
+        return None
 
 
 class PrecomputedModelGrid:
     """
     Pre-computed grid of model light curves for fast MCMC evaluation.
-    
-    This class pre-computes light curves on a coarse parameter grid and uses
-    N-dimensional interpolation for fast evaluation during MCMC sampling.
-    
-    Supports both accelerated velocity (av) and constant velocity (cv) wind models.
-    The grid can be saved/loaded to avoid recomputation.
+
+    The grid is built over the 5 geometry parameters (d1, d2, r, R, i0) with
+    the wind shape parameters held FIXED (defaults from default_wind_params,
+    or user-supplied via *wind_params_template*). For runs that fit wind
+    shape parameters, use DirectLightCurveModel instead.
     """
-    
+
     def __init__(
         self,
         band: str,
         flux_csv_path: str,
-        wind_model: str = 'av',
+        wind_model: str = 'smooth_pl',
         priors: Dict = DEFAULT_PRIORS,
         grid_points: Dict[str, int] = None,
         dth: float = 5.0,
         n_workers: int = None,
         verbose: bool = True,
         load_path: str = None,
-        sim_params: Dict = None
+        sim_params: Dict = None,
+        wind_params_template: Dict[str, float] = None,
     ):
         """
         Initialize and pre-compute the model grid (or load from file).
-        
+
         Parameters
         ----------
         band : str
@@ -441,7 +570,7 @@ class PrecomputedModelGrid:
         flux_csv_path : str
             Path to flux vs nH CSV file
         wind_model : str
-            Wind model to use: 'av' (accelerated) or 'cv' (constant velocity)
+            Wind model name (one of WIND_MODELS keys).
         priors : dict
             Prior specifications (used to set grid bounds)
         grid_points : dict, optional
@@ -455,12 +584,14 @@ class PrecomputedModelGrid:
         load_path : str, optional
             Path to load pre-computed grid from. If provided, skips computation.
         sim_params : dict, optional
-            Additional simulation parameters passed to simulate_lightcurve:
-            - gma0: Starting phase angle in degrees (default -90.0)
-            - d2h: Angular cell size for polar grid (default 6.0)
-            - dz: Step size along line of sight (default 0.1)
-            - lam: Scaling parameter for nH (default 0.589537)
-            - lam2: Scaling parameter for constant velocity wind (default 0.589537)
+            Additional simulation parameters passed to simulate_lightcurve
+            (lam, gma0, d2h, dz).
+        wind_params_template : dict, optional
+            Fixed wind-shape parameters used for every grid point. R_star
+            (for beta_law / confinement) is omitted here because it varies
+            with the geometry parameter R; it is filled in per-point by the
+            worker. If None, uses default_wind_params(wind_model, R=2.0)
+            with R_star stripped.
         """
         self.band = band.lower()
         self.flux_csv_path = flux_csv_path
@@ -469,26 +600,34 @@ class PrecomputedModelGrid:
         self.dth = dth
         self.verbose = verbose
         self.sim_params = sim_params or {}
-        
-        if self.wind_model not in ['av', 'cv']:
-            raise ValueError(f"wind_model must be 'av' or 'cv', got '{wind_model}'")
-        
+
+        if self.wind_model not in WIND_MODELS:
+            raise ValueError(
+                f"wind_model must be one of {list(WIND_MODELS)}, "
+                f"got '{wind_model}'"
+            )
+
+        # Build the wind_params template if none provided.
+        if wind_params_template is None:
+            wp = default_wind_params(self.wind_model, R=2.0)
+            # R_star is filled in per grid point.
+            wp.pop('R_star', None)
+            wind_params_template = wp
+        self.wind_params_template = dict(wind_params_template)
+
         # Default grid resolution
         if grid_points is None:
             grid_points = {'d1': 8, 'd2': 8, 'r': 5, 'R': 8, 'i0': 10}
-        
+
         self.grid_points = grid_points
         self.n_workers = n_workers if n_workers else max(1, cpu_count() - 1)
-        
+
         if load_path and os.path.exists(load_path):
-            # Load pre-computed grid
             self._load_grid(load_path)
         else:
-            # Create parameter grids and pre-compute
             self._create_grids()
             self._precompute_models()
-        
-        # Setup interpolators for the selected wind model
+
         self._setup_interpolators()
     
     def _create_grids(self):
@@ -524,34 +663,32 @@ class PrecomputedModelGrid:
         if self.verbose:
             print(f"\nPre-computing model grid using {self.n_workers} workers...")
             start_time = time.time()
-        
-        # Generate all parameter combinations
+
         d1_grid = self.param_grids['d1']
         d2_grid = self.param_grids['d2']
         r_grid = self.param_grids['r']
         R_grid = self.param_grids['R']
         i0_grid = self.param_grids['i0']
-        
-        # Create list of all parameter combinations
+
         param_combos = []
         for i_d1, d1 in enumerate(d1_grid):
             for i_d2, d2 in enumerate(d2_grid):
                 for i_r, r in enumerate(r_grid):
                     for i_R, R in enumerate(R_grid):
                         for i_i0, i0 in enumerate(i0_grid):
-                            # Skip unphysical combinations
                             if r >= R:
                                 continue
                             param_combos.append((
                                 d1, d2, r, R, i0,
                                 self.flux_csv_path, self.band, self.dth,
-                                self.sim_params
+                                self.sim_params,
+                                self.wind_model,
+                                self.wind_params_template,
                             ))
-        
+
         if self.verbose:
             print(f"Computing {len(param_combos)} valid parameter combinations...")
-        
-        # Compute models in parallel with progress bar
+
         if self.n_workers > 1:
             with Pool(self.n_workers) as pool:
                 if HAS_TQDM:
@@ -564,18 +701,17 @@ class PrecomputedModelGrid:
                     results = pool.map(_compute_single_model, param_combos)
         else:
             if HAS_TQDM:
-                results = [_compute_single_model(args) for args in tqdm(param_combos, desc="Building model grid")]
+                results = [_compute_single_model(args)
+                           for args in tqdm(param_combos, desc="Building model grid")]
             else:
                 results = [_compute_single_model(args) for args in param_combos]
-        
-        # Build the N-dimensional grid array
+
         shape = (
             len(d1_grid), len(d2_grid), len(r_grid), len(R_grid), len(i0_grid),
             len(self.phase_grid)
         )
-        self.flux_grid_av = np.full(shape, np.nan)
-        self.flux_grid_cv = np.full(shape, np.nan)
-        
+        self.flux_grid = np.full(shape, np.nan)
+
         idx = 0
         for i_d1 in range(len(d1_grid)):
             for i_d2 in range(len(d2_grid)):
@@ -584,27 +720,19 @@ class PrecomputedModelGrid:
                         for i_i0 in range(len(i0_grid)):
                             if r_grid[i_r] >= R_grid[i_R]:
                                 continue
-                            flux_av, flux_cv = results[idx]
-                            if flux_av is not None:
-                                self.flux_grid_av[i_d1, i_d2, i_r, i_R, i_i0, :] = flux_av
-                            if flux_cv is not None:
-                                self.flux_grid_cv[i_d1, i_d2, i_r, i_R, i_i0, :] = flux_cv
+                            flux = results[idx]
+                            if flux is not None:
+                                self.flux_grid[i_d1, i_d2, i_r, i_R, i_i0, :] = flux
                             idx += 1
-        
+
         if self.verbose:
             elapsed = time.time() - start_time
             print(f"Grid pre-computation completed in {elapsed:.1f} seconds")
-            valid_av = np.sum(~np.isnan(self.flux_grid_av)) / self.flux_grid_av.size
-            valid_cv = np.sum(~np.isnan(self.flux_grid_cv)) / self.flux_grid_cv.size
-            print(f"Valid grid coverage: AV={valid_av*100:.1f}%, CV={valid_cv*100:.1f}%")
-    
+            valid = np.sum(~np.isnan(self.flux_grid)) / self.flux_grid.size
+            print(f"Valid grid coverage: {valid*100:.1f}%")
+
     def _setup_interpolators(self):
         """Setup a single 6D interpolator (params + phase) for vectorized evaluation."""
-        if self.wind_model == 'av':
-            self.flux_grid = self.flux_grid_av
-        else:
-            self.flux_grid = self.flux_grid_cv
-
         flux_grid_clean = self.flux_grid.copy()
         if np.any(np.isnan(flux_grid_clean)):
             flux_grid_clean = np.where(
@@ -628,112 +756,96 @@ class PrecomputedModelGrid:
             fill_value=np.nan,
         )
     
-    def switch_wind_model(self, wind_model: str):
-        """
-        Switch to a different wind model without recomputing the grid.
-        
-        Parameters
-        ----------
-        wind_model : str
-            New wind model: 'av' or 'cv'
-        """
-        if wind_model.lower() not in ['av', 'cv']:
-            raise ValueError(f"wind_model must be 'av' or 'cv', got '{wind_model}'")
-        
-        self.wind_model = wind_model.lower()
-        self._setup_interpolators()
-        
-        if self.verbose:
-            print(f"Switched to {WIND_MODELS[self.wind_model]} ({self.wind_model})")
-    
     def save(self, filepath: str):
         """
         Save pre-computed grid to file for later reuse.
-        
+
         Parameters
         ----------
         filepath : str
             Path to save the grid (.npz format)
         """
-        # Create directory if needed
         os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
-        
-        # Save sim_params as individual arrays (npz doesn't support dicts directly)
+
         sim_param_keys = list(self.sim_params.keys()) if self.sim_params else []
         sim_param_vals = [self.sim_params[k] for k in sim_param_keys] if self.sim_params else []
-        
-        # Save using numpy's compressed format
+
+        wp_keys = list(self.wind_params_template.keys())
+        wp_vals = [float(self.wind_params_template[k]) for k in wp_keys]
+
         np.savez_compressed(
             filepath,
-            # Grids
-            flux_grid_av=self.flux_grid_av,
-            flux_grid_cv=self.flux_grid_cv,
+            flux_grid=self.flux_grid,
             phase_grid=self.phase_grid,
-            # Parameter grids
             d1_grid=self.param_grids['d1'],
             d2_grid=self.param_grids['d2'],
             r_grid=self.param_grids['r'],
             R_grid=self.param_grids['R'],
             i0_grid=self.param_grids['i0'],
-            # Metadata
             band=self.band,
+            wind_model=self.wind_model,
             dth=self.dth,
             grid_points=np.array([self.grid_points[p] for p in PARAM_NAMES]),
-            # Simulation parameters
             sim_param_keys=np.array(sim_param_keys, dtype=str),
-            sim_param_vals=np.array(sim_param_vals, dtype=float)
+            sim_param_vals=np.array(sim_param_vals, dtype=float),
+            wind_param_keys=np.array(wp_keys, dtype=str),
+            wind_param_vals=np.array(wp_vals, dtype=float),
         )
-        
+
         print(f"Grid saved to: {filepath}")
         print(f"  File size: {os.path.getsize(filepath) / 1024 / 1024:.1f} MB")
         if self.sim_params:
             print(f"  Simulation params: {self.sim_params}")
-    
+        print(f"  Wind model: {self.wind_model} | wind_params: {self.wind_params_template}")
+
     def _load_grid(self, filepath: str):
-        """
-        Load pre-computed grid from file.
-        
-        Parameters
-        ----------
-        filepath : str
-            Path to load the grid from (.npz format)
-        """
+        """Load pre-computed grid from file."""
         if self.verbose:
             print(f"\nLoading pre-computed grid from: {filepath}")
-        
+
         data = np.load(filepath, allow_pickle=True)
-        
-        # Load grids
-        self.flux_grid_av = data['flux_grid_av']
-        self.flux_grid_cv = data['flux_grid_cv']
+
+        self.flux_grid = data['flux_grid']
         self.phase_grid = data['phase_grid']
-        
-        # Load parameter grids
+
         self.param_grids = {
             'd1': data['d1_grid'],
             'd2': data['d2_grid'],
-            'r': data['r_grid'],
-            'R': data['R_grid'],
-            'i0': data['i0_grid']
+            'r':  data['r_grid'],
+            'R':  data['R_grid'],
+            'i0': data['i0_grid'],
         }
-        
-        # Load metadata
+
         loaded_band = str(data['band'])
         loaded_dth = float(data['dth'])
-        
-        # Load simulation parameters if present
+        loaded_wind_model = (
+            str(data['wind_model']) if 'wind_model' in data else self.wind_model
+        )
+
         loaded_sim_params = {}
         if 'sim_param_keys' in data and 'sim_param_vals' in data:
             keys = data['sim_param_keys']
             vals = data['sim_param_vals']
             if len(keys) > 0:
                 loaded_sim_params = dict(zip(keys, vals))
-        
-        # Verify band matches
+
+        loaded_wp = {}
+        if 'wind_param_keys' in data and 'wind_param_vals' in data:
+            wpk = data['wind_param_keys']
+            wpv = data['wind_param_vals']
+            if len(wpk) > 0:
+                loaded_wp = {str(k): float(v) for k, v in zip(wpk, wpv)}
+
         if loaded_band != self.band:
-            warnings.warn(f"Loaded grid band '{loaded_band}' differs from requested '{self.band}'")
-        
-        # Check if sim_params match (warn if different)
+            warnings.warn(
+                f"Loaded grid band '{loaded_band}' differs from requested '{self.band}'"
+            )
+        if loaded_wind_model != self.wind_model:
+            warnings.warn(
+                f"Loaded grid wind_model '{loaded_wind_model}' differs from requested "
+                f"'{self.wind_model}'. Using loaded value."
+            )
+
         if self.sim_params and loaded_sim_params:
             for key in self.sim_params:
                 if key in loaded_sim_params and self.sim_params[key] != loaded_sim_params[key]:
@@ -741,18 +853,22 @@ class PrecomputedModelGrid:
                         f"Loaded grid has {key}={loaded_sim_params[key]}, "
                         f"but requested {key}={self.sim_params[key]}. Using loaded value."
                     )
-        
+
         self.dth = loaded_dth
         self.sim_params = loaded_sim_params
-        
+        self.wind_model = loaded_wind_model
+        if loaded_wp:
+            self.wind_params_template = loaded_wp
+
         if self.verbose:
-            print(f"  Band: {loaded_band}, dth: {loaded_dth}")
-            print(f"  Grid shape: {self.flux_grid_av.shape}")
-            valid_av = np.sum(~np.isnan(self.flux_grid_av)) / self.flux_grid_av.size
-            valid_cv = np.sum(~np.isnan(self.flux_grid_cv)) / self.flux_grid_cv.size
-            print(f"  Valid coverage: AV={valid_av*100:.1f}%, CV={valid_cv*100:.1f}%")
+            print(f"  Band: {loaded_band}, dth: {loaded_dth}, wind_model: {loaded_wind_model}")
+            print(f"  Grid shape: {self.flux_grid.shape}")
+            valid = np.sum(~np.isnan(self.flux_grid)) / self.flux_grid.size
+            print(f"  Valid coverage: {valid*100:.1f}%")
             if loaded_sim_params:
                 print(f"  Simulation params: {loaded_sim_params}")
+            if loaded_wp:
+                print(f"  Wind params (template): {loaded_wp}")
     
     def evaluate(
         self,
@@ -761,25 +877,16 @@ class PrecomputedModelGrid:
         r: float,
         R: float,
         i0: float,
-        obs_phases: np.ndarray
+        obs_phases: np.ndarray,
+        wind_params: Dict[str, float] = None,
     ) -> np.ndarray:
-        """
-        Evaluate the model at given parameters using grid interpolation.
-        
-        Uses a single vectorized 6D interpolation call (params + phase)
-        instead of looping over per-phase interpolators.
-        
-        Parameters
-        ----------
-        d1, d2, r, R, i0 : float
-            Model parameters
-        obs_phases : np.ndarray
-            Orbital phases at which to evaluate model (0-1)
-            
-        Returns
-        -------
-        np.ndarray
-            Interpolated flux values at requested phases
+        """Evaluate the model at given parameters using grid interpolation.
+
+        ``wind_params`` is accepted for API compatibility with
+        :class:`DirectLightCurveModel`, but is *ignored*: the precomputed
+        grid is built with the wind shape held fixed at construction time.
+        Callers that fit wind shape parameters should use
+        :class:`DirectLightCurveModel` instead.
         """
         n_phase = len(self.phase_grid)
         points = np.empty((n_phase, 6))
@@ -798,7 +905,7 @@ class PrecomputedModelGrid:
         phase_extended = np.concatenate([
             self.phase_grid - 1,
             self.phase_grid,
-            self.phase_grid + 1
+            self.phase_grid + 1,
         ])
         flux_extended = np.concatenate([grid_flux, grid_flux, grid_flux])
 
@@ -807,7 +914,8 @@ class PrecomputedModelGrid:
     def evaluate_direct(
         self,
         d1: float, d2: float, r: float, R: float, i0: float,
-        obs_phases: np.ndarray
+        obs_phases: np.ndarray,
+        wind_params: Dict[str, float] = None,
     ) -> np.ndarray:
         """Evaluate the model by running ``simulate_lightcurve`` directly.
 
@@ -815,7 +923,15 @@ class PrecomputedModelGrid:
         produces the exact model curve.  Use this for final best-fit
         evaluation and chi-square reporting.
         """
-        flux_column = f"nfl_{self.band}_{self.wind_model}"
+        flux_column = f"nfl_{self.band}"
+
+        if wind_params is None:
+            wp = dict(self.wind_params_template)
+            if self.wind_model in ('beta_law', 'confinement'):
+                wp['R_star'] = float(R)
+        else:
+            wp = dict(wind_params)
+
         try:
             results = simulate_lightcurve(
                 r=r, R=R, d1=d1, d2=d2,
@@ -823,11 +939,12 @@ class PrecomputedModelGrid:
                 i0=i0,
                 dth=self.dth,
                 d2h=self.sim_params.get('d2h', 6.0),
-                dz=self.sim_params.get('dz', 0.1),
+                dz=self.sim_params.get('dz', 0.5),
                 flux_method="interpolate",
                 flux_csv_path=self.flux_csv_path,
                 lam=self.sim_params.get('lam', 0.589537),
-                lam2=self.sim_params.get('lam2', 0.589537),
+                wind_model=self.wind_model,
+                wind_params=wp,
                 verbose=False,
             )
         except Exception as e:
@@ -858,30 +975,44 @@ class PrecomputedModelGrid:
 class DirectLightCurveModel:
     """
     Direct light curve model evaluation (calls simulate_lightcurve each time).
-    
-    WARNING: This is SLOW! Use PrecomputedModelGrid for MCMC.
+
+    With the Gauss-Legendre mega-kernel in xrb_lightcurve.py a single LC is
+    ~60 ms, so this class is now suitable for MCMC. It is also the only path
+    that supports per-step varying wind shape parameters (--fit-wind-shape).
     """
-    
+
     def __init__(
         self,
         band: str,
         flux_csv_path: str,
-        wind_model: str = 'av',
+        wind_model: str = 'smooth_pl',
         dth: float = 5.0,
         flux_method: str = "interpolate",
-        sim_params: Dict = None
+        sim_params: Dict = None,
+        wind_params_default: Dict[str, float] = None,
     ):
         self.band = band.lower()
         self.flux_csv_path = flux_csv_path
         self.wind_model = wind_model.lower()
         self.dth = dth
         self.flux_method = flux_method
-        self.flux_column = f"nfl_{self.band}_{self.wind_model}"
+        self.flux_column = f"nfl_{self.band}"
         self.sim_params = sim_params or {}
-        
+
+        if self.wind_model not in WIND_MODELS:
+            raise ValueError(
+                f"wind_model must be one of {list(WIND_MODELS)}, got '{wind_model}'"
+            )
+
+        if wind_params_default is None:
+            wp = default_wind_params(self.wind_model, R=2.0)
+            wp.pop('R_star', None)
+            wind_params_default = wp
+        self.wind_params_default = dict(wind_params_default)
+
         if not os.path.exists(flux_csv_path):
             raise FileNotFoundError(f"Flux CSV not found: {flux_csv_path}")
-    
+
     def evaluate(
         self,
         d1: float,
@@ -889,9 +1020,22 @@ class DirectLightCurveModel:
         r: float,
         R: float,
         i0: float,
-        obs_phases: np.ndarray
+        obs_phases: np.ndarray,
+        wind_params: Dict[str, float] = None,
     ) -> np.ndarray:
-        """Evaluate model (slow - calls full simulation)."""
+        """Evaluate model by running simulate_lightcurve.
+
+        ``wind_params`` overrides the default fixed shape parameters when
+        provided. R_star is auto-filled from R for beta_law / confinement
+        if not present.
+        """
+        if wind_params is None:
+            wp = dict(self.wind_params_default)
+        else:
+            wp = dict(wind_params)
+        if self.wind_model in ('beta_law', 'confinement') and 'R_star' not in wp:
+            wp['R_star'] = float(R)
+
         try:
             results = simulate_lightcurve(
                 r=r, R=R, d1=d1, d2=d2,
@@ -899,38 +1043,39 @@ class DirectLightCurveModel:
                 i0=i0,
                 dth=self.dth,
                 d2h=self.sim_params.get('d2h', 6.0),
-                dz=self.sim_params.get('dz', 0.1),
+                dz=self.sim_params.get('dz', 0.5),
                 flux_method=self.flux_method,
                 flux_csv_path=self.flux_csv_path,
                 lam=self.sim_params.get('lam', 0.589537),
-                lam2=self.sim_params.get('lam2', 0.589537),
-                verbose=False
+                wind_model=self.wind_model,
+                wind_params=wp,
+                verbose=False,
             )
         except Exception as e:
             warnings.warn(f"Model evaluation failed: {e}")
             return np.full_like(obs_phases, np.nan)
-        
+
         if self.flux_column not in results.columns:
             return np.full_like(obs_phases, np.nan)
-        
+
         model_phase = results['phase'].values
         model_flux = results[self.flux_column].values
-        
+
         sort_idx = np.argsort(model_phase)
         model_phase_sorted = model_phase[sort_idx]
         model_flux_sorted = model_flux[sort_idx]
-        
+
         phase_extended = np.concatenate([
             model_phase_sorted - 1,
             model_phase_sorted,
-            model_phase_sorted + 1
+            model_phase_sorted + 1,
         ])
         flux_extended = np.concatenate([
             model_flux_sorted,
             model_flux_sorted,
-            model_flux_sorted
+            model_flux_sorted,
         ])
-        
+
         return np.interp(obs_phases, phase_extended, flux_extended)
 
 
@@ -946,11 +1091,45 @@ def _to_physical(theta, reparam: bool = False):
     return theta[0], theta[1], theta[2], theta[3], theta[4]
 
 
-def _evaluate_model(theta, model, obs_phase, reparam: bool = False):
-    """Evaluate the physical model. Returns model_flux or None on failure."""
+def _evaluate_model(
+    theta,
+    model,
+    obs_phase,
+    reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    active_names: List[str] = None,
+):
+    """Evaluate the physical model. Returns model_flux or None on failure.
+
+    When *fit_wind_shape* is True, the wind-shape parameters are pulled out
+    of *theta* (using their position in *active_names*) and passed inside
+    *wind_params* to ``model.evaluate``. When False, the model uses its
+    constructor-time defaults.
+    """
     d1, d2, r, R, i0 = _to_physical(theta, reparam=reparam)
+
+    # Build wind_params only if we need shape-varying behavior. Skipping the
+    # dict construction in the geometry-only fast path avoids ~1 us / call.
+    if fit_wind_shape and active_names is not None:
+        wind_params = _to_wind_params(
+            theta, active_names, wind_model, R_value=R,
+            fit_wind_shape=True,
+        )
+    else:
+        wind_params = None
+
     try:
-        model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
+        model_flux = model.evaluate(
+            d1, d2, r, R, i0, obs_phase, wind_params=wind_params,
+        )
+    except TypeError:
+        # Backward compat with any model.evaluate() that doesn't accept
+        # wind_params yet.
+        try:
+            model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
+        except Exception:
+            return None
     except Exception:
         return None
     if np.any(~np.isfinite(model_flux)):
@@ -965,9 +1144,16 @@ def log_likelihood_chi2(
     obs_flux: np.ndarray,
     obs_err: np.ndarray,
     reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    active_names: List[str] = None,
 ) -> float:
     """Standard Gaussian log-likelihood (chi-squared)."""
-    model_flux = _evaluate_model(theta, model, obs_phase, reparam=reparam)
+    model_flux = _evaluate_model(
+        theta, model, obs_phase, reparam=reparam,
+        wind_model=wind_model, fit_wind_shape=fit_wind_shape,
+        active_names=active_names,
+    )
     if model_flux is None:
         return -np.inf
     chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
@@ -981,19 +1167,28 @@ def log_likelihood_jitter(
     obs_flux: np.ndarray,
     obs_err: np.ndarray,
     reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    active_names: List[str] = None,
 ) -> float:
     """Gaussian log-likelihood with a free fractional systematic error term.
 
-    theta must have 6 elements: [d1, d2, r, R, i0, log_f]
-    (or [a, q, r, R, i0, log_f] when *reparam* is True).
+    The position of the ``log_f`` parameter is looked up from *active_names*.
     The effective variance per point is  sigma_obs^2 + (f * model)^2
-    where f = exp(log_f).  The log(sigma2) normalisation is included
-    so that inflating errors is properly penalised.
+    where f = exp(log_f).
     """
-    model_flux = _evaluate_model(theta, model, obs_phase, reparam=reparam)
+    model_flux = _evaluate_model(
+        theta, model, obs_phase, reparam=reparam,
+        wind_model=wind_model, fit_wind_shape=fit_wind_shape,
+        active_names=active_names,
+    )
     if model_flux is None:
         return -np.inf
-    f = np.exp(theta[5])
+    if active_names is not None and 'log_f' in active_names:
+        idx_logf = active_names.index('log_f')
+    else:
+        idx_logf = 5  # legacy default
+    f = np.exp(theta[idx_logf])
     sigma2 = obs_err ** 2 + (f * model_flux) ** 2
     return -0.5 * np.sum((obs_flux - model_flux) ** 2 / sigma2 + np.log(sigma2))
 
@@ -1006,12 +1201,19 @@ def log_likelihood_studentt(
     obs_err: np.ndarray,
     nu: float = 5.0,
     reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    active_names: List[str] = None,
 ) -> float:
     """Student-t log-likelihood (heavier tails than Gaussian).
 
     ``nu`` controls tail weight; nu -> inf recovers the Gaussian.
     """
-    model_flux = _evaluate_model(theta, model, obs_phase, reparam=reparam)
+    model_flux = _evaluate_model(
+        theta, model, obs_phase, reparam=reparam,
+        wind_model=wind_model, fit_wind_shape=fit_wind_shape,
+        active_names=active_names,
+    )
     if model_flux is None:
         return -np.inf
     resid = (obs_flux - model_flux) / obs_err
@@ -1038,39 +1240,61 @@ def log_prior(
     priors: Dict = DEFAULT_PRIORS,
     likelihood: str = 'chi2',
     reparam: bool = False,
+    active_names: List[str] = None,
 ) -> float:
-    """Log prior probability for physical + nuisance parameters.
+    """Log prior probability for geometry + jitter + wind-shape parameters.
+
+    *priors* must contain entries for every name in *active_names* (the
+    helper :func:`get_active_priors` builds such a merged dict). When
+    *active_names* is None this falls back to legacy geometry-only
+    behavior for backward compatibility.
 
     When *reparam* is True, theta[:5] = (a, q, r, R, i0) and *priors*
-    must contain keys ``'a'`` and ``'q'`` instead of ``'d1'`` and ``'d2'``.
-    A Jacobian correction ``log(a)`` is added to account for the change
-    of variables ``d(d1) d(d2) = a · d(a) d(q)``.
+    must contain keys ``'a'`` and ``'q'``. A Jacobian correction
+    ``log(a)`` is added to account for the change of variables
+    ``d(d1) d(d2) = a · d(a) d(q)``.
     """
     pnames = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
 
-    for i, param in enumerate(pnames):
-        if not (priors[param]['min'] < theta[i] < priors[param]['max']):
+    if active_names is None:
+        active_names = list(pnames)
+        if likelihood == 'jitter':
+            active_names.append('log_f')
+
+    # Box check on every active parameter (geometry + jitter + shape).
+    for name, value in zip(active_names, theta):
+        prior = priors.get(name)
+        if prior is None:
+            # No prior provided for this dim; treat as improper / skip box.
+            continue
+        if not (prior['min'] < value < prior['max']):
             return -np.inf
 
-    # Physical constraint r < R (indices 2, 3 regardless of reparam)
+    # Physical constraint r < R (indices 2, 3 regardless of reparam).
     if theta[2] >= theta[3]:
         return -np.inf
 
     log_p = 0.0
-    for param, value in zip(pnames, theta[:5]):
-        mean = priors[param]['mean']
-        std = priors[param]['std']
-        log_p += -0.5 * ((value - mean) / std) ** 2
 
-    # Jacobian |d(d1,d2)/d(a,q)| = a
+    # Gaussian penalty on geometry parameters.
+    for i, name in enumerate(pnames):
+        prior = priors.get(name)
+        if prior is None:
+            continue
+        log_p += -0.5 * ((theta[i] - prior['mean']) / prior['std']) ** 2
+
+    # Jacobian |d(d1,d2)/d(a,q)| = a.
     if reparam:
         log_p += np.log(theta[0])
 
-    if likelihood == 'jitter':
-        log_f = theta[5]
-        if not (JITTER_PRIOR['min'] < log_f < JITTER_PRIOR['max']):
-            return -np.inf
-        log_p += -0.5 * ((log_f - JITTER_PRIOR['mean']) / JITTER_PRIOR['std']) ** 2
+    # Gaussian penalty on jitter and shape parameters (anything beyond geometry).
+    for i, name in enumerate(active_names):
+        if i < len(pnames):
+            continue
+        prior = priors.get(name)
+        if prior is None:
+            continue
+        log_p += -0.5 * ((theta[i] - prior['mean']) / prior['std']) ** 2
 
     return log_p
 
@@ -1085,21 +1309,37 @@ def log_probability(
     likelihood: str = 'chi2',
     studentt_nu: float = 5.0,
     reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    active_names: List[str] = None,
 ) -> float:
     """Log posterior = log prior + log likelihood."""
-    lp = log_prior(theta, priors, likelihood=likelihood, reparam=reparam)
+    lp = log_prior(
+        theta, priors, likelihood=likelihood, reparam=reparam,
+        active_names=active_names,
+    )
     if not np.isfinite(lp):
         return -np.inf
 
+    common_kwargs = dict(
+        reparam=reparam,
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
+        active_names=active_names,
+    )
     if likelihood == 'jitter':
-        ll = log_likelihood_jitter(theta, model, obs_phase, obs_flux, obs_err,
-                                   reparam=reparam)
+        ll = log_likelihood_jitter(
+            theta, model, obs_phase, obs_flux, obs_err, **common_kwargs,
+        )
     elif likelihood == 'studentt':
-        ll = log_likelihood_studentt(theta, model, obs_phase, obs_flux, obs_err,
-                                     nu=studentt_nu, reparam=reparam)
+        ll = log_likelihood_studentt(
+            theta, model, obs_phase, obs_flux, obs_err,
+            nu=studentt_nu, **common_kwargs,
+        )
     else:
-        ll = log_likelihood_chi2(theta, model, obs_phase, obs_flux, obs_err,
-                                 reparam=reparam)
+        ll = log_likelihood_chi2(
+            theta, model, obs_phase, obs_flux, obs_err, **common_kwargs,
+        )
 
     return lp + ll
 
@@ -1123,6 +1363,8 @@ def run_mcmc(
     likelihood: str = 'chi2',
     studentt_nu: float = 5.0,
     reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
 ) -> Tuple:
     """
     Run MCMC sampling with emcee or zeus.
@@ -1162,28 +1404,33 @@ def run_mcmc(
     active_param_names : list of str
     active_param_labels : list of str
     """
-    active_names, active_labels = get_param_config(likelihood, reparam=reparam)
-    phys_names = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
+    active_names, active_labels = get_param_config(
+        likelihood, reparam=reparam,
+        wind_model=wind_model, fit_wind_shape=fit_wind_shape,
+    )
     n_dim = len(active_names)
 
-    # Initial positions for physical parameters
-    initial = np.array([priors[p]['mean'] for p in phys_names])
-    scatter = np.array([priors[p]['std'] * 0.1 for p in phys_names])
-    if likelihood == 'jitter':
-        initial = np.append(initial, JITTER_PRIOR['mean'])
-        scatter = np.append(scatter, JITTER_PRIOR['std'] * 0.1)
+    # Build initial positions and per-dim scatter from the (already merged)
+    # priors dict, which must contain entries for every active dim.
+    initial = np.empty(n_dim)
+    scatter = np.empty(n_dim)
+    for i, name in enumerate(active_names):
+        prior = priors[name]
+        initial[i] = prior['mean']
+        scatter[i] = prior['std'] * 0.1
 
     pos = initial + scatter * np.random.randn(n_walkers, n_dim)
 
-    for i, param in enumerate(phys_names):
-        pos[:, i] = np.clip(pos[:, i],
-                            priors[param]['min'] * 1.01,
-                            priors[param]['max'] * 0.99)
-    if likelihood == 'jitter':
-        pos[:, 5] = np.clip(pos[:, 5],
-                            JITTER_PRIOR['min'] * 0.99,
-                            JITTER_PRIOR['max'] * 0.99)
-    # Enforce r < R (indices 2, 3 regardless of reparam)
+    # Clip walkers inside the box for every dim.
+    for i, name in enumerate(active_names):
+        prior = priors[name]
+        pos[:, i] = np.clip(
+            pos[:, i],
+            prior['min'] + 0.01 * abs(prior['min']) + 1e-12,
+            prior['max'] - 0.01 * abs(prior['max']) - 1e-12,
+        )
+
+    # Enforce r < R (indices 2, 3 regardless of reparam).
     for j in range(n_walkers):
         if pos[j, 2] >= pos[j, 3]:
             pos[j, 2] = pos[j, 3] * 0.1
@@ -1194,10 +1441,16 @@ def run_mcmc(
     if reparam:
         print("Reparameterization: (d1, d2) -> (a = d1+d2, q = d1/a)")
     print(f"Likelihood: {LIKELIHOOD_TYPES[likelihood]}")
+    print(f"Wind model: {WIND_MODELS.get(wind_model, wind_model)} "
+          f"({wind_model})  | fit_wind_shape={fit_wind_shape}")
+    print(f"Active params ({n_dim}): {active_names}")
     print(f"Initial parameter values (first walker): {pos[0]}")
 
-    log_prob_args = (model, obs_phase, obs_flux, obs_err, priors, likelihood,
-                     studentt_nu, reparam)
+    log_prob_args = (
+        model, obs_phase, obs_flux, obs_err,
+        priors, likelihood, studentt_nu, reparam,
+        wind_model, fit_wind_shape, active_names,
+    )
 
     start_time = time.time()
 
@@ -1299,49 +1552,42 @@ def load_existing_results(
     band: str,
     wind_model: str,
     reparam: bool = False,
-) -> Tuple[Optional[np.ndarray], Optional[Dict]]:
+) -> Tuple[Optional[np.ndarray], Optional[Dict], Optional[List[str]]]:
     """
     Load existing MCMC results from saved files.
-    
-    Parameters
-    ----------
-    output_dir : str
-        Directory containing MCMC output files
-    band : str
-        Energy band name
-    wind_model : str
-        Wind model name ('av' or 'cv')
-    reparam : bool
-        Whether samples were saved in (a, q) parameterization
-        
+
     Returns
     -------
     samples : np.ndarray or None
-        Loaded samples array, or None if file not found
     stats : Dict or None
-        Computed statistics from samples, or None if samples not found
+    loaded_names : list[str] or None
+        Column names used (in order) for the returned samples array.
     """
     suffix = f"{band}_{wind_model}"
     samples_path = os.path.join(output_dir, f"{suffix}_samples.csv")
-    
+
     if not os.path.exists(samples_path):
         print(f"Samples file not found: {samples_path}")
-        return None, None
-    
+        return None, None, None
+
     print(f"Loading existing samples from: {samples_path}")
     samples_df = pd.read_csv(samples_path)
-    
-    expected_names = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
-    if not all(p in samples_df.columns for p in expected_names):
-        print(f"Error: Samples file missing required columns. Expected: {expected_names}")
-        return None, None
-    
-    samples = samples_df[expected_names].values
-    stats = compute_statistics(samples, param_names=expected_names, reparam=reparam)
-    
-    print(f"  Loaded {len(samples)} samples")
-    
-    return samples, stats
+
+    geom_names = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
+    missing_geom = [p for p in geom_names if p not in samples_df.columns]
+    if missing_geom:
+        print(f"Error: Samples file missing required geometry columns: {missing_geom}")
+        return None, None, None
+
+    # Use whatever columns are present, preserving the file order, and
+    # excluding bookkeeping columns like log_prob.
+    loaded_names = [c for c in samples_df.columns if c != 'log_prob']
+    samples = samples_df[loaded_names].values
+    stats = compute_statistics(samples, param_names=loaded_names, reparam=reparam)
+
+    print(f"  Loaded {len(samples)} samples; columns: {loaded_names}")
+
+    return samples, stats, loaded_names
 
 
 def compute_chi2_for_samples(
@@ -1354,6 +1600,9 @@ def compute_chi2_for_samples(
     n_samples: int = None,
     verbose: bool = True,
     reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    active_names: List[str] = None,
 ) -> None:
     """
     Compute chi-square for all (or a subset of) MCMC samples and save to compressed file.
@@ -1387,24 +1636,41 @@ def compute_chi2_for_samples(
     
     if verbose:
         print(f"Computing chi-square for {n_samples} samples...")
-    
-    n_phys = 5
+
+    # Number of free physical parameters = active dims minus log_f (if any).
+    if active_names is None:
+        n_phys = 5
+    else:
+        n_phys = len(active_names) - (1 if 'log_f' in active_names else 0)
     dof = len(obs_flux) - n_phys
-    
+
     results = []
-    
+
     if HAS_TQDM and verbose:
         iterator = tqdm(sample_indices, desc="Computing χ²")
     else:
         iterator = sample_indices
-    
+
     for idx in iterator:
         sample_params = samples[idx]
         d1, d2, r, R, i0 = _to_physical(sample_params, reparam=reparam)
-        
+
+        if fit_wind_shape and active_names is not None:
+            wp = _to_wind_params(
+                sample_params, active_names, wind_model, R_value=R,
+                fit_wind_shape=True,
+            )
+        else:
+            wp = None
+
         try:
-            model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
-            
+            try:
+                model_flux = model.evaluate(
+                    d1, d2, r, R, i0, obs_phase, wind_params=wp,
+                )
+            except TypeError:
+                model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
+
             if np.all(np.isfinite(model_flux)):
                 chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
                 red_chi2 = chi2 / dof if dof > 0 else np.nan
@@ -1414,9 +1680,9 @@ def compute_chi2_for_samples(
         except Exception:
             chi2 = np.nan
             red_chi2 = np.nan
-        
+
         results.append([idx, d1, d2, r, R, i0, chi2, red_chi2])
-    
+
     columns = ['sample_idx', 'd1', 'd2', 'r', 'R', 'i0', 'chi2', 'reduced_chi2']
     results_df = pd.DataFrame(results, columns=columns)
     
@@ -1542,6 +1808,7 @@ def plot_best_fit(
     output_path: str,
     param_names: List[str] = None,
     reparam: bool = False,
+    fit_wind_shape: bool = False,
 ):
     """
     Plot observed data with best-fit model overlay.
@@ -1575,14 +1842,33 @@ def plot_best_fit(
     else:
         best_params = [stats[p]['median'] for p in PARAM_NAMES]
 
+    # Build best-fit wind_params if shape was fitted.
+    best_R = best_params[3]
+    if fit_wind_shape and wind_model in WIND_SHAPE_FIT:
+        best_wp = dict(WIND_SHAPE_FIXED.get(wind_model, {}))
+        for sname in WIND_SHAPE_FIT[wind_model]:
+            if sname in stats:
+                best_wp[sname] = float(stats[sname]['median'])
+        if wind_model in ('beta_law', 'confinement'):
+            best_wp['R_star'] = float(best_R)
+    else:
+        best_wp = None
+
     eval_fn = getattr(model, 'evaluate_direct', model.evaluate)
 
     model_phases = np.linspace(0, 1, 360)
-    model_flux = eval_fn(*best_params, model_phases)
+    try:
+        model_flux = eval_fn(*best_params, model_phases, wind_params=best_wp)
+    except TypeError:
+        model_flux = eval_fn(*best_params, model_phases)
 
-    obs_model = eval_fn(*best_params, obs_phase)
+    try:
+        obs_model = eval_fn(*best_params, obs_phase, wind_params=best_wp)
+    except TypeError:
+        obs_model = eval_fn(*best_params, obs_phase)
     chi2 = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
-    dof = len(obs_flux) - 5
+    n_phys = len(param_names) - (1 if 'log_f' in param_names else 0)
+    dof = len(obs_flux) - n_phys
     red_chi2 = chi2 / dof if dof > 0 else np.nan
 
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -1687,6 +1973,9 @@ def compute_pointwise_loglik(
     studentt_nu: float = 5.0,
     n_samples: int = 200,
     reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    active_names: List[str] = None,
 ) -> np.ndarray:
     """Compute per-observation log-likelihood for a subset of posterior samples.
 
@@ -1698,14 +1987,23 @@ def compute_pointwise_loglik(
     n_obs = len(obs_phase)
     log_lik = np.full((n_use, n_obs), np.nan)
 
+    if active_names is not None and 'log_f' in active_names:
+        idx_logf = active_names.index('log_f')
+    else:
+        idx_logf = 5
+
     for k, idx in enumerate(indices):
         theta = samples[idx]
-        model_flux = _evaluate_model(theta, model, obs_phase, reparam=reparam)
+        model_flux = _evaluate_model(
+            theta, model, obs_phase, reparam=reparam,
+            wind_model=wind_model, fit_wind_shape=fit_wind_shape,
+            active_names=active_names,
+        )
         if model_flux is None:
             continue
 
         if likelihood == 'jitter':
-            f = np.exp(theta[5])
+            f = np.exp(theta[idx_logf])
             sigma2 = obs_err ** 2 + (f * model_flux) ** 2
             log_lik[k] = -0.5 * ((obs_flux - model_flux) ** 2 / sigma2
                                   + np.log(sigma2) + np.log(2 * np.pi))
@@ -1781,6 +2079,8 @@ def run_arviz_diagnostics(
     chain: np.ndarray = None,
     samples_flat: np.ndarray = None,
     reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
 ):
     """Run ArviZ convergence diagnostics and optionally WAIC/LOO.
 
@@ -1834,6 +2134,9 @@ def run_arviz_diagnostics(
             likelihood=likelihood, studentt_nu=studentt_nu,
             n_samples=n_samples_waic,
             reparam=reparam,
+            wind_model=wind_model,
+            fit_wind_shape=fit_wind_shape,
+            active_names=param_names,
         )
         if ll.shape[0] > 10:
             log_lik_dict = {"obs": ll[np.newaxis, :, :]}
@@ -1896,49 +2199,67 @@ def run_single_fit(
     priors: Dict = None,
     sim_params: Dict = None,
     reparam: bool = False,
-) -> Dict:
+    fit_wind_shape: bool = False,
+    shape_prior_overrides: Dict[str, Dict] = None,
+) -> Tuple[Dict, object]:
     """Run MCMC fit for a single band/wind_model combination."""
-    
+
     if priors is None:
         priors = REPARAM_PRIORS.copy() if reparam else DEFAULT_PRIORS.copy()
     if sim_params is None:
         sim_params = {}
 
+    likelihood = getattr(args, 'likelihood', 'chi2')
+
+    # Active priors include geometry + (optional) jitter + (optional) shape.
+    active_priors = get_active_priors(
+        base_priors=priors,
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
+        likelihood=likelihood,
+        shape_prior_overrides=shape_prior_overrides,
+    )
+
     # Grid always uses (d1, d2, r, R, i0) bounds
     grid_priors = _grid_priors_from_reparam(priors) if reparam else priors
-    
+
     print(f"\n{'#'*60}")
     print(f"# Fitting {band.upper()} band - {WIND_MODELS[wind_model]}")
     print('#'*60)
-    
+
     if sim_params:
         print(f"# Simulation params: {sim_params}")
-    
-    # Initialize or reuse model
+
+    # Initialize model. With --fit-wind-shape, args.no_grid is auto-forced
+    # in main(), so the elif branch below handles it.
     if model_grid is not None:
-        # Reuse pre-computed grid, just switch wind model if needed
         if model_grid.wind_model != wind_model:
-            model_grid.switch_wind_model(wind_model)
+            raise ValueError(
+                f"Reused grid was built for wind_model='{model_grid.wind_model}' "
+                f"but request is for '{wind_model}'."
+            )
         model = model_grid
     elif args.no_grid:
-        print("\n⚠️  Using direct model evaluation (SLOW!)")
+        if fit_wind_shape:
+            print("\n[info] Using DirectLightCurveModel (required for --fit-wind-shape).")
+        else:
+            print("\n⚠️  Using direct model evaluation (no precomputed grid).")
         model = DirectLightCurveModel(
             band=band,
             flux_csv_path=args.flux_csv,
             wind_model=wind_model,
             dth=args.dth,
-            sim_params=sim_params
+            sim_params=sim_params,
         )
     else:
-        # Pre-compute model grid
         grid_points = {
             'd1': args.grid_points,
             'd2': args.grid_points,
-            'r': max(5, args.grid_points // 2),
-            'R': args.grid_points,
-            'i0': args.grid_points + 2
+            'r':  max(5, args.grid_points // 2),
+            'R':  args.grid_points,
+            'i0': args.grid_points + 2,
         }
-        
+
         model = PrecomputedModelGrid(
             band=band,
             flux_csv_path=args.flux_csv,
@@ -1949,19 +2270,15 @@ def run_single_fit(
             n_workers=args.n_workers,
             verbose=True,
             load_path=args.load_grid,
-            sim_params=sim_params
+            sim_params=sim_params,
         )
-        
-        # Save grid if requested
+
         if args.save_grid:
             model.save(args.save_grid)
-    
-    # Resolve sampler / likelihood from CLI args
+
     sampler_type = getattr(args, 'sampler', 'emcee')
-    likelihood = getattr(args, 'likelihood', 'chi2')
     studentt_nu = getattr(args, 'studentt_nu', 5.0)
 
-    # Run MCMC
     sampler, samples, active_names, active_labels = run_mcmc(
         model=model,
         obs_phase=obs_phase,
@@ -1970,21 +2287,21 @@ def run_single_fit(
         n_walkers=args.n_walkers,
         n_steps=args.n_steps,
         n_burn=args.n_burn,
-        priors=priors,
+        priors=active_priors,
         progress=not args.quiet,
         n_threads=args.n_threads,
         sampler_type=sampler_type,
         likelihood=likelihood,
         studentt_nu=studentt_nu,
         reparam=reparam,
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
     )
 
-    # Compute statistics
     stats = compute_statistics(samples, param_names=active_names, reparam=reparam)
     print_results(stats, band, wind_model, param_names=active_names, reparam=reparam)
     print_diagnostics(sampler, sampler_type=sampler_type, param_names=active_names)
 
-    # ArviZ diagnostics
     compute_waic = getattr(args, 'compute_waic', False)
     run_arviz_diagnostics(
         sampler, active_names, args.n_burn,
@@ -1994,6 +2311,8 @@ def run_single_fit(
         output_dir=args.output_dir,
         suffix=f"{band}_{wind_model}",
         reparam=reparam,
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
     )
 
     # Generate file suffix
@@ -2017,10 +2336,10 @@ def run_single_fit(
             os.path.join(args.output_dir, f"{suffix}_bestfit.png"),
             param_names=active_names,
             reparam=reparam,
+            fit_wind_shape=fit_wind_shape,
         )
         stats['reduced_chi2'] = red_chi2
 
-    # Save samples with log-probability (flat CSV)
     samples_df = pd.DataFrame(samples, columns=active_names)
     try:
         log_prob = sampler.get_log_prob(discard=args.n_burn, flat=True)
@@ -2033,7 +2352,6 @@ def run_single_fit(
     )
     print(f"Samples saved to: {args.output_dir}/{suffix}_samples.csv")
 
-    # Save full chain (walkers preserved) for post-hoc diagnostics / WAIC
     try:
         chain_full = sampler.get_chain(discard=args.n_burn)
         log_prob_chain = sampler.get_log_prob(discard=args.n_burn)
@@ -2047,12 +2365,13 @@ def run_single_fit(
             likelihood=likelihood,
             studentt_nu=studentt_nu,
             reparam=reparam,
+            wind_model=wind_model,
+            fit_wind_shape=fit_wind_shape,
         )
         print(f"Full chain saved to: {chain_path}")
     except Exception as e:
         warnings.warn(f"Could not save full chain: {e}")
 
-    # Optionally save chi-square for all samples
     if getattr(args, 'save_chi2', False):
         chi2_path = os.path.join(args.output_dir, f"{suffix}_chi2.csv.gz")
         compute_chi2_for_samples(
@@ -2061,6 +2380,9 @@ def run_single_fit(
             n_samples=getattr(args, 'chi2_n_samples', None),
             verbose=True,
             reparam=reparam,
+            wind_model=wind_model,
+            fit_wind_shape=fit_wind_shape,
+            active_names=active_names,
         )
 
     stats['wind_model'] = wind_model
@@ -2077,31 +2399,15 @@ def replot_from_existing(
     priors: Dict = None,
     sim_params: Dict = None,
     reparam: bool = False,
+    fit_wind_shape: bool = False,
+    shape_prior_overrides: Dict[str, Dict] = None,
 ) -> Optional[Dict]:
-    """
-    Regenerate plots from existing MCMC results without re-running MCMC.
-    
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Command line arguments
-    band : str
-        Energy band name
-    wind_model : str
-        Wind model name
-    obs_phase, obs_flux, obs_err : np.ndarray
-        Observed data
-    priors : Dict, optional
-        Prior specifications
-    sim_params : Dict, optional
-        Simulation parameters
-    reparam : bool
-        If True, samples are in (a, q) parameterization.
-        
-    Returns
-    -------
-    stats : Dict or None
-        Statistics from loaded samples, or None if loading failed
+    """Regenerate plots from existing MCMC results without re-running MCMC.
+
+    The fit_wind_shape flag here matches what *the saved chain* contains; it
+    is only used to build the right wind_params for forward model evaluation.
+    If the saved chain has more dims than the geometry block, fit_wind_shape
+    is auto-detected.
     """
     if priors is None:
         priors = REPARAM_PRIORS.copy() if reparam else DEFAULT_PRIORS.copy()
@@ -2109,50 +2415,77 @@ def replot_from_existing(
         sim_params = {}
 
     grid_priors = _grid_priors_from_reparam(priors) if reparam else priors
-    
+
     print(f"\n{'#'*60}")
     print(f"# Replotting {band.upper()} band - {WIND_MODELS[wind_model]}")
     print('#'*60)
-    
-    # Load existing samples
-    samples, stats = load_existing_results(args.output_dir, band, wind_model,
-                                           reparam=reparam)
-    
+
+    samples, stats, loaded_names = load_existing_results(
+        args.output_dir, band, wind_model, reparam=reparam,
+    )
+
     if samples is None or stats is None:
         print(f"Could not load existing results for {band}_{wind_model}")
         return None
-    
-    print_results(stats, band, wind_model, reparam=reparam)
-    
-    # Initialize model grid for plotting
-    print("\nInitializing model grid for plotting...")
-    grid_points = {
-        'd1': args.grid_points,
-        'd2': args.grid_points,
-        'r': max(5, args.grid_points // 2),
-        'R': args.grid_points,
-        'i0': args.grid_points + 2
-    }
-    
-    model = PrecomputedModelGrid(
-        band=band,
-        flux_csv_path=args.flux_csv,
-        wind_model=wind_model,
-        priors=grid_priors,
-        grid_points=grid_points,
-        dth=args.dth,
-        n_workers=args.n_workers,
-        verbose=True,
-        load_path=args.load_grid,
-        sim_params=sim_params
-    )
-    
+
+    print_results(stats, band, wind_model,
+                  param_names=loaded_names, reparam=reparam)
+
+    # Auto-detect shape-fit from the saved column names.
+    geom_names = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
+    extra_dims = [n for n in loaded_names
+                  if n not in geom_names and n != 'log_f']
+    saved_fit_wind_shape = bool(extra_dims) or fit_wind_shape
+
+    # Pick the model path: shape fits MUST use DirectLightCurveModel.
+    if saved_fit_wind_shape or args.no_grid:
+        print("\nUsing DirectLightCurveModel for replot.")
+        model = DirectLightCurveModel(
+            band=band,
+            flux_csv_path=args.flux_csv,
+            wind_model=wind_model,
+            dth=args.dth,
+            sim_params=sim_params,
+        )
+    else:
+        print("\nInitializing model grid for plotting...")
+        grid_points = {
+            'd1': args.grid_points,
+            'd2': args.grid_points,
+            'r':  max(5, args.grid_points // 2),
+            'R':  args.grid_points,
+            'i0': args.grid_points + 2,
+        }
+        model = PrecomputedModelGrid(
+            band=band,
+            flux_csv_path=args.flux_csv,
+            wind_model=wind_model,
+            priors=grid_priors,
+            grid_points=grid_points,
+            dth=args.dth,
+            n_workers=args.n_workers,
+            verbose=True,
+            load_path=args.load_grid,
+            sim_params=sim_params,
+        )
+
     suffix = f"{band}_{wind_model}"
 
-    # Generate plots
     if not args.no_plots:
-        active_names, active_labels = get_param_config(
-            getattr(args, 'likelihood', 'chi2'), reparam=reparam)
+        # Use the loaded column names as the active set.
+        active_names = list(loaded_names)
+        active_labels = []
+        geom_labels = REPARAM_PARAM_LABELS if reparam else PARAM_LABELS
+        for name in active_names:
+            if name in geom_names:
+                active_labels.append(geom_labels[geom_names.index(name)])
+            elif name == 'log_f':
+                active_labels.append(r'$\ln\,f$')
+            elif name in WIND_SHAPE_LABELS:
+                active_labels.append(WIND_SHAPE_LABELS[name])
+            else:
+                active_labels.append(name)
+
         plot_corner(
             samples, band, wind_model,
             os.path.join(args.output_dir, f"{suffix}_corner.png"),
@@ -2164,10 +2497,10 @@ def replot_from_existing(
             os.path.join(args.output_dir, f"{suffix}_bestfit.png"),
             param_names=active_names,
             reparam=reparam,
+            fit_wind_shape=saved_fit_wind_shape,
         )
         stats['reduced_chi2'] = red_chi2
 
-    # Post-hoc ArviZ diagnostics / WAIC from saved chain
     compute_waic = getattr(args, 'compute_waic', False)
     if HAS_ARVIZ or compute_waic:
         chain_path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
@@ -2179,6 +2512,8 @@ def replot_from_existing(
             saved_likelihood = str(chain_data.get('likelihood', 'chi2'))
             saved_nu = float(chain_data.get('studentt_nu', 5.0))
             saved_reparam = bool(chain_data.get('reparam', False))
+            saved_wind_model = str(chain_data.get('wind_model', wind_model))
+            saved_fws = bool(chain_data.get('fit_wind_shape', saved_fit_wind_shape))
             print(f"  Chain shape: {saved_chain.shape} "
                   f"(likelihood={saved_likelihood})")
 
@@ -2195,12 +2530,13 @@ def replot_from_existing(
                 output_dir=args.output_dir,
                 suffix=suffix,
                 reparam=saved_reparam,
+                wind_model=saved_wind_model,
+                fit_wind_shape=saved_fws,
             )
         elif compute_waic:
             print(f"Chain file not found: {chain_path}")
             print("  Re-run MCMC to generate it, or skip --compute-waic.")
 
-    # Optionally compute and save chi-square for all samples
     if getattr(args, 'save_chi2', False):
         chi2_path = os.path.join(args.output_dir, f"{suffix}_chi2.csv.gz")
         compute_chi2_for_samples(
@@ -2209,6 +2545,9 @@ def replot_from_existing(
             n_samples=getattr(args, 'chi2_n_samples', None),
             verbose=True,
             reparam=reparam,
+            wind_model=wind_model,
+            fit_wind_shape=saved_fit_wind_shape,
+            active_names=loaded_names,
         )
 
     return stats
@@ -2239,9 +2578,21 @@ def main():
     parser.add_argument(
         "--wind-model",
         type=str,
-        choices=['av', 'cv', 'both'],
-        default='both',
-        help="Wind model: 'av' (accelerated velocity), 'cv' (constant velocity), or 'both'"
+        choices=list(WIND_MODELS.keys()),
+        default='smooth_pl',
+        help=("Wind density model. Choices: " +
+              ", ".join(f"{k} ({v})" for k, v in WIND_MODELS.items()))
+    )
+    parser.add_argument(
+        "--fit-wind-shape",
+        action="store_true",
+        help=(
+            "Add the wind-shape parameters of the chosen --wind-model as free "
+            "MCMC dimensions (smooth_pl: Rb, p; beta_law: beta; "
+            "confinement: fconf, ell). Forces --no-grid since the precomputed "
+            "grid is geometry-only. Override priors via --prior-Rb, --prior-p, "
+            "--prior-beta, --prior-fconf, --prior-ell."
+        ),
     )
     
     # Data options
@@ -2437,15 +2788,9 @@ def main():
         "--lam",
         type=float,
         default=0.589537,
-        help="Scaling parameter to convert column density to nH (in 1e22 cm^-2 units). "
-             "Controls the absolute flux normalization."
-    )
-    sim_group.add_argument(
-        "--lam2",
-        type=float,
-        default=None,
-        help="Scaling parameter for constant velocity wind model. "
-             "Defaults to same as --lam if not specified."
+        help="Target mean nH (in 1e22 cm^-2 units). The raw wind LOS integral "
+             "is rescaled so that mean(fl) = lam, which sets the absolute "
+             "flux normalization (and is fixed from spectral fits)."
     )
     sim_group.add_argument(
         "--gma0",
@@ -2529,19 +2874,53 @@ def main():
         help="Prior for q = d1/(d1+d2) (mass-ratio proxy, only with --reparam). "
              "Format: mean,std,min,max. Default: 0.58,0.15,0.01,0.99"
     )
-    
+
+    # Wind-shape prior overrides (only used with --fit-wind-shape).
+    shape_prior_group = parser.add_argument_group(
+        'Wind-Shape Prior Customization',
+        'Override default priors for wind-shape parameters '
+        '(only active with --fit-wind-shape)',
+    )
+    for sname in ('Rb', 'p', 'beta', 'fconf', 'ell'):
+        prior_def = WIND_SHAPE_PRIORS[sname]
+        shape_prior_group.add_argument(
+            f"--prior-{sname}",
+            type=str,
+            default=None,
+            metavar="MEAN,STD,MIN,MAX",
+            help=(
+                f"Prior for wind-shape parameter '{sname}'. "
+                f"Format: mean,std,min,max. "
+                f"Default: {prior_def['mean']},{prior_def['std']},"
+                f"{prior_def['min']},{prior_def['max']}"
+            ),
+        )
+
     args = parser.parse_args()
-    
+
+    # Auto-force --no-grid when fitting wind shape (the precomputed grid is
+    # geometry-only and cannot interpolate over additional shape dims).
+    if getattr(args, 'fit_wind_shape', False):
+        if args.load_grid or args.save_grid:
+            parser.error(
+                "--fit-wind-shape is incompatible with --load-grid/--save-grid; "
+                "the precomputed grid is geometry-only. Drop those flags or "
+                "the --fit-wind-shape flag."
+            )
+        if not args.no_grid:
+            print("[notice] --fit-wind-shape set: forcing --no-grid "
+                  "(direct simulate_lightcurve evaluation).")
+            args.no_grid = True
+
     # Build simulation parameters dict
     sim_params = {
         'lam': args.lam,
-        'lam2': args.lam2 if args.lam2 is not None else args.lam,
         'gma0': args.gma0,
         'd2h': args.d2h,
-        'dz': args.dz
+        'dz': args.dz,
     }
-    
-    # Build custom priors
+
+    # Build custom geometry priors
     reparam = getattr(args, 'reparam', False)
     if reparam:
         priors = copy.deepcopy(REPARAM_PRIORS)
@@ -2560,32 +2939,51 @@ def main():
                     'mean': parts[0],
                     'std': parts[1],
                     'min': parts[2],
-                    'max': parts[3]
+                    'max': parts[3],
                 }
-                print(f"Custom prior for {param}: mean={parts[0]}, std={parts[1]}, min={parts[2]}, max={parts[3]}")
+                print(f"Custom prior for {param}: mean={parts[0]}, std={parts[1]}, "
+                      f"min={parts[2]}, max={parts[3]}")
             except Exception as e:
                 parser.error(f"Invalid format for --prior-{param}: {e}")
-    
+
+    # Build wind-shape prior overrides (always parsed; only applied when
+    # --fit-wind-shape and the param is in WIND_SHAPE_FIT[wind_model]).
+    shape_prior_overrides: Dict[str, Dict[str, float]] = {}
+    for sname in ('Rb', 'p', 'beta', 'fconf', 'ell'):
+        prior_arg = getattr(args, f'prior_{sname}', None)
+        if prior_arg:
+            try:
+                parts = [float(x.strip()) for x in prior_arg.split(',')]
+                if len(parts) != 4:
+                    raise ValueError(f"Expected 4 values for --prior-{sname}")
+                shape_prior_overrides[sname] = {
+                    'mean': parts[0],
+                    'std': parts[1],
+                    'min': parts[2],
+                    'max': parts[3],
+                }
+                print(f"Custom prior for shape param {sname}: "
+                      f"mean={parts[0]}, std={parts[1]}, min={parts[2]}, max={parts[3]}")
+            except Exception as e:
+                parser.error(f"Invalid format for --prior-{sname}: {e}")
+
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
     # Determine which bands to fit
     if args.band == 'all':
         bands = ['broad', 'soft', 'medium', 'hard']
     else:
         bands = [args.band]
-    
-    # Determine which wind models to fit
-    if args.wind_model == 'both':
-        wind_models = ['av', 'cv']
-    else:
-        wind_models = [args.wind_model]
-    
+
+    # Wind models: a single value (no more 'both' loop).
+    wind_models = [args.wind_model]
+    fit_wind_shape = bool(getattr(args, 'fit_wind_shape', False))
+
     # Run MCMC or replot from existing results
     all_results = {}
-    
+
     for band in bands:
-        # Load data once per band
         try:
             obs_df = load_observed_lightcurves(
                 band, args.data_dir,
@@ -2593,77 +2991,77 @@ def main():
                 error_column=args.obs_error_column or args.obs_column + "_ERR",
                 time_column=args.time_column,
             )
-            
+
             if not args.no_phase_bin:
                 obs_df = phase_bin_data(obs_df, n_bins=args.n_phase_bins)
-            
+
             obs_phase = obs_df['phase'].values
             obs_flux = obs_df['flux'].values
             obs_err = obs_df['flux_err'].values
-            
-            # Replace invalid errors with flux-based estimate
+
             invalid_err = ~np.isfinite(obs_err) | (obs_err <= 0)
             if np.any(invalid_err):
                 obs_err[invalid_err] = np.abs(obs_flux[invalid_err]) * 0.1
-                warnings.warn(f"Replaced {np.sum(invalid_err)} invalid errors with 10% of flux")
-            
-            # For multiple wind models, reuse the same grid
-            model_grid = None
-            
+                warnings.warn(
+                    f"Replaced {np.sum(invalid_err)} invalid errors with 10% of flux"
+                )
+
             for wind_model in wind_models:
                 try:
-                    key = f"{band}_{wind_model}"
-                    
+                    key = (band, wind_model)
+
                     if args.replot:
-                        # Regenerate plots from existing results
                         stats = replot_from_existing(
                             args, band, wind_model,
                             obs_phase, obs_flux, obs_err,
                             priors=priors,
                             sim_params=sim_params,
                             reparam=reparam,
+                            fit_wind_shape=fit_wind_shape,
+                            shape_prior_overrides=shape_prior_overrides,
                         )
                         if stats is not None:
                             all_results[key] = stats
                     else:
-                        # Run full MCMC fitting
-                        stats, model_grid = run_single_fit(
+                        stats, _ = run_single_fit(
                             band, wind_model, args,
                             obs_phase, obs_flux, obs_err,
-                            model_grid=model_grid if len(wind_models) > 1 else None,
+                            model_grid=None,
                             priors=priors,
                             sim_params=sim_params,
                             reparam=reparam,
+                            fit_wind_shape=fit_wind_shape,
+                            shape_prior_overrides=shape_prior_overrides,
                         )
                         all_results[key] = stats
-                        
-                        # Save grid after first wind model if requested
-                        if args.save_grid and wind_model == wind_models[0]:
-                            model_grid.save(args.save_grid)
-                        
+
                 except Exception as e:
-                    print(f"ERROR {'replotting' if args.replot else 'fitting'} {band} band ({wind_model}): {e}")
+                    print(f"ERROR {'replotting' if args.replot else 'fitting'} "
+                          f"{band} band ({wind_model}): {e}")
                     import traceback
                     traceback.print_exc()
                     continue
-                    
+
         except Exception as e:
             print(f"ERROR loading data for {band} band: {e}")
             import traceback
             traceback.print_exc()
             continue
-    
+
     # Save summary results
     if all_results:
         summary_path = os.path.join(args.output_dir, "mcmc_summary.txt")
         with open(summary_path, 'w') as f:
             f.write("MCMC Light Curve Fitting Results\n")
             f.write("="*60 + "\n\n")
-            
+
             likelihood = getattr(args, 'likelihood', 'chi2')
-            active_names, _ = get_param_config(likelihood, reparam=reparam)
+            active_names, _ = get_param_config(
+                likelihood, reparam=reparam,
+                wind_model=args.wind_model, fit_wind_shape=fit_wind_shape,
+            )
             for key, stats in all_results.items():
-                band, wind_model = key.rsplit('_', 1)
+                band, wind_model = key
                 f.write(f"{band.upper()} Band - {WIND_MODELS[wind_model]}\n")
                 f.write("-"*40 + "\n")
                 for param in active_names:
