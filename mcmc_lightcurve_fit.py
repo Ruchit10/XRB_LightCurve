@@ -24,9 +24,13 @@ chosen --wind-model):
 - confinement : fconf (compression amplitude), ell (compression scale).
                 R_star is tied to R.
 
-The precomputed model grid is geometry-only. When --fit-wind-shape is set the
-code automatically falls back to direct simulate_lightcurve evaluation, which
-is now ~60 ms per LC thanks to the Gauss-Legendre mega-kernel.
+The precomputed model grid works for both geometry-only runs and wind-shape
+fits.  In shape-fit mode it adds one axis per active wind-shape parameter
+(configurable via --shape-grid-points, default 5); building the grid is
+more expensive but subsequent likelihood evaluations are still ~O(1)
+ND-interpolator calls. Pass --no-grid to use direct simulate_lightcurve
+evaluation instead (~60 ms per LC with the Gauss-Legendre mega-kernel),
+which is convenient for short debugging chains.
 
 Simulation parameters (passed to simulate_lightcurve):
 - lam:  Target mean nH in 1e22 cm^-2 units (fixes overall normalization)
@@ -101,6 +105,19 @@ except ImportError:
 
 from scipy.interpolate import RegularGridInterpolator
 from scipy.special import gammaln
+
+# Silence noisy, repeated messages that would otherwise flood stdout during
+# MCMC (one fire per model evaluation x thousands of evaluations).  The
+# underlying causes are benign (extrapolation just outside the flux-vs-nH
+# CSV grid, and a one-line "detected bands" print).  simulate_lightcurve is
+# already called with verbose=False from the MCMC path, which suppresses
+# both at the source; this filter is a belt-and-suspenders catch in case a
+# new callsite is added without threading the flag through.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Some nH values are outside CSV range",
+    category=UserWarning,
+)
 
 from xrb_lightcurve import (
     simulate_lightcurve,
@@ -493,20 +510,17 @@ def _compute_single_model(args):
     """Worker function to compute a single grid model (for parallel processing).
 
     Returns the band-flux array sorted by phase, or None on failure.
+
+    Expects ``wind_params`` to be fully resolved by the caller (fixed shape
+    params + per-point shape-axis values + R_star tied to R when needed).
     """
     (
         d1, d2, r, R, i0,
         flux_csv_path, band, dth,
-        sim_params, wind_model, wind_params_template,
+        sim_params, wind_model, wind_params,
     ) = args
 
     flux_column = f"nfl_{band}"
-
-    # For beta_law/confinement R_star is tied to R (varies in the grid). For
-    # smooth_pl/broken_pl the template is geometry-independent.
-    wind_params = dict(wind_params_template)
-    if wind_model in ('beta_law', 'confinement'):
-        wind_params['R_star'] = float(R)
 
     try:
         results = simulate_lightcurve(
@@ -537,13 +551,22 @@ def _compute_single_model(args):
 
 
 class PrecomputedModelGrid:
-    """
-    Pre-computed grid of model light curves for fast MCMC evaluation.
+    """Pre-computed grid of model light curves for fast MCMC evaluation.
 
-    The grid is built over the 5 geometry parameters (d1, d2, r, R, i0) with
-    the wind shape parameters held FIXED (defaults from default_wind_params,
-    or user-supplied via *wind_params_template*). For runs that fit wind
-    shape parameters, use DirectLightCurveModel instead.
+    Supports two modes, selected at construction time:
+
+    * **Geometry-only** (default, ``fit_wind_shape=False``) — the grid axes
+      are the 5 geometry parameters ``(d1, d2, r, R, i0)``.  Wind-shape
+      parameters are held fixed at ``wind_params_template`` (or
+      ``default_wind_params`` if not provided).  Fast to build, small on
+      disk, cannot represent runs where shape parameters vary.
+
+    * **Geometry + wind-shape** (``fit_wind_shape=True``) — the active
+      wind-shape parameters for ``wind_model`` (``WIND_SHAPE_FIT[wind_model]``)
+      are added as extra grid axes.  Grid size grows multiplicatively
+      (~5^k for k shape axes at ``shape_grid_points=5`` each), but once
+      built every likelihood evaluation is still a single ND interpolation.
+      Much faster than ``DirectLightCurveModel`` for long chains.
     """
 
     def __init__(
@@ -559,39 +582,27 @@ class PrecomputedModelGrid:
         load_path: str = None,
         sim_params: Dict = None,
         wind_params_template: Dict[str, float] = None,
+        fit_wind_shape: bool = False,
+        shape_priors: Dict[str, Dict] = None,
+        shape_grid_points: int = 5,
     ):
-        """
-        Initialize and pre-compute the model grid (or load from file).
+        """Initialize and pre-compute the model grid (or load from file).
 
         Parameters
         ----------
-        band : str
-            Energy band ('broad', 'soft', 'medium', 'hard')
-        flux_csv_path : str
-            Path to flux vs nH CSV file
-        wind_model : str
-            Wind model name (one of WIND_MODELS keys).
-        priors : dict
-            Prior specifications (used to set grid bounds)
-        grid_points : dict, optional
-            Number of grid points per parameter.
-        dth : float
-            Phase resolution for model computation (degrees)
-        n_workers : int, optional
-            Number of parallel workers.
-        verbose : bool
-            Print progress messages
-        load_path : str, optional
-            Path to load pre-computed grid from. If provided, skips computation.
-        sim_params : dict, optional
-            Additional simulation parameters passed to simulate_lightcurve
-            (lam, gma0, d2h, dz).
-        wind_params_template : dict, optional
-            Fixed wind-shape parameters used for every grid point. R_star
-            (for beta_law / confinement) is omitted here because it varies
-            with the geometry parameter R; it is filled in per-point by the
-            worker. If None, uses default_wind_params(wind_model, R=2.0)
-            with R_star stripped.
+        band, flux_csv_path, wind_model, priors, grid_points, dth,
+        n_workers, verbose, load_path, sim_params, wind_params_template
+            See class docstring / previous signature.
+        fit_wind_shape : bool
+            If True, include ``WIND_SHAPE_FIT[wind_model]`` as additional
+            grid axes so the grid can be used for shape-parameter MCMC.
+        shape_priors : dict, optional
+            ``{shape_name: {min, max, ...}}``.  Only ``min`` and ``max`` are
+            used (to bound each shape grid axis).  Defaults to
+            ``WIND_SHAPE_PRIORS``.
+        shape_grid_points : int
+            Number of grid points per wind-shape axis.  Default 5.  Can be
+            overridden per-axis by adding entries to ``grid_points``.
         """
         self.band = band.lower()
         self.flux_csv_path = flux_csv_path
@@ -600,6 +611,9 @@ class PrecomputedModelGrid:
         self.dth = dth
         self.verbose = verbose
         self.sim_params = sim_params or {}
+        self.fit_wind_shape = bool(fit_wind_shape)
+        self.shape_priors = shape_priors if shape_priors is not None else WIND_SHAPE_PRIORS
+        self.shape_grid_points = int(shape_grid_points)
 
         if self.wind_model not in WIND_MODELS:
             raise ValueError(
@@ -607,18 +621,35 @@ class PrecomputedModelGrid:
                 f"got '{wind_model}'"
             )
 
-        # Build the wind_params template if none provided.
+        # Build the wind_params template (fixed shape params) if none provided.
+        # This holds shape params that are *constant* across the grid, even
+        # when fit_wind_shape=True (e.g. Delta for smooth_pl, H for beta_law).
         if wind_params_template is None:
             wp = default_wind_params(self.wind_model, R=2.0)
-            # R_star is filled in per grid point.
-            wp.pop('R_star', None)
+            wp.pop('R_star', None)  # R_star is tied to R per-point.
             wind_params_template = wp
         self.wind_params_template = dict(wind_params_template)
+
+        # Shape axes that become grid dimensions.
+        if self.fit_wind_shape:
+            self.shape_axes: List[str] = list(WIND_SHAPE_FIT.get(self.wind_model, []))
+            # Fixed shape params for this model (not on a grid axis) come
+            # from WIND_SHAPE_FIXED, overlaid by anything the caller supplied
+            # in wind_params_template.
+            fixed = dict(WIND_SHAPE_FIXED.get(self.wind_model, {}))
+            fixed.update(self.wind_params_template)
+            self.wind_params_template = fixed
+        else:
+            self.shape_axes = []
+
+        self.axis_names: List[str] = list(PARAM_NAMES) + list(self.shape_axes)
 
         # Default grid resolution
         if grid_points is None:
             grid_points = {'d1': 8, 'd2': 8, 'r': 5, 'R': 8, 'i0': 10}
-
+        grid_points = dict(grid_points)
+        for sname in self.shape_axes:
+            grid_points.setdefault(sname, self.shape_grid_points)
         self.grid_points = grid_points
         self.n_workers = n_workers if n_workers else max(1, cpu_count() - 1)
 
@@ -629,62 +660,83 @@ class PrecomputedModelGrid:
             self._precompute_models()
 
         self._setup_interpolators()
-    
+
     def _create_grids(self):
-        """Create 1D parameter grids."""
-        self.param_grids = {}
-        
+        """Create 1D parameter grids for geometry + (optional) shape axes."""
+        self.param_grids: Dict[str, np.ndarray] = {}
+
         for param in PARAM_NAMES:
             p_min = self.priors[param]['min']
             p_max = self.priors[param]['max']
             n_pts = self.grid_points.get(param, 8)
-            
-            # Use log spacing for r (spans orders of magnitude)
             if param == 'r':
                 self.param_grids[param] = np.logspace(
                     np.log10(p_min), np.log10(p_max), n_pts
                 )
             else:
                 self.param_grids[param] = np.linspace(p_min, p_max, n_pts)
-        
+
+        for sname in self.shape_axes:
+            sp = self.shape_priors[sname]
+            n_pts = self.grid_points.get(sname, self.shape_grid_points)
+            self.param_grids[sname] = np.linspace(sp['min'], sp['max'], n_pts)
+
         # Standard phase grid for output
         n_phase_points = int(360 / self.dth)
-        self.phase_grid = np.linspace(0, 1 - 1/n_phase_points, n_phase_points)
-        
+        self.phase_grid = np.linspace(0, 1 - 1 / n_phase_points, n_phase_points)
+
         if self.verbose:
-            total_models = np.prod([len(g) for g in self.param_grids.values()])
+            total_models = int(np.prod([len(g) for g in self.param_grids.values()]))
             print(f"\nGrid configuration: {total_models} models to compute")
             print(f"Wind model: {WIND_MODELS[self.wind_model]} ({self.wind_model})")
-            for param, grid in self.param_grids.items():
+            print(f"Axes: {self.axis_names}")
+            if self.shape_axes:
+                print(f"  (including {len(self.shape_axes)} wind-shape axes: "
+                      f"{self.shape_axes})")
+            for param in self.axis_names:
+                grid = self.param_grids[param]
                 print(f"  {param}: {len(grid)} points [{grid[0]:.4f} - {grid[-1]:.4f}]")
     
     def _precompute_models(self):
-        """Pre-compute all models on the grid."""
+        """Pre-compute all models on the (geometry + shape) grid."""
         if self.verbose:
             print(f"\nPre-computing model grid using {self.n_workers} workers...")
             start_time = time.time()
 
-        d1_grid = self.param_grids['d1']
-        d2_grid = self.param_grids['d2']
-        r_grid = self.param_grids['r']
-        R_grid = self.param_grids['R']
-        i0_grid = self.param_grids['i0']
+        axis_arrays = [self.param_grids[name] for name in self.axis_names]
+        axis_lens = [len(a) for a in axis_arrays]
+
+        # Geometry indices used to skip r >= R combinations.
+        try:
+            idx_r = self.axis_names.index('r')
+            idx_R = self.axis_names.index('R')
+        except ValueError:
+            idx_r = idx_R = None
 
         param_combos = []
-        for i_d1, d1 in enumerate(d1_grid):
-            for i_d2, d2 in enumerate(d2_grid):
-                for i_r, r in enumerate(r_grid):
-                    for i_R, R in enumerate(R_grid):
-                        for i_i0, i0 in enumerate(i0_grid):
-                            if r >= R:
-                                continue
-                            param_combos.append((
-                                d1, d2, r, R, i0,
-                                self.flux_csv_path, self.band, self.dth,
-                                self.sim_params,
-                                self.wind_model,
-                                self.wind_params_template,
-                            ))
+        valid_index_tuples = []
+        for index in np.ndindex(*axis_lens):
+            values = [axis_arrays[k][i] for k, i in enumerate(index)]
+            if idx_r is not None and values[idx_r] >= values[idx_R]:
+                continue
+            d1, d2, r, R, i0 = values[:5]
+            shape_values = values[5:]
+
+            # Build the wind_params for this grid point.
+            wp = dict(self.wind_params_template)
+            for sname, sval in zip(self.shape_axes, shape_values):
+                wp[sname] = float(sval)
+            if self.wind_model in ('beta_law', 'confinement'):
+                wp['R_star'] = float(R)
+
+            param_combos.append((
+                d1, d2, r, R, i0,
+                self.flux_csv_path, self.band, self.dth,
+                self.sim_params,
+                self.wind_model,
+                wp,
+            ))
+            valid_index_tuples.append(index)
 
         if self.verbose:
             print(f"Computing {len(param_combos)} valid parameter combinations...")
@@ -706,33 +758,23 @@ class PrecomputedModelGrid:
             else:
                 results = [_compute_single_model(args) for args in param_combos]
 
-        shape = (
-            len(d1_grid), len(d2_grid), len(r_grid), len(R_grid), len(i0_grid),
-            len(self.phase_grid)
-        )
+        shape = tuple(axis_lens) + (len(self.phase_grid),)
         self.flux_grid = np.full(shape, np.nan)
 
-        idx = 0
-        for i_d1 in range(len(d1_grid)):
-            for i_d2 in range(len(d2_grid)):
-                for i_r in range(len(r_grid)):
-                    for i_R in range(len(R_grid)):
-                        for i_i0 in range(len(i0_grid)):
-                            if r_grid[i_r] >= R_grid[i_R]:
-                                continue
-                            flux = results[idx]
-                            if flux is not None:
-                                self.flux_grid[i_d1, i_d2, i_r, i_R, i_i0, :] = flux
-                            idx += 1
+        for index, flux in zip(valid_index_tuples, results):
+            if flux is not None:
+                self.flux_grid[index + (slice(None),)] = flux
 
         if self.verbose:
             elapsed = time.time() - start_time
             print(f"Grid pre-computation completed in {elapsed:.1f} seconds")
+            mem_mb = self.flux_grid.nbytes / (1024 * 1024)
+            print(f"Grid shape: {self.flux_grid.shape} ({mem_mb:.1f} MB in RAM)")
             valid = np.sum(~np.isnan(self.flux_grid)) / self.flux_grid.size
             print(f"Valid grid coverage: {valid*100:.1f}%")
 
     def _setup_interpolators(self):
-        """Setup a single 6D interpolator (params + phase) for vectorized evaluation."""
+        """Set up a single ND interpolator over (axes..., phase)."""
         flux_grid_clean = self.flux_grid.copy()
         if np.any(np.isnan(flux_grid_clean)):
             flux_grid_clean = np.where(
@@ -741,20 +783,17 @@ class PrecomputedModelGrid:
                 flux_grid_clean,
             )
 
-        self._interp_6d = RegularGridInterpolator(
-            (
-                self.param_grids['d1'],
-                self.param_grids['d2'],
-                self.param_grids['r'],
-                self.param_grids['R'],
-                self.param_grids['i0'],
-                self.phase_grid,
-            ),
+        interp_axes = tuple(self.param_grids[name] for name in self.axis_names) \
+            + (self.phase_grid,)
+        self._interp_nd = RegularGridInterpolator(
+            interp_axes,
             flux_grid_clean,
             method='linear',
             bounds_error=False,
             fill_value=np.nan,
         )
+        # Backwards-compat alias (older code paths reference _interp_6d).
+        self._interp_6d = self._interp_nd
     
     def save(self, filepath: str):
         """
@@ -773,33 +812,40 @@ class PrecomputedModelGrid:
         wp_keys = list(self.wind_params_template.keys())
         wp_vals = [float(self.wind_params_template[k]) for k in wp_keys]
 
-        np.savez_compressed(
-            filepath,
+        save_kwargs = dict(
             flux_grid=self.flux_grid,
             phase_grid=self.phase_grid,
-            d1_grid=self.param_grids['d1'],
-            d2_grid=self.param_grids['d2'],
-            r_grid=self.param_grids['r'],
-            R_grid=self.param_grids['R'],
-            i0_grid=self.param_grids['i0'],
             band=self.band,
             wind_model=self.wind_model,
             dth=self.dth,
-            grid_points=np.array([self.grid_points[p] for p in PARAM_NAMES]),
+            axis_names=np.array(self.axis_names, dtype=str),
+            shape_axes=np.array(self.shape_axes, dtype=str),
+            fit_wind_shape=np.array(self.fit_wind_shape),
             sim_param_keys=np.array(sim_param_keys, dtype=str),
             sim_param_vals=np.array(sim_param_vals, dtype=float),
             wind_param_keys=np.array(wp_keys, dtype=str),
             wind_param_vals=np.array(wp_vals, dtype=float),
         )
+        # Persist every axis as "<name>_grid" so loading can reconstruct the
+        # full set regardless of how many shape axes are present.
+        for name in self.axis_names:
+            save_kwargs[f"{name}_grid"] = self.param_grids[name]
+        grid_pts = np.array(
+            [self.grid_points.get(p, len(self.param_grids[p])) for p in self.axis_names]
+        )
+        save_kwargs['grid_points'] = grid_pts
+
+        np.savez_compressed(filepath, **save_kwargs)
 
         print(f"Grid saved to: {filepath}")
         print(f"  File size: {os.path.getsize(filepath) / 1024 / 1024:.1f} MB")
         if self.sim_params:
             print(f"  Simulation params: {self.sim_params}")
+        print(f"  Axes: {self.axis_names}")
         print(f"  Wind model: {self.wind_model} | wind_params: {self.wind_params_template}")
 
     def _load_grid(self, filepath: str):
-        """Load pre-computed grid from file."""
+        """Load pre-computed grid from file (supports legacy geometry-only grids)."""
         if self.verbose:
             print(f"\nLoading pre-computed grid from: {filepath}")
 
@@ -808,13 +854,36 @@ class PrecomputedModelGrid:
         self.flux_grid = data['flux_grid']
         self.phase_grid = data['phase_grid']
 
-        self.param_grids = {
-            'd1': data['d1_grid'],
-            'd2': data['d2_grid'],
-            'r':  data['r_grid'],
-            'R':  data['R_grid'],
-            'i0': data['i0_grid'],
-        }
+        # Determine the loaded axis layout.  New grids write an explicit
+        # ``axis_names`` entry.  Legacy grids had only the 5 geometry axes.
+        if 'axis_names' in data:
+            loaded_axis_names = [str(x) for x in data['axis_names']]
+        else:
+            loaded_axis_names = list(PARAM_NAMES)
+
+        if 'shape_axes' in data:
+            loaded_shape_axes = [str(x) for x in data['shape_axes'] if str(x)]
+        else:
+            loaded_shape_axes = [
+                n for n in loaded_axis_names if n not in PARAM_NAMES
+            ]
+        loaded_fit_wind_shape = bool(loaded_shape_axes)
+        if 'fit_wind_shape' in data:
+            try:
+                loaded_fit_wind_shape = bool(data['fit_wind_shape'])
+            except Exception:
+                pass
+
+        self.param_grids = {}
+        for name in loaded_axis_names:
+            key = f"{name}_grid"
+            if key in data:
+                self.param_grids[name] = data[key]
+            else:
+                # Legacy fallback: some older grids stored lowercase for R.
+                alt = f"{name.lower()}_grid"
+                if alt in data:
+                    self.param_grids[name] = data[alt]
 
         loaded_band = str(data['band'])
         loaded_dth = float(data['dth'])
@@ -845,6 +914,11 @@ class PrecomputedModelGrid:
                 f"Loaded grid wind_model '{loaded_wind_model}' differs from requested "
                 f"'{self.wind_model}'. Using loaded value."
             )
+        if self.fit_wind_shape != loaded_fit_wind_shape:
+            warnings.warn(
+                f"Loaded grid fit_wind_shape={loaded_fit_wind_shape} differs from "
+                f"requested fit_wind_shape={self.fit_wind_shape}. Using loaded value."
+            )
 
         if self.sim_params and loaded_sim_params:
             for key in self.sim_params:
@@ -857,11 +931,15 @@ class PrecomputedModelGrid:
         self.dth = loaded_dth
         self.sim_params = loaded_sim_params
         self.wind_model = loaded_wind_model
+        self.axis_names = loaded_axis_names
+        self.shape_axes = loaded_shape_axes
+        self.fit_wind_shape = loaded_fit_wind_shape
         if loaded_wp:
             self.wind_params_template = loaded_wp
 
         if self.verbose:
             print(f"  Band: {loaded_band}, dth: {loaded_dth}, wind_model: {loaded_wind_model}")
+            print(f"  Axes: {self.axis_names} (fit_wind_shape={self.fit_wind_shape})")
             print(f"  Grid shape: {self.flux_grid.shape}")
             valid = np.sum(~np.isnan(self.flux_grid)) / self.flux_grid.size
             print(f"  Valid coverage: {valid*100:.1f}%")
@@ -882,22 +960,35 @@ class PrecomputedModelGrid:
     ) -> np.ndarray:
         """Evaluate the model at given parameters using grid interpolation.
 
-        ``wind_params`` is accepted for API compatibility with
-        :class:`DirectLightCurveModel`, but is *ignored*: the precomputed
-        grid is built with the wind shape held fixed at construction time.
-        Callers that fit wind shape parameters should use
-        :class:`DirectLightCurveModel` instead.
+        If this grid includes wind-shape axes (``fit_wind_shape=True`` at
+        construction time), ``wind_params`` must supply the corresponding
+        shape-parameter values.  Otherwise the grid's fixed template values
+        are used and ``wind_params`` is ignored.
         """
         n_phase = len(self.phase_grid)
-        points = np.empty((n_phase, 6))
+        n_axes = len(self.axis_names)
+        points = np.empty((n_phase, n_axes + 1))
         points[:, 0] = d1
         points[:, 1] = d2
         points[:, 2] = r
         points[:, 3] = R
         points[:, 4] = i0
-        points[:, 5] = self.phase_grid
 
-        grid_flux = self._interp_6d(points)
+        for k, sname in enumerate(self.shape_axes, start=5):
+            if wind_params is not None and sname in wind_params:
+                points[:, k] = float(wind_params[sname])
+            else:
+                # Fall back to the grid's fixed template value if present,
+                # otherwise use the axis midpoint as a safe default.
+                fallback = self.wind_params_template.get(sname)
+                if fallback is None:
+                    axis = self.param_grids[sname]
+                    fallback = 0.5 * (axis[0] + axis[-1])
+                points[:, k] = float(fallback)
+
+        points[:, -1] = self.phase_grid
+
+        grid_flux = self._interp_nd(points)
 
         if np.any(np.isnan(grid_flux)):
             return np.full_like(obs_phases, np.nan, dtype=float)
@@ -2230,20 +2321,20 @@ def run_single_fit(
     if sim_params:
         print(f"# Simulation params: {sim_params}")
 
-    # Initialize model. With --fit-wind-shape, args.no_grid is auto-forced
-    # in main(), so the elif branch below handles it.
     if model_grid is not None:
         if model_grid.wind_model != wind_model:
             raise ValueError(
                 f"Reused grid was built for wind_model='{model_grid.wind_model}' "
                 f"but request is for '{wind_model}'."
             )
+        if bool(model_grid.fit_wind_shape) != bool(fit_wind_shape):
+            raise ValueError(
+                f"Reused grid has fit_wind_shape={model_grid.fit_wind_shape} "
+                f"but request is fit_wind_shape={fit_wind_shape}."
+            )
         model = model_grid
     elif args.no_grid:
-        if fit_wind_shape:
-            print("\n[info] Using DirectLightCurveModel (required for --fit-wind-shape).")
-        else:
-            print("\n⚠️  Using direct model evaluation (no precomputed grid).")
+        print("\n[info] Using DirectLightCurveModel (no precomputed grid).")
         model = DirectLightCurveModel(
             band=band,
             flux_csv_path=args.flux_csv,
@@ -2260,6 +2351,16 @@ def run_single_fit(
             'i0': args.grid_points + 2,
         }
 
+        # Shape priors for grid bounds: defaults, overridden per-name by CLI.
+        shape_priors_for_grid = {
+            name: dict(WIND_SHAPE_PRIORS[name])
+            for name in WIND_SHAPE_FIT.get(wind_model, [])
+        }
+        if shape_prior_overrides:
+            for name, override in shape_prior_overrides.items():
+                if name in shape_priors_for_grid:
+                    shape_priors_for_grid[name].update(override)
+
         model = PrecomputedModelGrid(
             band=band,
             flux_csv_path=args.flux_csv,
@@ -2271,6 +2372,9 @@ def run_single_fit(
             verbose=True,
             load_path=args.load_grid,
             sim_params=sim_params,
+            fit_wind_shape=fit_wind_shape,
+            shape_priors=shape_priors_for_grid,
+            shape_grid_points=getattr(args, 'shape_grid_points', 5),
         )
 
         if args.save_grid:
@@ -2437,18 +2541,11 @@ def replot_from_existing(
                   if n not in geom_names and n != 'log_f']
     saved_fit_wind_shape = bool(extra_dims) or fit_wind_shape
 
-    # Pick the model path: shape fits MUST use DirectLightCurveModel.
-    if saved_fit_wind_shape or args.no_grid:
-        print("\nUsing DirectLightCurveModel for replot.")
-        model = DirectLightCurveModel(
-            band=band,
-            flux_csv_path=args.flux_csv,
-            wind_model=wind_model,
-            dth=args.dth,
-            sim_params=sim_params,
-        )
-    else:
-        print("\nInitializing model grid for plotting...")
+    # Model for best-fit overlay.  Replotting doesn't need fast likelihood
+    # evaluation, so we default to the direct evaluator unless the user
+    # explicitly asked to reuse a precomputed grid (via --load-grid).
+    if args.load_grid:
+        print(f"\nLoading precomputed grid from {args.load_grid} for replot...")
         grid_points = {
             'd1': args.grid_points,
             'd2': args.grid_points,
@@ -2466,6 +2563,17 @@ def replot_from_existing(
             n_workers=args.n_workers,
             verbose=True,
             load_path=args.load_grid,
+            sim_params=sim_params,
+            fit_wind_shape=saved_fit_wind_shape,
+            shape_grid_points=getattr(args, 'shape_grid_points', 5),
+        )
+    else:
+        print("\nUsing DirectLightCurveModel for replot.")
+        model = DirectLightCurveModel(
+            band=band,
+            flux_csv_path=args.flux_csv,
+            wind_model=wind_model,
+            dth=args.dth,
             sim_params=sim_params,
         )
 
@@ -2589,8 +2697,9 @@ def main():
         help=(
             "Add the wind-shape parameters of the chosen --wind-model as free "
             "MCMC dimensions (smooth_pl: Rb, p; beta_law: beta; "
-            "confinement: fconf, ell). Forces --no-grid since the precomputed "
-            "grid is geometry-only. Override priors via --prior-Rb, --prior-p, "
+            "confinement: fconf, ell). Works with the precomputed grid "
+            "(grid axes are expanded automatically; tune --shape-grid-points) "
+            "or with --no-grid. Override priors via --prior-Rb, --prior-p, "
             "--prior-beta, --prior-fconf, --prior-ell."
         ),
     )
@@ -2704,7 +2813,16 @@ def main():
         "--grid-points",
         type=int,
         default=8,
-        help="Number of grid points per parameter for pre-computed grid"
+        help="Number of grid points per geometry parameter (d1, d2, r, R, i0) "
+             "in the pre-computed grid"
+    )
+    parser.add_argument(
+        "--shape-grid-points",
+        type=int,
+        default=5,
+        help="Number of grid points per wind-shape axis when --fit-wind-shape "
+             "is used with the precomputed grid (ignored without --fit-wind-shape "
+             "or with --no-grid). Default: 5"
     )
     parser.add_argument(
         "--dth",
@@ -2898,19 +3016,23 @@ def main():
 
     args = parser.parse_args()
 
-    # Auto-force --no-grid when fitting wind shape (the precomputed grid is
-    # geometry-only and cannot interpolate over additional shape dims).
-    if getattr(args, 'fit_wind_shape', False):
-        if args.load_grid or args.save_grid:
-            parser.error(
-                "--fit-wind-shape is incompatible with --load-grid/--save-grid; "
-                "the precomputed grid is geometry-only. Drop those flags or "
-                "the --fit-wind-shape flag."
+    # Warn on very large grids when fitting wind shape + lots of points.
+    if getattr(args, 'fit_wind_shape', False) and not args.no_grid:
+        wm = getattr(args, 'wind_model', 'smooth_pl')
+        shape_dims = len(WIND_SHAPE_FIT.get(wm, []))
+        total = (
+            args.grid_points ** 4
+            * max(5, args.grid_points // 2)
+            * (args.shape_grid_points ** shape_dims)
+        )
+        if shape_dims > 0:
+            print(
+                f"[notice] --fit-wind-shape with precomputed grid: "
+                f"geometry grid × {args.shape_grid_points}^{shape_dims} "
+                f"shape axes → ~{total:,} grid points to compute "
+                f"(use --no-grid for a quick direct MCMC, or --save-grid to "
+                f"cache for future runs)."
             )
-        if not args.no_grid:
-            print("[notice] --fit-wind-shape set: forcing --no-grid "
-                  "(direct simulate_lightcurve evaluation).")
-            args.no_grid = True
 
     # Build simulation parameters dict
     sim_params = {
