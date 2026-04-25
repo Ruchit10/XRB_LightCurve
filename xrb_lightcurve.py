@@ -1107,7 +1107,7 @@ def simulate_lightcurve(
             - flx: Raw (unscaled) mean wind LOS integral per phase
             - fl: Scaled nH values (1e22 cm^-2 units), mean(fl) = lam
             - nfl_{band}: Photon or energy flux per band (depending on flux_method)
-
+            
     Notes:
         - The column density integral (flx) has arbitrary units until scaled.
         - The scaling factor is computed as lam / mean(flx), so mean(fl) = lam.
@@ -1339,7 +1339,7 @@ def simulate_lightcurve(
         # Legacy hardcoded exponential coefficients (single wind model only)
         results["nfl_hard"] = 9.524 * np.exp(-fl * 0.057)
         results["nfl_soft"] = 9.3923 * np.exp(-fl * 2.5062)
-
+        
     elif flux_method == "interpolate":
         # Interpolate from CSV data
         if flux_csv_path is None:
@@ -1353,7 +1353,7 @@ def simulate_lightcurve(
                 )
             except Exception as e:
                 warnings.warn(f"Failed to interpolate flux for band '{band}': {e}")
-
+        
     elif flux_method == "refit":
         # Fit new exponentials to CSV data
         if flux_csv_path is None:
@@ -1365,7 +1365,7 @@ def simulate_lightcurve(
                 results[f"nfl_{band}"] = A * np.exp(-B * fl)
             except Exception as e:
                 warnings.warn(f"Failed to fit exponential for band '{band}': {e}")
-
+        
     else:
         raise ValueError(
             f"Invalid flux_method: {flux_method}. "
@@ -1721,7 +1721,7 @@ def main():
     # Default physical cutoff reproduces legacy behavior
     if args.Rmax is None:
         args.Rmax = 2.0 * (args.d1 + args.d2)
-
+    
     # Validate arguments
     if args.flux_method in ["interpolate", "refit"] and args.flux_csv is None:
         parser.error(f"--flux_csv is required when flux_method='{args.flux_method}'")

@@ -63,6 +63,7 @@ Usage:
 import argparse
 import copy
 import glob
+import multiprocessing as mp
 import os
 import time
 import warnings
@@ -131,6 +132,27 @@ from chandra_phase_analysis import (
     load_data as _load_data_base,
     phase_bin_data as _phase_bin_data_base,
 )
+
+
+def _init_numba_worker(max_numba_threads: int = 1):
+    """Pool worker initializer: set Numba thread count inside each worker process.
+
+    In `--no-grid` pooled mode, each worker runs full ``simulate_lightcurve``
+    calls that already use ``parallel=True`` / ``prange`` in ``xrb_lightcurve``.
+
+    - Too many threads per worker × many workers ⇒ severe oversubscription.
+    - Too few (e.g. 1) per worker ⇒ each LC evaluation is much slower, so
+      process-level parallelism barely beats serial ``32 × t_eval``.
+
+    The driver picks ``max_numba_threads`` (see ``--numba-threads-per-worker``
+    and its default ``auto`` ≈ ``cpu_count // pool_size``).
+    """
+    try:
+        import numba
+        numba.set_num_threads(max(1, int(max_numba_threads)))
+    except Exception:
+        # If numba is unavailable or thread control fails, proceed with defaults.
+        pass
 
 # Default priors based on IC 10 X-1 parameters
 DEFAULT_PRIORS = {
@@ -1456,6 +1478,7 @@ def run_mcmc(
     reparam: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
+    numba_threads_per_worker: Optional[int] = None,
 ) -> Tuple:
     """
     Run MCMC sampling with emcee or zeus.
@@ -1477,7 +1500,11 @@ def run_mcmc(
     progress : bool
         Show progress bar
     n_threads : int
-        Number of threads for parallel MCMC (1 = serial)
+        Number of worker processes for parallel MCMC (1 = serial).
+    numba_threads_per_worker : int or None
+        Numba threads inside each worker when ``n_threads > 1`` and the model is
+        ``DirectLightCurveModel``. ``None`` means auto:
+        ``max(1, cpu_count // n_threads)``.
     sampler_type : str
         'emcee' or 'zeus'
     likelihood : str
@@ -1526,6 +1553,32 @@ def run_mcmc(
         if pos[j, 2] >= pos[j, 3]:
             pos[j, 2] = pos[j, 3] * 0.1
 
+    # Auto-disable multiprocessing when using a PrecomputedModelGrid.
+    # Each evaluate() call is a microsecond-scale RegularGridInterpolator
+    # lookup, while the grid itself can be hundreds of MB to several GB.
+    # On macOS (and any system using the 'spawn' start method) multiprocessing
+    # would pickle and ship the entire grid to every worker on every step,
+    # which dwarfs the actual compute and makes the sampler appear hung.
+    if n_threads > 1 and isinstance(model, PrecomputedModelGrid):
+        try:
+            grid_bytes = model.flux_grid.nbytes
+        except Exception:
+            grid_bytes = 0
+        size_str = (
+            f" (~{grid_bytes / 1e6:.0f} MB flux_grid)"
+            if grid_bytes else ""
+        )
+        print(
+            f"\n[notice] --n-threads={n_threads} is being ignored because the "
+            f"model is a PrecomputedModelGrid{size_str}. Per-step lookups are "
+            f"already microsecond-scale, and multiprocessing would have to "
+            f"pickle/ship the entire grid to every worker on every step "
+            f"(this is what makes the progress bar appear stuck). "
+            f"Falling back to serial MCMC. "
+            f"For multi-process speedups, use --no-grid (DirectLightCurveModel)."
+        )
+        n_threads = 1
+
     parallel_info = f", {n_threads} threads" if n_threads > 1 else " (serial)"
     print(f"\nStarting MCMC ({sampler_type}) with {n_walkers} walkers, "
           f"{n_steps} steps{parallel_info}")
@@ -1545,31 +1598,51 @@ def run_mcmc(
 
     start_time = time.time()
 
-    if sampler_type == 'zeus':
-        if not HAS_ZEUS:
-            raise ImportError("zeus not installed. Install with: pip install zeus-mcmc")
-        sampler = zeus_sampler.EnsembleSampler(
-            n_walkers, n_dim, log_probability, args=log_prob_args
+    using_direct_model = isinstance(model, DirectLightCurveModel)
+    using_pool = n_threads > 1 and using_direct_model
+
+    if n_threads > 1 and not using_direct_model:
+        print(
+            f"\n[notice] --n-threads={n_threads} requested with model type "
+            f"{type(model).__name__}. Pooling is only enabled for "
+            f"DirectLightCurveModel (--no-grid); running serial."
         )
-        sampler.run_mcmc(pos, n_steps, progress=progress)
+        n_threads = 1
+        using_pool = False
+
+    if using_pool:
+        cpus = int(cpu_count() or 1)
+        if numba_threads_per_worker is None:
+            ntb = max(1, cpus // int(n_threads))
+        else:
+            ntb = max(1, int(numba_threads_per_worker))
+        print(
+            f"[info] Pooled MCMC: {n_threads} worker processes, "
+            f"numba.set_num_threads({ntb}) per worker "
+            f"(logical CPUs ≈ {cpus}; auto is cpus//workers)."
+        )
+        # 'spawn' is safest cross-platform and avoids inheriting heavy state.
+        mp_ctx = mp.get_context("spawn")
+        pool = mp_ctx.Pool(
+            processes=n_threads,
+            initializer=_init_numba_worker,
+            initargs=(ntb,),
+        )
     else:
-        if n_threads > 1:
-            from multiprocessing import Pool as MPPool
-            with MPPool(n_threads) as pool:
-                sampler = emcee.EnsembleSampler(
-                    n_walkers, n_dim, log_probability,
-                    args=log_prob_args, pool=pool,
-                )
-                if progress and HAS_TQDM:
-                    for _ in tqdm(sampler.sample(pos, iterations=n_steps),
-                                  total=n_steps, desc="MCMC Sampling"):
-                        pass
-                else:
-                    sampler.run_mcmc(pos, n_steps, progress=progress)
+        pool = None
+
+    try:
+        if sampler_type == 'zeus':
+            if not HAS_ZEUS:
+                raise ImportError("zeus not installed. Install with: pip install zeus-mcmc")
+            sampler = zeus_sampler.EnsembleSampler(
+                n_walkers, n_dim, log_probability, args=log_prob_args, pool=pool
+            )
+            sampler.run_mcmc(pos, n_steps, progress=progress)
         else:
             sampler = emcee.EnsembleSampler(
                 n_walkers, n_dim, log_probability,
-                args=log_prob_args,
+                args=log_prob_args, pool=pool,
             )
             if progress and HAS_TQDM:
                 for _ in tqdm(sampler.sample(pos, iterations=n_steps),
@@ -1577,6 +1650,10 @@ def run_mcmc(
                     pass
             else:
                 sampler.run_mcmc(pos, n_steps, progress=progress)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     elapsed = time.time() - start_time
 
@@ -1597,11 +1674,25 @@ def compute_statistics(
     samples: np.ndarray,
     param_names: List[str] = None,
     reparam: bool = False,
+    log_prob: Optional[np.ndarray] = None,
 ) -> Dict:
     """Compute summary statistics from MCMC samples.
 
     When *reparam* is True, derived ``d1`` and ``d2`` statistics are
     appended by transforming each sample: ``d1 = a*q``, ``d2 = a*(1-q)``.
+
+    Per-parameter ``median`` / ``mean`` / ``std`` are *marginal* summaries.
+    Note that medians of nonlinear combinations are not the combinations of
+    medians, e.g. ``median(a*q) != median(a) * median(q)``, so the ``median``
+    rows for ``a, q, d1, d2`` will not algebraically satisfy
+    ``d1 + d2 == a`` or ``d1 / (d1 + d2) == q`` in general (they will be
+    close only when posteriors are roughly symmetric and uncorrelated).
+
+    If *log_prob* is provided, a single self-consistent point estimate (MAP,
+    i.e. the sample with the highest log-probability) is added under the
+    ``'map'`` key of every parameter's stats dict. The MAP point *does*
+    satisfy ``d1 + d2 == a`` and ``d1 / (d1 + d2) == q`` exactly, since it
+    is a single sample.
     """
     if param_names is None:
         param_names = PARAM_NAMES
@@ -1633,6 +1724,23 @@ def compute_statistics(
                 'mean': np.mean(derived_vals),
                 'std': np.std(derived_vals),
                 'derived': True,
+            }
+
+    if log_prob is not None and len(log_prob) == len(samples):
+        finite = np.isfinite(log_prob)
+        if finite.any():
+            map_idx = int(np.argmax(np.where(finite, log_prob, -np.inf)))
+            map_sample = samples[map_idx]
+            for i, param in enumerate(param_names):
+                stats[param]['map'] = float(map_sample[i])
+            if reparam:
+                a_map = float(map_sample[0])
+                q_map = float(map_sample[1])
+                stats['d1']['map'] = a_map * q_map
+                stats['d2']['map'] = a_map * (1.0 - q_map)
+            stats['_map_meta'] = {
+                'index': map_idx,
+                'log_prob': float(log_prob[map_idx]),
             }
 
     return stats
@@ -1674,7 +1782,13 @@ def load_existing_results(
     # excluding bookkeeping columns like log_prob.
     loaded_names = [c for c in samples_df.columns if c != 'log_prob']
     samples = samples_df[loaded_names].values
-    stats = compute_statistics(samples, param_names=loaded_names, reparam=reparam)
+    log_prob_loaded = (
+        samples_df['log_prob'].values if 'log_prob' in samples_df.columns else None
+    )
+    stats = compute_statistics(
+        samples, param_names=loaded_names, reparam=reparam,
+        log_prob=log_prob_loaded,
+    )
 
     print(f"  Loaded {len(samples)} samples; columns: {loaded_names}")
 
@@ -1924,14 +2038,26 @@ def plot_best_fit(
     if param_names is None:
         param_names = PARAM_NAMES
 
-    # Always evaluate the model in physical (d1, d2, r, R, i0) space
+    # Prefer the algebraically self-consistent MAP point (single sample with
+    # the highest log-prob) when available; otherwise fall back to per-param
+    # medians. Note that median(d1) + median(d2) != median(a) in general
+    # (medians of nonlinear combinations are not the combinations of medians),
+    # so using medians here would produce a curve whose displayed parameters
+    # don't satisfy d1 + d2 = a or d1/(d1+d2) = q. The MAP point does.
+    use_map = all(
+        ('map' in stats[p]) for p in (PARAM_NAMES if not reparam else
+                                       ['r', 'R', 'i0', 'd1', 'd2'])
+        if p in stats
+    )
+    point_key = 'map' if use_map else 'median'
+
     if reparam:
-        best_d1 = stats['d1']['median']
-        best_d2 = stats['d2']['median']
-        best_params = [best_d1, best_d2, stats['r']['median'],
-                       stats['R']['median'], stats['i0']['median']]
+        best_d1 = stats['d1'][point_key]
+        best_d2 = stats['d2'][point_key]
+        best_params = [best_d1, best_d2, stats['r'][point_key],
+                       stats['R'][point_key], stats['i0'][point_key]]
     else:
-        best_params = [stats[p]['median'] for p in PARAM_NAMES]
+        best_params = [stats[p][point_key] for p in PARAM_NAMES]
 
     # Build best-fit wind_params if shape was fitted.
     best_R = best_params[3]
@@ -1939,7 +2065,7 @@ def plot_best_fit(
         best_wp = dict(WIND_SHAPE_FIXED.get(wind_model, {}))
         for sname in WIND_SHAPE_FIT[wind_model]:
             if sname in stats:
-                best_wp[sname] = float(stats[sname]['median'])
+                best_wp[sname] = float(stats[sname][point_key])
         if wind_model in ('beta_law', 'confinement'):
             best_wp['R_star'] = float(best_R)
     else:
@@ -1978,14 +2104,22 @@ def plot_best_fit(
     ax.legend(loc='best')
     ax.grid(alpha=0.3)
 
-    # Show all sampled parameters plus derived d1/d2 when reparameterized
+    # Show all sampled parameters plus derived d1/d2 when reparameterized.
+    # Display the point estimate that was actually used to evaluate the
+    # overlay (MAP if available, else median) and tag the median's symmetric
+    # 1-sigma uncertainty for context.
     display_params = list(param_names)
     if reparam:
         display_params += ['d1', 'd2']
-    param_text = '\n'.join([
-        f"{p}: {stats[p]['median']:.4f} +/- {(stats[p]['lower']+stats[p]['upper'])/2:.4f}"
-        for p in display_params if p in stats
-    ])
+    point_label = 'MAP' if point_key == 'map' else 'median'
+    rows = [f"point estimate: {point_label}"]
+    for p in display_params:
+        if p not in stats:
+            continue
+        s = stats[p]
+        sigma = (s['lower'] + s['upper']) / 2
+        rows.append(f"{p}: {s[point_key]:.4f}  (median +/- {sigma:.4f})")
+    param_text = '\n'.join(rows)
     ax.text(0.02, 0.98, param_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
@@ -2400,9 +2534,19 @@ def run_single_fit(
         reparam=reparam,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
+        numba_threads_per_worker=getattr(
+            args, "numba_threads_per_worker", None
+        ),
     )
 
-    stats = compute_statistics(samples, param_names=active_names, reparam=reparam)
+    try:
+        chain_log_prob_flat = sampler.get_log_prob(discard=args.n_burn, flat=True)
+    except Exception:
+        chain_log_prob_flat = None
+    stats = compute_statistics(
+        samples, param_names=active_names, reparam=reparam,
+        log_prob=chain_log_prob_flat,
+    )
     print_results(stats, band, wind_model, param_names=active_names, reparam=reparam)
     print_diagnostics(sampler, sampler_type=sampler_type, param_names=active_names)
 
@@ -2797,8 +2941,25 @@ def main():
         "--n-threads",
         type=int,
         default=1,
-        help="Number of threads for parallel MCMC sampling (1 = serial). "
-             "Note: With pre-computed grid, parallelization may not help much."
+        help="Number of worker processes for parallel MCMC sampling (1 = serial). "
+             "Only useful with --no-grid (DirectLightCurveModel), where each "
+             "log-likelihood call is ~63 ms. With a PrecomputedModelGrid the "
+             "per-step lookup is microseconds while the grid can be hundreds of "
+             "MB to several GB; multiprocessing would pickle/ship the entire "
+             "grid to each worker on every step (causing the progress bar to "
+             "hang), so this flag is auto-ignored in that case."
+    )
+    parser.add_argument(
+        "--numba-threads-per-worker",
+        type=int,
+        default=None,
+        metavar="N",
+        help="When using --no-grid with --n-threads>1, set Numba's thread count "
+             "inside each worker via numba.set_num_threads(N). Default (omit this "
+             "flag): auto = max(1, cpu_count // n_threads) so workers collectively "
+             "use about one thread per logical CPU without each worker running a "
+             "fully serial Numba kernel. Set explicitly if you tune "
+             "--n-threads for your machine."
     )
     parser.add_argument(
         "--compute-waic",
@@ -3186,19 +3347,63 @@ def main():
                 band, wind_model = key
                 f.write(f"{band.upper()} Band - {WIND_MODELS[wind_model]}\n")
                 f.write("-"*40 + "\n")
+
+                f.write("Marginal posterior (median +upper/-lower, 16/84 pct):\n")
                 for param in active_names:
                     if param in stats:
                         s = stats[param]
-                        f.write(f"{param}: {s['median']:.6f} (+{s['upper']:.6f}/-{s['lower']:.6f})\n")
+                        f.write(f"  {param}: {s['median']:.6f} "
+                                f"(+{s['upper']:.6f}/-{s['lower']:.6f})\n")
                 if reparam:
                     for derived in ('d1', 'd2'):
                         if derived in stats:
                             s = stats[derived]
-                            f.write(f"{derived} (derived): {s['median']:.6f} "
+                            f.write(f"  {derived} (derived): {s['median']:.6f} "
                                     f"(+{s['upper']:.6f}/-{s['lower']:.6f})\n")
+
+                # Self-consistent point estimate (single sample with max log-prob).
+                has_map = any(
+                    isinstance(stats.get(p), dict) and 'map' in stats[p]
+                    for p in active_names
+                )
+                if has_map:
+                    map_meta = stats.get('_map_meta', {})
+                    lp = map_meta.get('log_prob')
+                    lp_str = f"  (log_prob = {lp:.3f})" if lp is not None else ""
+                    f.write(f"Best-fit (MAP, max log-prob){lp_str}:\n")
+                    for param in active_names:
+                        if param in stats and 'map' in stats[param]:
+                            f.write(f"  {param}: {stats[param]['map']:.6f}\n")
+                    if reparam:
+                        for derived in ('d1', 'd2'):
+                            if derived in stats and 'map' in stats[derived]:
+                                f.write(
+                                    f"  {derived} (derived): "
+                                    f"{stats[derived]['map']:.6f}\n"
+                                )
+                    if reparam:
+                        a_map = stats['a']['map']
+                        d1_map = stats['d1']['map']
+                        d2_map = stats['d2']['map']
+                        f.write(
+                            f"  check: d1+d2 = {d1_map + d2_map:.6f} "
+                            f"(== a = {a_map:.6f}); "
+                            f"d1/(d1+d2) = "
+                            f"{d1_map / (d1_map + d2_map):.6f} "
+                            f"(== q = {stats['q']['map']:.6f})\n"
+                        )
+
                 if 'reduced_chi2' in stats:
                     f.write(f"Reduced chi-square: {stats['reduced_chi2']:.3f}\n")
                 f.write("\n")
+
+            f.write(
+                "Note: marginal medians of nonlinear combinations are not the\n"
+                "combinations of medians, so median(d1) + median(d2) need not\n"
+                "equal median(a), and median(d1)/(median(d1)+median(d2)) need\n"
+                "not equal median(q). The MAP block above is a single sample,\n"
+                "so those identities hold exactly.\n"
+            )
         
         print(f"\nSummary saved to: {summary_path}")
     

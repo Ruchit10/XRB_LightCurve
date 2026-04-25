@@ -54,3 +54,16 @@ python mcmc_lightcurve_fit.py \
 --prior-R 2.0,0.5,1.0,20.0 \
 --prior-d1 11.0,3.0,1.5,40.0 \
 --prior-d2 11.0,3.0,1.5,40.0
+
+# Latest (04/22/2026)
+python mcmc_lightcurve_fit.py \
+--band broad --wind-model smooth_pl --fit-wind-shape --reparam --compute-waic \
+--n-steps 5000 --no-grid --numba-threads-per-worker 8 --n-walkers 16 --n-burn 500 --flux-csv ./analyses/flux_vs_nH_tbabs_600bin_15803_broad.csv \
+--data-dir data/IC_10_X1_LC_CIAO/broad/single/ \
+--lam 0.533545 --obs-column flux_t --time-column t_raw \
+--n-phase-bins 150 --sampler zeus --dth 4.0 --likelihood jitter \
+--prior-i0 20.0,10.0,5.0,50.0 \
+--prior-r 0.01,1.0,0.001,10.0 \
+--prior-R 2.0,5.0,1.0,20.0 \
+--prior-d1 11.0,10.0,1.0,40.0 \
+--prior-d2 8.0,10.0,1.0,40.0 --prior-a 19.0,5.0,2.0,80.0 --prior-q 0.5,0.2,0.01,0.99 --prior-Rb 6.0,3.0,3.0,80.0 --prior-p 4.0,2.0,2.0,8.0
