@@ -1411,6 +1411,9 @@ def simulate_lightcurve(
 # about g's internal normalization.
 
 R_SUN_CM = 6.957e10  # 1 solar radius in cm
+M_H_G = 1.6726e-24  # hydrogen atom mass in g
+M_SUN_G = 1.989e33  # solar mass in g
+KM_TO_CM = 1.0e5  # 1 km in cm
 
 
 def compute_surface_density(
@@ -1459,6 +1462,97 @@ def compute_surface_density(
         )
     n0 = (float(lam) * 1e22) / (R_SUN_CM * flx_mean)
     return n0 * g_surface
+
+
+def compute_wind_normalization_constants(
+    lam: float,
+    flx_mean: float,
+    wind_model: str,
+    wind_params: Dict[str, float],
+    v_inf: Optional[float] = None,
+    mu: float = 1.4,
+) -> Dict[str, float]:
+    """
+    Back-calculate physical normalization constants for supported wind models.
+
+    The simulation evolves a dimensionless profile g(r) and enforces
+        mean(N_H) = lam * 1e22 cm^-2.
+    This implies a reference number density
+        n0 = lam * 1e22 / (R_sun * mean(flx_code)).
+
+    Using n0, this helper maps each model back to its physical normalization:
+      - smooth_pl: break density rho_b
+      - beta_law / confinement: Mdot/v_inf prefactor (and Mdot if v_inf supplied)
+
+    Args:
+        lam: Target mean column density in 1e22 cm^-2 units.
+        flx_mean: Mean of the raw dimensionless LOS integral (mean(sim_df["flx"])).
+        wind_model: One of "smooth_pl", "beta_law", "confinement".
+        wind_params: Wind-model parameter dictionary.
+        v_inf: Terminal velocity in km/s (optional; used for beta_law/confinement).
+        mu: Mean molecular weight for converting number to mass density.
+
+    Returns:
+        Dict of model-dependent normalization constants in physical units.
+    """
+    if flx_mean <= 0.0:
+        raise ValueError("flx_mean must be positive.")
+    if mu <= 0.0:
+        raise ValueError("mu must be positive.")
+
+    n0 = (float(lam) * 1e22) / (R_SUN_CM * float(flx_mean))
+    out: Dict[str, float] = {"n0_cm3": float(n0)}
+
+    if wind_model == "smooth_pl":
+        if "Rb" not in wind_params:
+            raise ValueError("wind_params for smooth_pl must include 'Rb'.")
+        Rb = float(wind_params["Rb"])
+        g_break = float(evaluate_g_profile(np.array([Rb]), wind_model, wind_params)[0])
+        if g_break <= 0.0:
+            raise ValueError(f"g(Rb={Rb}) is non-positive for smooth_pl.")
+        n_break = n0 * g_break
+        rho_b = mu * M_H_G * n_break
+        out["g_break"] = float(g_break)
+        out["n_break_cm3"] = float(n_break)
+        out["rho_b_g_cm3"] = float(rho_b)
+        return out
+
+    if wind_model in ("beta_law", "confinement"):
+        if "R_star" not in wind_params:
+            raise ValueError(f"wind_params for {wind_model} must include 'R_star'.")
+        R_star = float(wind_params["R_star"])
+        g_surface = float(
+            evaluate_g_profile(np.array([R_star]), wind_model, wind_params)[0]
+        )
+        if g_surface <= 0.0:
+            raise ValueError(
+                f"g(R_star={R_star}) is non-positive for wind_model='{wind_model}'."
+            )
+
+        n_surface = n0 * g_surface
+        rho_surface = mu * M_H_G * n_surface
+        mdot_over_vinf_cgs = mu * M_H_G * n0 * (4.0 * math.pi * (R_SUN_CM ** 2))
+
+        out["g_surface"] = float(g_surface)
+        out["n_surface_cm3"] = float(n_surface)
+        out["rho_surface_g_cm3"] = float(rho_surface)
+        out["mdot_over_vinf_g_per_cm"] = float(mdot_over_vinf_cgs)
+
+        if v_inf is not None:
+            v_inf_km_s = float(v_inf)
+            if v_inf_km_s <= 0.0:
+                raise ValueError("v_inf must be positive when provided.")
+            mdot_cgs = mdot_over_vinf_cgs * v_inf_km_s * KM_TO_CM
+            mdot_msun_yr = mdot_cgs * (3.1558e7 / M_SUN_G)
+            out["v_inf_km_s"] = float(v_inf_km_s)
+            out["mdot_g_s"] = float(mdot_cgs)
+            out["mdot_msun_yr"] = float(mdot_msun_yr)
+        return out
+
+    raise ValueError(
+        f"Unsupported wind_model '{wind_model}'. "
+        "Supported models are: smooth_pl, beta_law, confinement."
+    )
 
 
 def wind_density_posterior(
@@ -1548,6 +1642,110 @@ def wind_density_posterior(
         "p16": float(q16),
         "p84": float(q84),
     }
+
+
+def wind_normalization_constants_posterior(
+    lam_samples: np.ndarray,
+    flx_mean,
+    wind_model: str,
+    wind_params_samples,
+    v_inf_samples=None,
+    mu: float = 1.4,
+) -> Dict[str, Dict[str, object]]:
+    """
+    Posterior estimates of wind normalization constants from sampled parameters.
+
+    This wraps `compute_wind_normalization_constants` over posterior samples and
+    summarizes each returned constant with median/p16/p84.
+
+    Args:
+        lam_samples: 1-D array of lam posterior samples (1e22 cm^-2 units).
+        flx_mean: Scalar or 1-D array of mean(flx_code) per sample.
+        wind_model: One of "smooth_pl", "beta_law", "confinement".
+        wind_params_samples: Single dict (reused) or iterable of per-sample dicts.
+        v_inf_samples: Optional scalar/array terminal velocity values in km/s.
+        mu: Mean molecular weight for number-to-mass conversion.
+
+    Returns:
+        Mapping from constant name -> {"samples", "median", "p16", "p84"}.
+    """
+    lam_arr = np.asarray(lam_samples, dtype=float)
+    n_samples = lam_arr.size
+    if n_samples == 0:
+        raise ValueError("lam_samples must contain at least one sample.")
+
+    flx_arr = np.asarray(flx_mean, dtype=float)
+    if flx_arr.ndim == 0:
+        flx_arr = np.full(n_samples, float(flx_arr))
+    if flx_arr.size != n_samples:
+        raise ValueError(
+            f"flx_mean must be scalar or have length {n_samples}, got {flx_arr.size}"
+        )
+
+    if isinstance(wind_params_samples, dict):
+        params_iter = [wind_params_samples] * n_samples
+    else:
+        params_iter = list(wind_params_samples)
+        if len(params_iter) != n_samples:
+            raise ValueError(
+                f"wind_params_samples length {len(params_iter)} != n_samples {n_samples}"
+            )
+
+    if v_inf_samples is None:
+        v_inf_arr = np.array([None] * n_samples, dtype=object)
+    else:
+        v_inf_arr = np.asarray(v_inf_samples, dtype=float)
+        if v_inf_arr.ndim == 0:
+            v_inf_arr = np.full(n_samples, float(v_inf_arr))
+        if v_inf_arr.size != n_samples:
+            raise ValueError(
+                f"v_inf_samples must be scalar or have length {n_samples}, "
+                f"got {v_inf_arr.size}"
+            )
+
+    series: Optional[Dict[str, np.ndarray]] = None
+    for idx in range(n_samples):
+        try:
+            vals = compute_wind_normalization_constants(
+                lam=float(lam_arr[idx]),
+                flx_mean=float(flx_arr[idx]),
+                wind_model=wind_model,
+                wind_params=params_iter[idx],
+                v_inf=v_inf_arr[idx],
+                mu=mu,
+            )
+        except Exception:
+            continue
+
+        if series is None:
+            series = {k: np.full(n_samples, np.nan, dtype=float) for k in vals.keys()}
+        for key, value in vals.items():
+            if key not in series:
+                series[key] = np.full(n_samples, np.nan, dtype=float)
+            series[key][idx] = float(value)
+
+    if series is None:
+        return {}
+
+    summary: Dict[str, Dict[str, object]] = {}
+    for key, arr in series.items():
+        good = np.isfinite(arr)
+        if not np.any(good):
+            summary[key] = {
+                "samples": arr,
+                "median": np.nan,
+                "p16": np.nan,
+                "p84": np.nan,
+            }
+            continue
+        q16, q50, q84 = np.percentile(arr[good], [16.0, 50.0, 84.0])
+        summary[key] = {
+            "samples": arr,
+            "median": float(q50),
+            "p16": float(q16),
+            "p84": float(q84),
+        }
+    return summary
 
 
 def main():

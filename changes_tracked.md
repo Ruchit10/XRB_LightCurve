@@ -95,7 +95,7 @@ phase using the ephemeris (`REF_EPOCH = 278801348 s`, `P = 125431 s`) and
 fits simulation models via χ² minimization with optional phase-shift /
 scale rescaling. Auto-detects flux columns (`nfl_*`, `pho_count_*`),
 handles both standard whitespace and CIAO `#Columns:` formats, supports
-multi-column simultaneous fitting and master-file verification.
+multi-column simultaneous fitting.
 
 ---
 

@@ -55,6 +55,10 @@ Usage:
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
         --wind-model smooth_pl --sampler zeus --likelihood jitter
 
+    # CIAO flux_t workflow (raw 100s bins + jitter)
+    python mcmc_lightcurve_fit.py --band soft --flux-csv data_flux_vs_nH.csv \\
+        --obs-column flux_t --time-column t_raw --no-phase-bin --likelihood jitter
+
     # Custom shape-param prior (e.g. tighter Rb)
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
         --wind-model smooth_pl --fit-wind-shape --prior-Rb 5.0,1.0,2.0,15.0
@@ -414,7 +418,7 @@ def load_observed_lightcurves(
     band: str,
     data_dir: str = "data/IC_10_X1_LC",
     flux_column: str = "FLUX",
-    error_column: str = "FLUX_ERR",
+    error_column: Optional[str] = None,
     time_column: str = None
 ) -> pd.DataFrame:
     """Load all observed light curve files for a given energy band.
@@ -432,8 +436,8 @@ def load_observed_lightcurves(
         The function tries several sub-directory conventions automatically.
     flux_column : str
         Column name for flux values in the data files
-    error_column : str
-        Column name for flux errors in the data files
+    error_column : str, optional
+        Column name for flux errors in the data files. If None, auto-detect.
     time_column : str, optional
         Column name for timestamps (e.g. 'TIME', 't_raw'). Auto-detected if None.
 
@@ -463,8 +467,12 @@ def load_observed_lightcurves(
     else:
         combined['phase'] = frac((combined['time'] - REF_EPOCH) / ORBITAL_PERIOD)
 
+    n_before = len(combined)
     valid = (combined['flux'] > 0) & np.isfinite(combined['flux']) & np.isfinite(combined['time'])
     combined = combined.loc[valid].reset_index(drop=True)
+    n_dropped = n_before - len(combined)
+    if n_dropped > 0:
+        print(f"Dropped {n_dropped} zero/non-finite flux rows before fitting")
 
     n_files = len(glob.glob(os.path.join(band_dir, "*.txt")))
     print(f"Loaded {len(combined)} data points from {n_files} file(s) for {band} band")
@@ -1808,6 +1816,7 @@ def compute_chi2_for_samples(
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
+    likelihood: str = 'chi2',
 ) -> None:
     """
     Compute chi-square for all (or a subset of) MCMC samples and save to compressed file.
@@ -1877,7 +1886,14 @@ def compute_chi2_for_samples(
                 model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
 
             if np.all(np.isfinite(model_flux)):
-                chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
+                if likelihood == 'jitter' and active_names is not None and 'log_f' in active_names:
+                    idx_logf = active_names.index('log_f')
+                    f = np.exp(sample_params[idx_logf])
+                    sigma2 = obs_err ** 2 + (f * model_flux) ** 2
+                    sigma2 = np.maximum(sigma2, np.finfo(float).eps)
+                    chi2 = np.sum((obs_flux - model_flux) ** 2 / sigma2)
+                else:
+                    chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
                 red_chi2 = chi2 / dof if dof > 0 else np.nan
             else:
                 chi2 = np.nan
@@ -2014,6 +2030,8 @@ def plot_best_fit(
     param_names: List[str] = None,
     reparam: bool = False,
     fit_wind_shape: bool = False,
+    is_binned: bool = True,
+    likelihood: str = 'chi2',
 ):
     """
     Plot observed data with best-fit model overlay.
@@ -2083,19 +2101,61 @@ def plot_best_fit(
         obs_model = eval_fn(*best_params, obs_phase, wind_params=best_wp)
     except TypeError:
         obs_model = eval_fn(*best_params, obs_phase)
-    chi2 = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
+    f_best = None
+    if likelihood == 'jitter' and 'log_f' in stats and point_key in stats['log_f']:
+        f_best = float(np.exp(stats['log_f'][point_key]))
+        sigma2 = obs_err ** 2 + (f_best * obs_model) ** 2
+        sigma2 = np.maximum(sigma2, np.finfo(float).eps)
+        chi2 = np.sum((obs_flux - obs_model) ** 2 / sigma2)
+    else:
+        chi2 = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
     n_phys = len(param_names) - (1 if 'log_f' in param_names else 0)
     dof = len(obs_flux) - n_phys
     red_chi2 = chi2 / dof if dof > 0 else np.nan
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    ax.errorbar(obs_phase, obs_flux, yerr=obs_err, fmt='o',
-                markersize=4, alpha=0.7, label='Observed (phase-binned)',
-                capsize=2, elinewidth=1, color='C0', zorder=5)
+    if is_binned:
+        ax.errorbar(
+            obs_phase, obs_flux, yerr=obs_err, fmt='o',
+            markersize=4, alpha=0.7, label='Observed (phase-binned)',
+            capsize=2, elinewidth=1, color='C0', zorder=5
+        )
+    else:
+        ax.scatter(
+            obs_phase, obs_flux, s=10, alpha=0.25, color='C0',
+            label='Observed (raw 100s)', zorder=4
+        )
 
     ax.plot(model_phases, model_flux, 'r-', lw=2,
             label=f'Best-fit model ({WIND_MODELS[wind_model]})', zorder=10)
+
+    if (not is_binned) and likelihood == 'jitter' and (f_best is not None):
+        phase_mod = np.mod(obs_phase, 1.0)
+        edges = np.linspace(0.0, 1.0, 121)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        idx = np.digitize(phase_mod, edges) - 1
+        idx = np.clip(idx, 0, len(centers) - 1)
+        sigma_repr = np.full_like(centers, np.nan, dtype=float)
+        for j in range(len(centers)):
+            in_bin = idx == j
+            if np.any(in_bin):
+                sigma_repr[j] = np.nanmedian(obs_err[in_bin])
+        global_sigma = np.nanmedian(obs_err[np.isfinite(obs_err) & (obs_err > 0)])
+        if not np.isfinite(global_sigma):
+            global_sigma = np.finfo(float).eps
+        sigma_repr = np.where(np.isfinite(sigma_repr), sigma_repr, global_sigma)
+        sigma_obs_model = np.interp(model_phases, centers, sigma_repr)
+        sigma_eff_model = np.sqrt(sigma_obs_model ** 2 + (f_best * model_flux) ** 2)
+        ax.fill_between(
+            model_phases,
+            model_flux - sigma_eff_model,
+            model_flux + sigma_eff_model,
+            alpha=0.18,
+            color='C3',
+            label='1-sigma effective (jitter)',
+            zorder=6,
+        )
 
     ax.set_xlabel('Orbital Phase', fontsize=12)
     ax.set_ylabel('Flux (erg/cm²/s)', fontsize=12)
@@ -2119,6 +2179,8 @@ def plot_best_fit(
         s = stats[p]
         sigma = (s['lower'] + s['upper']) / 2
         rows.append(f"{p}: {s[point_key]:.4f}  (median +/- {sigma:.4f})")
+    if f_best is not None:
+        rows.append(f"f: {f_best:.4f}  (from log_f)")
     param_text = '\n'.join(rows)
     ax.text(0.02, 0.98, param_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', fontfamily='monospace',
@@ -2426,6 +2488,7 @@ def run_single_fit(
     reparam: bool = False,
     fit_wind_shape: bool = False,
     shape_prior_overrides: Dict[str, Dict] = None,
+    is_binned: bool = True,
 ) -> Tuple[Dict, object]:
     """Run MCMC fit for a single band/wind_model combination."""
 
@@ -2585,6 +2648,8 @@ def run_single_fit(
             param_names=active_names,
             reparam=reparam,
             fit_wind_shape=fit_wind_shape,
+            is_binned=is_binned,
+            likelihood=likelihood,
         )
         stats['reduced_chi2'] = red_chi2
 
@@ -2631,6 +2696,7 @@ def run_single_fit(
             wind_model=wind_model,
             fit_wind_shape=fit_wind_shape,
             active_names=active_names,
+            likelihood=likelihood,
         )
 
     stats['wind_model'] = wind_model
@@ -2649,6 +2715,7 @@ def replot_from_existing(
     reparam: bool = False,
     fit_wind_shape: bool = False,
     shape_prior_overrides: Dict[str, Dict] = None,
+    is_binned: bool = True,
 ) -> Optional[Dict]:
     """Regenerate plots from existing MCMC results without re-running MCMC.
 
@@ -2722,6 +2789,14 @@ def replot_from_existing(
         )
 
     suffix = f"{band}_{wind_model}"
+    saved_likelihood = getattr(args, 'likelihood', 'chi2')
+    chain_path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
+    if os.path.exists(chain_path):
+        try:
+            _meta = np.load(chain_path, allow_pickle=True)
+            saved_likelihood = str(_meta.get('likelihood', saved_likelihood))
+        except Exception:
+            pass
 
     if not args.no_plots:
         # Use the loaded column names as the active set.
@@ -2750,12 +2825,13 @@ def replot_from_existing(
             param_names=active_names,
             reparam=reparam,
             fit_wind_shape=saved_fit_wind_shape,
+            is_binned=is_binned,
+            likelihood=saved_likelihood,
         )
         stats['reduced_chi2'] = red_chi2
 
     compute_waic = getattr(args, 'compute_waic', False)
     if HAS_ARVIZ or compute_waic:
-        chain_path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
         if os.path.exists(chain_path):
             print(f"\nLoading saved chain from: {chain_path}")
             chain_data = np.load(chain_path, allow_pickle=True)
@@ -2800,6 +2876,7 @@ def replot_from_existing(
             wind_model=wind_model,
             fit_wind_shape=saved_fit_wind_shape,
             active_names=loaded_names,
+            likelihood=saved_likelihood,
         )
 
     return stats
@@ -2867,7 +2944,8 @@ def main():
         type=str,
         default=None,
         help="Column name for errors. If omitted, auto-detected from --obs-column "
-             "(e.g. FLUX -> FLUX_ERR, rate -> rate_err)"
+             "(e.g. FLUX -> FLUX_ERR, rate -> rate_err). For proportional "
+             "columns like flux_t, errors are inferred from rate_err when possible."
     )
     parser.add_argument(
         "--time-column",
@@ -2884,7 +2962,8 @@ def main():
     parser.add_argument(
         "--no-phase-bin",
         action="store_true",
-        help="Use raw 100s binned data without phase binning"
+        help="Use raw 100s data without phase binning. Usually best paired with "
+             "--likelihood jitter."
     )
     
     # MCMC options
@@ -3271,10 +3350,11 @@ def main():
             obs_df = load_observed_lightcurves(
                 band, args.data_dir,
                 flux_column=args.obs_column,
-                error_column=args.obs_error_column or args.obs_column + "_ERR",
+                error_column=args.obs_error_column,
                 time_column=args.time_column,
             )
 
+            is_binned = not args.no_phase_bin
             if not args.no_phase_bin:
                 obs_df = phase_bin_data(obs_df, n_bins=args.n_phase_bins)
 
@@ -3284,9 +3364,16 @@ def main():
 
             invalid_err = ~np.isfinite(obs_err) | (obs_err <= 0)
             if np.any(invalid_err):
-                obs_err[invalid_err] = np.abs(obs_flux[invalid_err]) * 0.1
+                valid_err = obs_err[np.isfinite(obs_err) & (obs_err > 0)]
+                if len(valid_err) > 0:
+                    err_floor = float(np.median(valid_err))
+                else:
+                    err_floor = float(np.finfo(float).eps)
+                obs_err[invalid_err] = np.maximum(
+                    np.abs(obs_flux[invalid_err]) * 0.1, err_floor
+                )
                 warnings.warn(
-                    f"Replaced {np.sum(invalid_err)} invalid errors with 10% of flux"
+                    f"Replaced {np.sum(invalid_err)} invalid errors with max(10% flux, median valid error)"
                 )
 
             for wind_model in wind_models:
@@ -3302,6 +3389,7 @@ def main():
                             reparam=reparam,
                             fit_wind_shape=fit_wind_shape,
                             shape_prior_overrides=shape_prior_overrides,
+                            is_binned=is_binned,
                         )
                         if stats is not None:
                             all_results[key] = stats
@@ -3315,6 +3403,7 @@ def main():
                             reparam=reparam,
                             fit_wind_shape=fit_wind_shape,
                             shape_prior_overrides=shape_prior_overrides,
+                            is_binned=is_binned,
                         )
                         all_results[key] = stats
 

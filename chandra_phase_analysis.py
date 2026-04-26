@@ -6,13 +6,12 @@ This script converts observational X-ray light-curve data to orbital phase and
 fits simulation models to the observations.
 
 Features:
-1.  Reads all .txt files from a data directory (or a specified master file)
+1.  Reads all .txt files from a data directory
 2.  Converts observation times to orbital phase using the reference epoch and
     orbital period
-3.  Optionally verifies that individual files are contained in a master file
-4.  Produces scatter plots of count-rate versus orbital phase
-5.  Fits simulation models to observations via chi-square minimization
-6.  Supports multiple energy bands and automatically detects available flux columns
+3.  Produces scatter plots of count-rate versus orbital phase
+4.  Fits simulation models to observations via chi-square minimization
+5.  Supports multiple energy bands and automatically detects available flux columns
 
 File Format:
   Whitespace-delimited text files with three columns:
@@ -24,9 +23,6 @@ Examples
 ~~~~~~~~
 # Load all .txt files from a custom directory:
 $ python chandra_phase_analysis.py --data-dir my_observations --output phase_plot.png
-
-# Use a specific master file:
-$ python chandra_phase_analysis.py --data-dir data --master-file Chandra.txt --output plot.png
 
 # Use specific observation column (e.g., NET_RATE instead of default):
 $ python chandra_phase_analysis.py --data-dir data --obs-column NET_RATE --output plot.png
@@ -148,6 +144,54 @@ def validate_sim_columns(df: pd.DataFrame, requested_columns: List[str]) -> List
         )
     
     return valid_columns
+
+
+def _derive_err_from_rate_err(df: pd.DataFrame, obs_col: str) -> Optional[pd.Series]:
+    """Derive observable errors from rate_err for proportional columns.
+
+    This supports CIAO style files where ``flux_t`` exists but ``flux_t_err``
+    does not. For rows with finite, positive ``rate`` we use:
+
+        err_obs = rate_err * (obs / rate)
+
+    For rows where that ratio is undefined, fall back to a robust file-level
+    conversion factor median(obs/rate) computed from valid rows.
+    """
+    rate_col = None
+    rate_err_col = None
+
+    for col in df.columns:
+        if col.upper() == "RATE":
+            rate_col = col
+            break
+
+    for col in df.columns:
+        if col.upper() in {"RATE_ERR", "ERR_RATE", "COUNT_RATE_ERR"}:
+            rate_err_col = col
+            break
+
+    if rate_col is None or rate_err_col is None:
+        return None
+
+    obs_vals = pd.to_numeric(df[obs_col], errors="coerce")
+    rate_vals = pd.to_numeric(df[rate_col], errors="coerce")
+    rate_err_vals = pd.to_numeric(df[rate_err_col], errors="coerce")
+
+    valid_ratio = (
+        np.isfinite(obs_vals.to_numpy())
+        & np.isfinite(rate_vals.to_numpy())
+        & (rate_vals.to_numpy() > 0.0)
+    )
+    if not np.any(valid_ratio):
+        return None
+
+    ratio = np.full(len(df), np.nan, dtype=float)
+    ratio[valid_ratio] = obs_vals.to_numpy()[valid_ratio] / rate_vals.to_numpy()[valid_ratio]
+    cf = float(np.nanmedian(ratio[valid_ratio]))
+    ratio = np.where(np.isfinite(ratio), ratio, cf)
+
+    derived = rate_err_vals.to_numpy() * ratio
+    return pd.Series(derived, index=df.index, dtype=float)
 
 
 def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None, phase_column: Optional[str] = None) -> pd.DataFrame:
@@ -339,6 +383,10 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
                     
                     if error_col:
                         result_df['error'] = df[error_col]
+                    else:
+                        derived = _derive_err_from_rate_err(df, actual_obs_column)
+                        if derived is not None:
+                            result_df['error'] = derived
                     
                     # Determine phase: use pre-computed if available, otherwise compute from time
                     if phase_col:
@@ -370,16 +418,13 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
 # Data loading helpers
 # -----------------------------------------------------------------------------
 
-def load_data(data_dir: str, master_file: Optional[str] = None, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None, phase_column: Optional[str] = None) -> pd.DataFrame:
+def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None, phase_column: Optional[str] = None) -> pd.DataFrame:
     """Load observational data from *data_dir*.
 
     Parameters
     ----------
     data_dir : str
         Directory containing observation text files
-    master_file : str, optional
-        Name of master file (if it exists). If provided and exists, only this file is loaded.
-        If None, all .txt files in the directory are loaded.
     obs_column : str, default "rate"
         Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE", "ECF", "flux_t")
     obs_error_column : str, optional
@@ -393,15 +438,6 @@ def load_data(data_dir: str, master_file: Optional[str] = None, obs_column: str 
     -------
     DataFrame with columns: time, rate (containing the specified observable), error (optional), phase, obs
     """
-    # Check for master file if specified
-    if master_file:
-        master_path = os.path.join(data_dir, master_file)
-        if os.path.isfile(master_path):
-            print(f"Using master file: {master_path}")
-            return read_observation(master_path, "master", obs_column, obs_error_column, time_column, phase_column)
-        else:
-            print(f"Warning: Master file '{master_file}' not found in {data_dir}, loading all files instead.")
-
     # Load all .txt files from directory
     txt_pattern = os.path.join(data_dir, "*.txt")
     files: List[str] = sorted(glob.glob(txt_pattern))
@@ -517,53 +553,6 @@ def phase_bin_data(
               f"(avg {len(df)/n_bins:.1f} points/bin)")
     
     return result
-
-
-def verify_master_contains_individual(data_dir: str, master_file: str = "Chandra.txt") -> None:
-    """Check that every timestamp in individual .txt files appears in the master file.
-    
-    Parameters
-    ----------
-    data_dir : str
-        Directory containing observation files
-    master_file : str, optional
-        Name of the master file to verify against (default: "Chandra.txt")
-    """
-    master_path = os.path.join(data_dir, master_file)
-    if not os.path.isfile(master_path):
-        print(f"No master file '{master_file}' found; skipping verification.")
-        return
-
-    print(f"Verifying individual files against master file: {master_file}\n")
-    master_times = (
-        pd.read_csv(master_path, delim_whitespace=True, header=None, usecols=[0])[0]
-        .round(6)
-        .astype(str)
-        .tolist()
-    )
-    master_set = set(master_times)
-
-    # Get all .txt files except the master file
-    all_files = glob.glob(os.path.join(data_dir, "*.txt"))
-    individual_files = [fp for fp in all_files if os.path.basename(fp) != master_file]
-    
-    if not individual_files:
-        print("No individual files found to verify.")
-        return
-
-    for fp in sorted(individual_files):
-        ind_times = (
-            pd.read_csv(fp, delim_whitespace=True, header=None, usecols=[0])[0]
-            .round(6)
-            .astype(str)
-            .tolist()
-        )
-        missing = [t for t in ind_times if t not in master_set]
-        if missing:
-            print(f"⚠️  {os.path.basename(fp)}: {len(missing)} point(s) NOT in master file.")
-        else:
-            print(f"✓ {os.path.basename(fp)} fully contained in master file.")
-    print()
 
 
 # -----------------------------------------------------------------------------
@@ -844,22 +833,10 @@ def main() -> None:
         help="Directory containing observation text files (.txt format with time, rate, error columns).",
     )
     parser.add_argument(
-        "--master-file",
-        type=str,
-        default=None,
-        help="Name of master file in data directory (e.g., 'Chandra.txt'). If specified and exists, "
-             "only this file is loaded. If not specified, all .txt files in the directory are loaded.",
-    )
-    parser.add_argument(
         "--output",
         type=str,
         default=None,
         help="Output filename for the generated plot. If omitted, the plot is shown interactively.",
-    )
-    parser.add_argument(
-        "--verify-master",
-        action="store_true",
-        help="Verify that each individual .txt file is contained in the master file (requires --master-file).",
     )
     parser.add_argument(
         "--sim-file",
@@ -941,11 +918,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.verify_master:
-        if not args.master_file:
-            parser.error("--verify-master requires --master-file to be specified.")
-        verify_master_contains_individual(args.data_dir, args.master_file)
-
     # Determine observation column to use
     obs_column = args.obs_column if args.obs_column else "rate"
     obs_error_column = args.obs_error_column
@@ -963,7 +935,13 @@ def main() -> None:
     if phase_column:
         print(f"Using pre-computed phase column: {phase_column}")
     
-    df = load_data(args.data_dir, args.master_file, obs_column, obs_error_column, time_column, phase_column)
+    df = load_data(
+        args.data_dir,
+        obs_column=obs_column,
+        obs_error_column=obs_error_column,
+        time_column=time_column,
+        phase_column=phase_column,
+    )
     print(f"Loaded {len(df)} data point(s) from {df['obs'].nunique()} observation(s).")
     
     # Remove observations with zero or NaN flux (gaps in observations)
