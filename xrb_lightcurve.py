@@ -66,6 +66,10 @@ WIND_MODEL_PARAM_KEYS: Dict[str, Tuple[str, ...]] = {
     "confinement": ("R_star", "fconf", "ell"),
 }
 
+# Cache flux-vs-NH interpolation/refit inputs keyed by (csv_path, flux_type)
+# to avoid repeated CSV read/sort/interpolator creation during MCMC.
+_FLUX_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
+
 
 def pack_wind_params(
     wind_model: str,
@@ -329,6 +333,12 @@ def _simulate_phases_numba(
     n_r_ring = 10
     d2h_rad = d2h_deg * math.pi / 180.0
     th_step_rad = 2.0 * math.pi / (n_th - 1)
+    th_vals = np.empty(n_th, dtype=np.float64)
+    cos_th_vals = np.empty(n_th, dtype=np.float64)
+    for i_th in range(n_th):
+        th_val = i_th * th_step_rad
+        th_vals[i_th] = th_val
+        cos_th_vals[i_th] = math.cos(th_val)
 
     # Pre-compute r-grid (shared across phases, no shared writes)
     r_min = r / 10.0
@@ -387,8 +397,8 @@ def _simulate_phases_numba(
         sum_A = 0.0
 
         for i_th in range(n_th):
-            th_val = i_th * th_step_rad
-            cos_th = math.cos(th_val)
+            th_val = th_vals[i_th]
+            cos_th = cos_th_vals[i_th]
             for i_r in range(n_r_ring):
                 r_val = r_min + i_r * r_step
 
@@ -871,6 +881,92 @@ def load_flux_vs_nh_csv(
     return df, bands
 
 
+def _build_flux_context(csv_path: str, flux_type: str) -> Dict[str, object]:
+    """Build/load cached interpolation and refit context for flux conversion."""
+    key = (os.path.abspath(csv_path), str(flux_type))
+    cached = _FLUX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    df, bands = load_flux_vs_nh_csv(csv_path, verbose=False)
+    band_data: Dict[str, Dict[str, object]] = {}
+
+    # Sort once and reuse for all bands.
+    df_sorted = df.sort_values("nH_1e22")
+    nh_base = df_sorted["nH_1e22"].values
+    valid_nh = np.isfinite(nh_base) & (nh_base > 0)
+    nh_base = nh_base[valid_nh]
+
+    for band in bands:
+        flux_col = f"flux_{band}_{flux_type}"
+        if flux_col not in df_sorted.columns:
+            continue
+        flux_vals = df_sorted[flux_col].values
+        flux_vals = flux_vals[valid_nh]
+        valid = np.isfinite(flux_vals) & (flux_vals > 0)
+        if not np.any(valid):
+            continue
+
+        nh_csv = nh_base[valid]
+        flux_csv = flux_vals[valid]
+        interp_func = interp1d(
+            np.log10(nh_csv),
+            np.log10(flux_csv),
+            kind="linear",
+            fill_value="extrapolate",
+            bounds_error=False,
+        )
+        band_data[band] = {
+            "nh": nh_csv,
+            "flux": flux_csv,
+            "interp_loglog": interp_func,
+        }
+
+    ctx: Dict[str, object] = {
+        "csv_path": key[0],
+        "flux_type": key[1],
+        "bands": sorted(list(band_data.keys())),
+        "band_data": band_data,
+        "exp_fit": {},
+    }
+    _FLUX_CACHE[key] = ctx
+    return ctx
+
+
+def _interpolate_flux_from_context(
+    nh_1e22: np.ndarray,
+    ctx: Dict[str, object],
+    band: str,
+    warn_extrapolation: bool = True,
+) -> np.ndarray:
+    """Interpolate using prebuilt flux context."""
+    band_data = ctx["band_data"]  # type: ignore[index]
+    if band not in band_data:
+        available = sorted(list(band_data.keys()))
+        raise ValueError(
+            f"Band '{band}' not present in flux cache for flux_type='{ctx['flux_type']}'. "
+            f"Available bands: {available}"
+        )
+
+    info = band_data[band]
+    nh_csv = info["nh"]
+    interp_func = info["interp_loglog"]
+    nh_min, nh_max = float(np.min(nh_csv)), float(np.max(nh_csv))
+    nh_1e22 = np.asarray(nh_1e22)
+
+    if warn_extrapolation and (
+        np.any(nh_1e22 < nh_min) or np.any(nh_1e22 > nh_max)
+    ):
+        warnings.warn(
+            f"Some nH values are outside CSV range [{nh_min:.3f}, {nh_max:.3f}] 1e22 cm^-2 for band '{band}'. "
+            f"Extrapolation will be used (fill_value='extrapolate')."
+        )
+
+    nh_1e22_safe = np.clip(nh_1e22, 1e-6, 1e6)
+    log_flux = interp_func(np.log10(nh_1e22_safe))
+    return 10 ** log_flux
+
+
 def interpolate_flux_from_nh(
     nh_1e22: np.ndarray,
     df: pd.DataFrame,
@@ -1174,20 +1270,17 @@ def simulate_lightcurve(
         if verbose:
             print(f"Computed {n_iterations} phases via mega-kernel "
                   f"(GL quadrature, parallel over phases)")
-
-        results_list = list(zip(
-            flx_arr.tolist(),
-            icd_arr.tolist(),
-            A2_arr.tolist(),
-            gma_values.tolist(),
-            deg_arr.tolist(),
-            phase_arr.tolist(),
-            time_arr.tolist(),
-            l_arr.tolist(),
-            L_arr.tolist(),
-            h_arr.tolist(),
-            [bool(x) for x in eclipsed_arr.tolist()],
-        ))
+        flx = np.asarray(flx_arr, dtype=float)
+        icd_vals = np.asarray(icd_arr, dtype=float)
+        A2_vals = np.asarray(A2_arr, dtype=float)
+        ph = np.asarray(gma_values, dtype=float)
+        deg = np.asarray(deg_arr, dtype=float)
+        phase = np.asarray(phase_arr, dtype=float)
+        time = np.asarray(time_arr, dtype=float)
+        l3 = np.asarray(l_arr, dtype=float)
+        L3 = np.asarray(L_arr, dtype=float)
+        h3 = np.asarray(h_arr, dtype=float)
+        is_eclipsed = np.asarray(eclipsed_arr, dtype=bool)
         # Skip the per-phase python loop below
         _skip_python_loop = True
     else:
@@ -1306,10 +1399,11 @@ def simulate_lightcurve(
                     if verbose:
                         print(f"Phase: {out[4]:.2f} degrees")
 
-    # Unpack (now includes is_eclipsed flag)
-    flx, icd_vals, A2_vals, ph, deg, phase, time, l3, L3, h3, is_eclipsed = map(
-        list, zip(*results_list)
-    )
+    if not _skip_python_loop:
+        # Unpack (now includes is_eclipsed flag)
+        flx, icd_vals, A2_vals, ph, deg, phase, time, l3, L3, h3, is_eclipsed = map(
+            np.asarray, zip(*results_list)
+        )
 
     # Create results DataFrame
     results = pd.DataFrame(
@@ -1324,7 +1418,7 @@ def simulate_lightcurve(
             "l3": l3,
             "L3": L3,
             "h3": h3,
-            "is_eclipsed": is_eclipsed,
+            "is_eclipsed": np.asarray(is_eclipsed, dtype=bool),
         }
     )
 
@@ -1344,11 +1438,14 @@ def simulate_lightcurve(
         # Interpolate from CSV data
         if flux_csv_path is None:
             raise ValueError("flux_csv_path required when flux_method='interpolate'")
-        df_flux, available_bands = load_flux_vs_nh_csv(flux_csv_path, verbose=verbose)
+        ctx = _build_flux_context(flux_csv_path, flux_type=flux_type)
+        available_bands = ctx["bands"]  # type: ignore[index]
+        if verbose:
+            print(f"Detected energy bands in CSV: {', '.join(available_bands)}")
         for band in available_bands:
             try:
-                results[f"nfl_{band}"] = interpolate_flux_from_nh(
-                    fl, df_flux, band, flux_type=flux_type,
+                results[f"nfl_{band}"] = _interpolate_flux_from_context(
+                    fl, ctx, band,
                     warn_extrapolation=verbose,
                 )
             except Exception as e:
@@ -1358,10 +1455,21 @@ def simulate_lightcurve(
         # Fit new exponentials to CSV data
         if flux_csv_path is None:
             raise ValueError("flux_csv_path required when flux_method='refit'")
-        df_flux, available_bands = load_flux_vs_nh_csv(flux_csv_path, verbose=verbose)
+        ctx = _build_flux_context(flux_csv_path, flux_type=flux_type)
+        available_bands = ctx["bands"]  # type: ignore[index]
+        exp_fit_cache = ctx["exp_fit"]  # type: ignore[index]
+        if verbose:
+            print(f"Detected energy bands in CSV: {', '.join(available_bands)}")
+        # Keep behavior identical to existing fit_exponential_to_csv by
+        # constructing the same validated DataFrame once.
+        df_flux, _ = load_flux_vs_nh_csv(flux_csv_path, verbose=False)
         for band in available_bands:
             try:
-                A, B = fit_exponential_to_csv(df_flux, band, flux_type=flux_type)
+                if band in exp_fit_cache:
+                    A, B = exp_fit_cache[band]
+                else:
+                    A, B = fit_exponential_to_csv(df_flux, band, flux_type=flux_type)
+                    exp_fit_cache[band] = (A, B)
                 results[f"nfl_{band}"] = A * np.exp(-B * fl)
             except Exception as e:
                 warnings.warn(f"Failed to fit exponential for band '{band}': {e}")

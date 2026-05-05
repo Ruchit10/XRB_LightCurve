@@ -65,6 +65,7 @@ Usage:
 """
 
 import argparse
+import csv
 import copy
 import glob
 import multiprocessing as mp
@@ -580,6 +581,31 @@ def _compute_single_model(args):
         return None
 
 
+def _interp_periodic_phases(
+    obs_phases: np.ndarray,
+    model_phase: np.ndarray,
+    model_flux: np.ndarray,
+) -> np.ndarray:
+    """Interpolate periodic model flux to observation phases.
+
+    Uses a monotonic fast path and falls back to sorting when needed.
+    """
+    if model_phase.size == 0:
+        return np.full_like(obs_phases, np.nan, dtype=float)
+
+    if np.all(np.diff(model_phase) >= 0):
+        phase_sorted = model_phase
+        flux_sorted = model_flux
+    else:
+        sort_idx = np.argsort(model_phase)
+        phase_sorted = model_phase[sort_idx]
+        flux_sorted = model_flux[sort_idx]
+
+    phase_ext = np.concatenate([phase_sorted - 1.0, phase_sorted, phase_sorted + 1.0])
+    flux_ext = np.concatenate([flux_sorted, flux_sorted, flux_sorted])
+    return np.interp(obs_phases, phase_ext, flux_ext)
+
+
 class PrecomputedModelGrid:
     """Pre-computed grid of model light curves for fast MCMC evaluation.
 
@@ -615,6 +641,7 @@ class PrecomputedModelGrid:
         fit_wind_shape: bool = False,
         shape_priors: Dict[str, Dict] = None,
         shape_grid_points: int = 5,
+        grid_dtype: str = "float64",
     ):
         """Initialize and pre-compute the model grid (or load from file).
 
@@ -644,6 +671,7 @@ class PrecomputedModelGrid:
         self.fit_wind_shape = bool(fit_wind_shape)
         self.shape_priors = shape_priors if shape_priors is not None else WIND_SHAPE_PRIORS
         self.shape_grid_points = int(shape_grid_points)
+        self.grid_dtype = np.dtype(grid_dtype)
 
         if self.wind_model not in WIND_MODELS:
             raise ValueError(
@@ -771,29 +799,38 @@ class PrecomputedModelGrid:
         if self.verbose:
             print(f"Computing {len(param_combos)} valid parameter combinations...")
 
+        shape = tuple(axis_lens) + (len(self.phase_grid),)
+        self.flux_grid = np.full(shape, np.nan, dtype=self.grid_dtype)
+
         if self.n_workers > 1:
             with Pool(self.n_workers) as pool:
+                result_iter = pool.imap(_compute_single_model, param_combos)
                 if HAS_TQDM:
-                    results = list(tqdm(
-                        pool.imap(_compute_single_model, param_combos),
+                    result_iter = tqdm(
+                        result_iter,
                         total=len(param_combos),
-                        desc="Building model grid"
-                    ))
-                else:
-                    results = pool.map(_compute_single_model, param_combos)
+                        desc="Building model grid",
+                    )
+                for index, flux in zip(valid_index_tuples, result_iter):
+                    if flux is not None:
+                        self.flux_grid[index + (slice(None),)] = np.asarray(
+                            flux, dtype=self.grid_dtype
+                        )
         else:
             if HAS_TQDM:
-                results = [_compute_single_model(args)
-                           for args in tqdm(param_combos, desc="Building model grid")]
+                iterator = tqdm(
+                    zip(valid_index_tuples, param_combos),
+                    total=len(param_combos),
+                    desc="Building model grid",
+                )
             else:
-                results = [_compute_single_model(args) for args in param_combos]
-
-        shape = tuple(axis_lens) + (len(self.phase_grid),)
-        self.flux_grid = np.full(shape, np.nan)
-
-        for index, flux in zip(valid_index_tuples, results):
-            if flux is not None:
-                self.flux_grid[index + (slice(None),)] = flux
+                iterator = zip(valid_index_tuples, param_combos)
+            for index, args in iterator:
+                flux = _compute_single_model(args)
+                if flux is not None:
+                    self.flux_grid[index + (slice(None),)] = np.asarray(
+                        flux, dtype=self.grid_dtype
+                    )
 
         if self.verbose:
             elapsed = time.time() - start_time
@@ -805,13 +842,15 @@ class PrecomputedModelGrid:
 
     def _setup_interpolators(self):
         """Set up a single ND interpolator over (axes..., phase)."""
-        flux_grid_clean = self.flux_grid.copy()
-        if np.any(np.isnan(flux_grid_clean)):
-            flux_grid_clean = np.where(
-                np.isnan(flux_grid_clean),
-                np.nanmean(flux_grid_clean),
-                flux_grid_clean,
-            )
+        flux_grid_clean = self.flux_grid
+        nan_mask = np.isnan(flux_grid_clean)
+        if np.any(nan_mask):
+            fill_val = np.nanmean(flux_grid_clean)
+            if np.isnan(fill_val):
+                fill_val = 0.0
+            # Copy only when we actually need to patch NaNs.
+            flux_grid_clean = np.array(flux_grid_clean, copy=True)
+            flux_grid_clean[nan_mask] = fill_val
 
         interp_axes = tuple(self.param_grids[name] for name in self.axis_names) \
             + (self.phase_grid,)
@@ -848,6 +887,7 @@ class PrecomputedModelGrid:
             band=self.band,
             wind_model=self.wind_model,
             dth=self.dth,
+            grid_dtype=np.array(str(self.grid_dtype)),
             axis_names=np.array(self.axis_names, dtype=str),
             shape_axes=np.array(self.shape_axes, dtype=str),
             fit_wind_shape=np.array(self.fit_wind_shape),
@@ -882,6 +922,13 @@ class PrecomputedModelGrid:
         data = np.load(filepath, allow_pickle=True)
 
         self.flux_grid = data['flux_grid']
+        if 'grid_dtype' in data:
+            try:
+                self.grid_dtype = np.dtype(str(data['grid_dtype']))
+            except Exception:
+                self.grid_dtype = self.flux_grid.dtype
+        else:
+            self.grid_dtype = self.flux_grid.dtype
         self.phase_grid = data['phase_grid']
 
         # Determine the loaded axis layout.  New grids write an explicit
@@ -1077,16 +1124,7 @@ class PrecomputedModelGrid:
 
         model_phase = results['phase'].values
         model_flux = results[flux_column].values
-        sort_idx = np.argsort(model_phase)
-
-        phase_ext = np.concatenate([
-            model_phase[sort_idx] - 1,
-            model_phase[sort_idx],
-            model_phase[sort_idx] + 1,
-        ])
-        flux_ext = np.tile(model_flux[sort_idx], 3)
-
-        return np.interp(obs_phases, phase_ext, flux_ext)
+        return _interp_periodic_phases(obs_phases, model_phase, model_flux)
 
 
 # =============================================================================
@@ -1181,23 +1219,7 @@ class DirectLightCurveModel:
 
         model_phase = results['phase'].values
         model_flux = results[self.flux_column].values
-
-        sort_idx = np.argsort(model_phase)
-        model_phase_sorted = model_phase[sort_idx]
-        model_flux_sorted = model_flux[sort_idx]
-
-        phase_extended = np.concatenate([
-            model_phase_sorted - 1,
-            model_phase_sorted,
-            model_phase_sorted + 1,
-        ])
-        flux_extended = np.concatenate([
-            model_flux_sorted,
-            model_flux_sorted,
-            model_flux_sorted,
-        ])
-
-        return np.interp(obs_phases, phase_extended, flux_extended)
+        return _interp_periodic_phases(obs_phases, model_phase, model_flux)
 
 
 # =============================================================================
@@ -1268,6 +1290,7 @@ def log_likelihood_chi2(
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
+    obs_err2: np.ndarray = None,
 ) -> float:
     """Standard Gaussian log-likelihood (chi-squared)."""
     model_flux = _evaluate_model(
@@ -1277,7 +1300,9 @@ def log_likelihood_chi2(
     )
     if model_flux is None:
         return -np.inf
-    chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
+    if obs_err2 is None:
+        obs_err2 = obs_err ** 2
+    chi2 = np.sum((obs_flux - model_flux) ** 2 / obs_err2)
     return -0.5 * chi2
 
 
@@ -1291,6 +1316,8 @@ def log_likelihood_jitter(
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
+    obs_err2: np.ndarray = None,
+    jitter_logf_index: Optional[int] = None,
 ) -> float:
     """Gaussian log-likelihood with a free fractional systematic error term.
 
@@ -1305,12 +1332,16 @@ def log_likelihood_jitter(
     )
     if model_flux is None:
         return -np.inf
-    if active_names is not None and 'log_f' in active_names:
+    if jitter_logf_index is not None:
+        idx_logf = int(jitter_logf_index)
+    elif active_names is not None and 'log_f' in active_names:
         idx_logf = active_names.index('log_f')
     else:
         idx_logf = 5  # legacy default
     f = np.exp(theta[idx_logf])
-    sigma2 = obs_err ** 2 + (f * model_flux) ** 2
+    if obs_err2 is None:
+        obs_err2 = obs_err ** 2
+    sigma2 = obs_err2 + (f * model_flux) ** 2
     return -0.5 * np.sum((obs_flux - model_flux) ** 2 / sigma2 + np.log(sigma2))
 
 
@@ -1325,6 +1356,7 @@ def log_likelihood_studentt(
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
+    log_obs_err: np.ndarray = None,
 ) -> float:
     """Student-t log-likelihood (heavier tails than Gaussian).
 
@@ -1337,12 +1369,14 @@ def log_likelihood_studentt(
     )
     if model_flux is None:
         return -np.inf
+    if log_obs_err is None:
+        log_obs_err = np.log(obs_err)
     resid = (obs_flux - model_flux) / obs_err
     ll = (
         gammaln(0.5 * (nu + 1))
         - gammaln(0.5 * nu)
         - 0.5 * np.log(nu * np.pi)
-        - np.log(obs_err)
+        - log_obs_err
         - 0.5 * (nu + 1) * np.log(1.0 + resid ** 2 / nu)
     )
     return float(np.sum(ll))
@@ -1433,6 +1467,7 @@ def log_probability(
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
+    like_terms: Dict[str, object] = None,
 ) -> float:
     """Log posterior = log prior + log likelihood."""
     lp = log_prior(
@@ -1448,18 +1483,26 @@ def log_probability(
         fit_wind_shape=fit_wind_shape,
         active_names=active_names,
     )
+    like_terms = like_terms or {}
+    obs_err2 = like_terms.get('obs_err2')
+    log_obs_err = like_terms.get('log_obs_err')
+    jitter_logf_index = like_terms.get('jitter_logf_index')
     if likelihood == 'jitter':
         ll = log_likelihood_jitter(
             theta, model, obs_phase, obs_flux, obs_err, **common_kwargs,
+            obs_err2=obs_err2,
+            jitter_logf_index=jitter_logf_index,
         )
     elif likelihood == 'studentt':
         ll = log_likelihood_studentt(
             theta, model, obs_phase, obs_flux, obs_err,
             nu=studentt_nu, **common_kwargs,
+            log_obs_err=log_obs_err,
         )
     else:
         ll = log_likelihood_chi2(
             theta, model, obs_phase, obs_flux, obs_err, **common_kwargs,
+            obs_err2=obs_err2,
         )
 
     return lp + ll
@@ -1599,9 +1642,28 @@ def run_mcmc(
     print(f"Initial parameter values (first walker): {pos[0]}")
 
     log_prob_args = (
+        # Precomputed invariants to reduce per-call overhead in likelihood eval.
+        # Keep formulas unchanged; only move repeated allocations/lookups out of
+        # the hot loop.
+        # `jitter_logf_index` only used for jitter likelihood.
+        #
+        # Values are passed as a dict to keep backward-compatible call ordering.
+        #
+        # NOTE: not including constants dropped in existing formulas.
+        #
+        # fmt: off
         model, obs_phase, obs_flux, obs_err,
         priors, likelihood, studentt_nu, reparam,
         wind_model, fit_wind_shape, active_names,
+        {
+            'obs_err2': obs_err ** 2,
+            'log_obs_err': np.log(obs_err),
+            'jitter_logf_index': (
+                active_names.index('log_f')
+                if ('log_f' in active_names) else None
+            ),
+        },
+        # fmt: on
     )
 
     start_time = time.time()
@@ -1754,6 +1816,31 @@ def compute_statistics(
     return stats
 
 
+def save_samples_csv_chunked(
+    samples: np.ndarray,
+    param_names: List[str],
+    output_path: str,
+    log_prob: Optional[np.ndarray] = None,
+    chunk_size: int = 50000,
+):
+    """Write sample table to CSV in chunks to limit peak memory."""
+    headers = list(param_names) + (["log_prob"] if log_prob is not None else [])
+    with open(output_path, "w", newline="") as fout:
+        writer = csv.writer(fout)
+        writer.writerow(headers)
+        n_rows = len(samples)
+        for start in range(0, n_rows, int(chunk_size)):
+            stop = min(start + int(chunk_size), n_rows)
+            block = samples[start:stop]
+            if log_prob is not None:
+                lp_block = log_prob[start:stop]
+                for row, lp in zip(block, lp_block):
+                    writer.writerow(list(np.asarray(row, dtype=float)) + [float(lp)])
+            else:
+                for row in block:
+                    writer.writerow(list(np.asarray(row, dtype=float)))
+
+
 def load_existing_results(
     output_dir: str,
     band: str,
@@ -1859,6 +1946,7 @@ def compute_chi2_for_samples(
     dof = len(obs_flux) - n_phys
 
     results = []
+    use_jitter = (likelihood == 'jitter' and active_names is not None and 'log_f' in active_names)
 
     if HAS_TQDM and verbose:
         iterator = tqdm(sample_indices, desc="Computing χ²")
@@ -1886,25 +1974,41 @@ def compute_chi2_for_samples(
                 model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
 
             if np.all(np.isfinite(model_flux)):
-                if likelihood == 'jitter' and active_names is not None and 'log_f' in active_names:
+                # Always compute classical chi2 on measurement errors for
+                # comparability across likelihood choices.
+                chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
+                red_chi2 = chi2 / dof if dof > 0 else np.nan
+
+                # For jitter runs, also compute the effective-variance version
+                # used in the likelihood; this can be much smaller than 1.
+                chi2_eff = np.nan
+                red_chi2_eff = np.nan
+                if use_jitter:
                     idx_logf = active_names.index('log_f')
                     f = np.exp(sample_params[idx_logf])
                     sigma2 = obs_err ** 2 + (f * model_flux) ** 2
                     sigma2 = np.maximum(sigma2, np.finfo(float).eps)
-                    chi2 = np.sum((obs_flux - model_flux) ** 2 / sigma2)
-                else:
-                    chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
-                red_chi2 = chi2 / dof if dof > 0 else np.nan
+                    chi2_eff = np.sum((obs_flux - model_flux) ** 2 / sigma2)
+                    red_chi2_eff = chi2_eff / dof if dof > 0 else np.nan
             else:
                 chi2 = np.nan
                 red_chi2 = np.nan
+                chi2_eff = np.nan
+                red_chi2_eff = np.nan
         except Exception:
             chi2 = np.nan
             red_chi2 = np.nan
+            chi2_eff = np.nan
+            red_chi2_eff = np.nan
 
-        results.append([idx, d1, d2, r, R, i0, chi2, red_chi2])
+        if use_jitter:
+            results.append([idx, d1, d2, r, R, i0, chi2, red_chi2, chi2_eff, red_chi2_eff])
+        else:
+            results.append([idx, d1, d2, r, R, i0, chi2, red_chi2])
 
     columns = ['sample_idx', 'd1', 'd2', 'r', 'R', 'i0', 'chi2', 'reduced_chi2']
+    if use_jitter:
+        columns += ['chi2_eff', 'reduced_chi2_eff']
     results_df = pd.DataFrame(results, columns=columns)
     
     # Save to file (compressed if .gz extension)
@@ -2102,16 +2206,18 @@ def plot_best_fit(
     except TypeError:
         obs_model = eval_fn(*best_params, obs_phase)
     f_best = None
+    chi2_obs = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
+    chi2_eff = np.nan
     if likelihood == 'jitter' and 'log_f' in stats and point_key in stats['log_f']:
         f_best = float(np.exp(stats['log_f'][point_key]))
         sigma2 = obs_err ** 2 + (f_best * obs_model) ** 2
         sigma2 = np.maximum(sigma2, np.finfo(float).eps)
-        chi2 = np.sum((obs_flux - obs_model) ** 2 / sigma2)
-    else:
-        chi2 = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
+        chi2_eff = np.sum((obs_flux - obs_model) ** 2 / sigma2)
+    chi2 = chi2_obs
     n_phys = len(param_names) - (1 if 'log_f' in param_names else 0)
     dof = len(obs_flux) - n_phys
     red_chi2 = chi2 / dof if dof > 0 else np.nan
+    red_chi2_eff = chi2_eff / dof if (dof > 0 and np.isfinite(chi2_eff)) else np.nan
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -2159,8 +2265,15 @@ def plot_best_fit(
 
     ax.set_xlabel('Orbital Phase', fontsize=12)
     ax.set_ylabel('Flux (erg/cm²/s)', fontsize=12)
-    ax.set_title(f'{band.upper()} Band - {wind_model.upper()} Wind '
-                 f'(χ²/dof = {red_chi2:.2f})', fontsize=14)
+    if np.isfinite(red_chi2) and red_chi2 < 1e-2:
+        red_chi2_label = f"{red_chi2:.2e}"
+    else:
+        red_chi2_label = f"{red_chi2:.3f}"
+    ax.set_title(
+        f'{band.upper()} Band - {wind_model.upper()} Wind '
+        f'(χ²/dof = {red_chi2_label})',
+        fontsize=14
+    )
     ax.legend(loc='best')
     ax.grid(alpha=0.3)
 
@@ -2181,6 +2294,8 @@ def plot_best_fit(
         rows.append(f"{p}: {s[point_key]:.4f}  (median +/- {sigma:.4f})")
     if f_best is not None:
         rows.append(f"f: {f_best:.4f}  (from log_f)")
+        if np.isfinite(red_chi2_eff):
+            rows.append(f"reduced_chi2_eff: {red_chi2_eff:.3e}")
     param_text = '\n'.join(rows)
     ax.text(0.02, 0.98, param_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', fontfamily='monospace',
@@ -2312,6 +2427,75 @@ def compute_pointwise_loglik(
     return log_lik[valid]
 
 
+def compute_bic_metrics(
+    samples_flat: np.ndarray,
+    param_names: List[str],
+    model,
+    obs_phase: np.ndarray,
+    obs_flux: np.ndarray,
+    obs_err: np.ndarray,
+    likelihood: str = 'chi2',
+    studentt_nu: float = 5.0,
+    reparam: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    log_prob_flat: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Compute BIC from the best posterior point under the selected likelihood."""
+    if samples_flat is None or len(samples_flat) == 0:
+        return {}
+
+    theta_source = "median_fallback"
+    theta_hat = np.median(samples_flat, axis=0)
+
+    lp = log_prob_flat
+    if lp is not None and len(lp) == len(samples_flat):
+        finite = np.isfinite(lp)
+        if np.any(finite):
+            idx = int(np.argmax(np.where(finite, lp, -np.inf)))
+            theta_hat = samples_flat[idx]
+            theta_source = "map_log_prob"
+
+    like_kwargs = dict(
+        reparam=reparam,
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
+        active_names=param_names,
+    )
+    obs_err2 = obs_err ** 2
+    log_obs_err = np.log(obs_err)
+    if likelihood == 'jitter':
+        logL_hat = log_likelihood_jitter(
+            theta_hat, model, obs_phase, obs_flux, obs_err,
+            obs_err2=obs_err2,
+            jitter_logf_index=(param_names.index('log_f') if 'log_f' in param_names else None),
+            **like_kwargs,
+        )
+    elif likelihood == 'studentt':
+        logL_hat = log_likelihood_studentt(
+            theta_hat, model, obs_phase, obs_flux, obs_err,
+            nu=studentt_nu, log_obs_err=log_obs_err, **like_kwargs,
+        )
+    else:
+        logL_hat = log_likelihood_chi2(
+            theta_hat, model, obs_phase, obs_flux, obs_err,
+            obs_err2=obs_err2, **like_kwargs,
+        )
+
+    k = int(len(param_names))
+    n = int(len(obs_flux))
+    if n <= 0 or not np.isfinite(logL_hat):
+        return {}
+    bic = k * np.log(n) - 2.0 * float(logL_hat)
+    return {
+        "bic": float(bic),
+        "logL_hat": float(logL_hat),
+        "k_params": float(k),
+        "n_obs": float(n),
+        "theta_source": theta_source,
+    }
+
+
 def _build_inference_data(posterior_dict, log_lik_dict=None):
     """Construct an ArviZ inference object from plain numpy dicts.
 
@@ -2359,17 +2543,17 @@ def run_arviz_diagnostics(
     obs_err: np.ndarray = None,
     likelihood: str = 'chi2',
     studentt_nu: float = 5.0,
-    compute_waic: bool = False,
-    n_samples_waic: int = 200,
+    compute_bic: bool = False,
     output_dir: str = None,
     suffix: str = '',
     chain: np.ndarray = None,
     samples_flat: np.ndarray = None,
+    log_prob_flat: np.ndarray = None,
     reparam: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
 ):
-    """Run ArviZ convergence diagnostics and optionally WAIC/LOO.
+    """Run ArviZ convergence diagnostics and optionally BIC.
 
     Accepts either a live *sampler* object or pre-saved arrays
     (*chain* and/or *samples_flat*) so diagnostics can be run
@@ -2388,9 +2572,9 @@ def run_arviz_diagnostics(
 
     Returns the ArviZ inference object (or None if ArviZ is unavailable).
     """
-    if not HAS_ARVIZ:
+    if not HAS_ARVIZ and not compute_bic:
         print("arviz not installed. Install with: pip install arviz")
-        return None
+        return {"idata": None, "bic": {}}
     if param_names is None:
         param_names = PARAM_NAMES
 
@@ -2406,69 +2590,61 @@ def run_arviz_diagnostics(
 
     if chain is None:
         print("No chain data available for ArviZ diagnostics.")
-        return None
+        return {"idata": None, "bic": {}}
 
     # posterior_dict: ArviZ wants (chain=walkers, draw=steps)
     posterior_dict = {
         name: chain[:, :, i].T for i, name in enumerate(param_names)
     }
 
-    log_lik_dict = None
-    if compute_waic and model is not None and samples_flat is not None:
-        print(f"Computing per-point log-likelihoods for WAIC/LOO ({n_samples_waic} samples)...")
-        ll = compute_pointwise_loglik(
-            samples_flat, model, obs_phase, obs_flux, obs_err,
-            likelihood=likelihood, studentt_nu=studentt_nu,
-            n_samples=n_samples_waic,
+    idata = None
+    summary = None
+    if HAS_ARVIZ:
+        idata = _build_inference_data(posterior_dict, None)
+        print("\n--- ArviZ Summary ---")
+        summary = az.summary(idata)
+        print(summary)
+
+    bic_info = {}
+    if compute_bic and model is not None and samples_flat is not None:
+        if log_prob_flat is None and sampler is not None:
+            try:
+                log_prob_flat = sampler.get_log_prob(discard=n_burn, flat=True)
+            except Exception:
+                log_prob_flat = None
+        bic_info = compute_bic_metrics(
+            samples_flat=samples_flat,
+            param_names=param_names,
+            model=model,
+            obs_phase=obs_phase,
+            obs_flux=obs_flux,
+            obs_err=obs_err,
+            likelihood=likelihood,
+            studentt_nu=studentt_nu,
             reparam=reparam,
             wind_model=wind_model,
             fit_wind_shape=fit_wind_shape,
-            active_names=param_names,
+            log_prob_flat=log_prob_flat,
         )
-        if ll.shape[0] > 10:
-            log_lik_dict = {"obs": ll[np.newaxis, :, :]}
+        if bic_info:
+            print(
+                "\nBIC: {bic:.3f}  (logL_hat={logL_hat:.3f}, k={k_params:.0f}, n={n_obs:.0f}, source={theta_source})".format(
+                    **bic_info
+                )
+            )
 
-    idata = _build_inference_data(posterior_dict, log_lik_dict)
-
-    print("\n--- ArviZ Summary ---")
-    summary = az.summary(idata)
-    print(summary)
-
-    has_ll = (
-        hasattr(idata, "log_likelihood")
-        or (hasattr(idata, "children") and "log_likelihood" in idata.children)
-    )
-    if has_ll:
-        if hasattr(az, "waic"):
-            try:
-                waic = az.waic(idata)
-                waic_val = getattr(waic, "elpd_waic", None) or getattr(waic, "waic", None)
-                waic_se = getattr(waic, "se", getattr(waic, "waic_se", None))
-                print(f"\nWAIC: {waic_val:.2f}" + (f" +/- {waic_se:.2f}" if waic_se else ""))
-            except Exception as e:
-                print(f"WAIC computation failed: {e}")
-        else:
-            print("\nWAIC: not available in this ArviZ version (removed in 1.0); using LOO instead.")
-        try:
-            loo = az.loo(idata)
-            loo_val = getattr(loo, "elpd", None) or getattr(loo, "elpd_loo", None) or getattr(loo, "loo", None)
-            loo_se = getattr(loo, "se", getattr(loo, "loo_se", None))
-            if loo_val is not None:
-                msg = f"LOO:  {loo_val:.2f}"
-                if loo_se is not None:
-                    msg += f" +/- {loo_se:.2f}"
-                print(msg)
-            else:
-                print(f"LOO:  {loo}")
-        except Exception as e:
-            print(f"LOO computation failed: {e}")
-
-    if output_dir:
+    if output_dir and summary is not None:
         csv_path = os.path.join(output_dir, f"{suffix}_arviz_summary.csv" if suffix else "arviz_summary.csv")
         summary.to_csv(csv_path)
         print(f"ArviZ summary saved to: {csv_path}")
+    if output_dir and bic_info:
+        metrics_path = os.path.join(
+            output_dir, f"{suffix}_model_metrics.csv" if suffix else "model_metrics.csv"
+        )
+        pd.DataFrame([bic_info]).to_csv(metrics_path, index=False)
+        print(f"Model metrics saved to: {metrics_path}")
 
-    return idata
+    return {"idata": idata, "bic": bic_info}
 
 
 # =============================================================================
@@ -2572,6 +2748,7 @@ def run_single_fit(
             fit_wind_shape=fit_wind_shape,
             shape_priors=shape_priors_for_grid,
             shape_grid_points=getattr(args, 'shape_grid_points', 5),
+            grid_dtype=getattr(args, 'grid_dtype', 'float64'),
         )
 
         if args.save_grid:
@@ -2613,18 +2790,22 @@ def run_single_fit(
     print_results(stats, band, wind_model, param_names=active_names, reparam=reparam)
     print_diagnostics(sampler, sampler_type=sampler_type, param_names=active_names)
 
-    compute_waic = getattr(args, 'compute_waic', False)
-    run_arviz_diagnostics(
+    compute_bic_flag = bool(getattr(args, 'compute_bic', False))
+    diag_out = run_arviz_diagnostics(
         sampler, active_names, args.n_burn,
         model=model, obs_phase=obs_phase, obs_flux=obs_flux, obs_err=obs_err,
         likelihood=likelihood, studentt_nu=studentt_nu,
-        compute_waic=compute_waic,
+        compute_bic=compute_bic_flag,
         output_dir=args.output_dir,
         suffix=f"{band}_{wind_model}",
+        log_prob_flat=chain_log_prob_flat,
         reparam=reparam,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
     )
+    bic_info = (diag_out or {}).get("bic", {})
+    if bic_info:
+        stats.update(bic_info)
 
     # Generate file suffix
     suffix = f"{band}_{wind_model}"
@@ -2653,17 +2834,31 @@ def run_single_fit(
         )
         stats['reduced_chi2'] = red_chi2
 
-    samples_df = pd.DataFrame(samples, columns=active_names)
     try:
         log_prob = sampler.get_log_prob(discard=args.n_burn, flat=True)
-        samples_df['log_prob'] = log_prob
     except Exception:
-        pass
-    samples_df.to_csv(
-        os.path.join(args.output_dir, f"{suffix}_samples.csv"),
-        index=False
-    )
-    print(f"Samples saved to: {args.output_dir}/{suffix}_samples.csv")
+        log_prob = None
+
+    samples_csv_path = os.path.join(args.output_dir, f"{suffix}_samples.csv")
+    if not getattr(args, "no_csv_output", False):
+        save_samples_csv_chunked(
+            samples=samples,
+            param_names=active_names,
+            output_path=samples_csv_path,
+            log_prob=log_prob,
+            chunk_size=getattr(args, "csv_chunk_size", 50000),
+        )
+        print(f"Samples saved to: {samples_csv_path}")
+
+    if getattr(args, "compact_output", False):
+        samples_npz_path = os.path.join(args.output_dir, f"{suffix}_samples.npz")
+        np.savez_compressed(
+            samples_npz_path,
+            samples=samples,
+            param_names=np.array(active_names, dtype=str),
+            log_prob=(log_prob if log_prob is not None else np.array([])),
+        )
+        print(f"Compact samples saved to: {samples_npz_path}")
 
     try:
         chain_full = sampler.get_chain(discard=args.n_burn)
@@ -2680,6 +2875,10 @@ def run_single_fit(
             reparam=reparam,
             wind_model=wind_model,
             fit_wind_shape=fit_wind_shape,
+            bic=(bic_info.get("bic") if bic_info else np.nan),
+            logL_hat=(bic_info.get("logL_hat") if bic_info else np.nan),
+            k_params=(bic_info.get("k_params") if bic_info else np.nan),
+            n_obs=(bic_info.get("n_obs") if bic_info else np.nan),
         )
         print(f"Full chain saved to: {chain_path}")
     except Exception as e:
@@ -2777,6 +2976,7 @@ def replot_from_existing(
             sim_params=sim_params,
             fit_wind_shape=saved_fit_wind_shape,
             shape_grid_points=getattr(args, 'shape_grid_points', 5),
+            grid_dtype=getattr(args, 'grid_dtype', 'float64'),
         )
     else:
         print("\nUsing DirectLightCurveModel for replot.")
@@ -2830,12 +3030,13 @@ def replot_from_existing(
         )
         stats['reduced_chi2'] = red_chi2
 
-    compute_waic = getattr(args, 'compute_waic', False)
-    if HAS_ARVIZ or compute_waic:
+    compute_bic_flag = bool(getattr(args, 'compute_bic', False))
+    if HAS_ARVIZ or compute_bic_flag:
         if os.path.exists(chain_path):
             print(f"\nLoading saved chain from: {chain_path}")
             chain_data = np.load(chain_path, allow_pickle=True)
             saved_chain = chain_data['chain']
+            saved_lp = chain_data['log_prob'] if 'log_prob' in chain_data else None
             saved_names = list(chain_data['param_names'])
             saved_likelihood = str(chain_data.get('likelihood', 'chi2'))
             saved_nu = float(chain_data.get('studentt_nu', 5.0))
@@ -2845,7 +3046,7 @@ def replot_from_existing(
             print(f"  Chain shape: {saved_chain.shape} "
                   f"(likelihood={saved_likelihood})")
 
-            run_arviz_diagnostics(
+            diag_out = run_arviz_diagnostics(
                 param_names=saved_names,
                 chain=saved_chain,
                 model=model,
@@ -2854,16 +3055,22 @@ def replot_from_existing(
                 obs_err=obs_err,
                 likelihood=saved_likelihood,
                 studentt_nu=saved_nu,
-                compute_waic=compute_waic,
+                compute_bic=compute_bic_flag,
                 output_dir=args.output_dir,
                 suffix=suffix,
+                log_prob_flat=(
+                    saved_lp.reshape(-1) if isinstance(saved_lp, np.ndarray) else None
+                ),
                 reparam=saved_reparam,
                 wind_model=saved_wind_model,
                 fit_wind_shape=saved_fws,
             )
-        elif compute_waic:
+            bic_info = (diag_out or {}).get("bic", {})
+            if bic_info:
+                stats.update(bic_info)
+        elif compute_bic_flag:
             print(f"Chain file not found: {chain_path}")
-            print("  Re-run MCMC to generate it, or skip --compute-waic.")
+            print("  Re-run MCMC to generate it, or skip --compute-bic.")
 
     if getattr(args, 'save_chi2', False):
         chi2_path = os.path.join(args.output_dir, f"{suffix}_chi2.csv.gz")
@@ -3041,11 +3248,15 @@ def main():
              "--n-threads for your machine."
     )
     parser.add_argument(
+        "--compute-bic",
+        action="store_true",
+        help="Compute Bayesian Information Criterion (BIC) model-comparison metrics. "
+             "Works for chi2, jitter, and studentt likelihoods."
+    )
+    parser.add_argument(
         "--compute-waic",
         action="store_true",
-        help="Compute WAIC and LOO model comparison metrics via ArviZ "
-             "(requires arviz: pip install arviz). Slower but useful for comparing "
-             "likelihoods and binning strategies."
+        help=argparse.SUPPRESS,
     )
     
     # Model grid options
@@ -3093,6 +3304,14 @@ def main():
         default=None,
         help="Load pre-computed grid from file (skips grid computation)"
     )
+    parser.add_argument(
+        "--grid-dtype",
+        type=str,
+        choices=["float64", "float32"],
+        default="float64",
+        help="Data type for precomputed flux grid storage. float32 saves memory "
+             "but may slightly change interpolation precision."
+    )
     
     # Output options
     parser.add_argument(
@@ -3110,6 +3329,22 @@ def main():
         "--quiet",
         action="store_true",
         help="Suppress progress bar"
+    )
+    parser.add_argument(
+        "--compact-output",
+        action="store_true",
+        help="Also save compact binary outputs (NPZ) for samples/metadata."
+    )
+    parser.add_argument(
+        "--no-csv-output",
+        action="store_true",
+        help="Skip writing large *_samples.csv tables."
+    )
+    parser.add_argument(
+        "--csv-chunk-size",
+        type=int,
+        default=50000,
+        help="Chunk size used when writing sample CSV files."
     )
     
     # Replot option - regenerate plots from existing MCMC results
@@ -3255,6 +3490,13 @@ def main():
         )
 
     args = parser.parse_args()
+    if getattr(args, "compute_waic", False):
+        warnings.warn(
+            "--compute-waic is deprecated and replaced by --compute-bic. "
+            "Proceeding with BIC.",
+            UserWarning,
+        )
+        args.compute_bic = True
 
     # Warn on very large grids when fitting wind shape + lots of points.
     if getattr(args, 'fit_wind_shape', False) and not args.no_grid:
@@ -3426,6 +3668,12 @@ def main():
         with open(summary_path, 'w') as f:
             f.write("MCMC Light Curve Fitting Results\n")
             f.write("="*60 + "\n\n")
+            bic_values = [
+                float(v["bic"])
+                for v in all_results.values()
+                if isinstance(v, dict) and ("bic" in v) and np.isfinite(v["bic"])
+            ]
+            bic_best = min(bic_values) if bic_values else np.nan
 
             likelihood = getattr(args, 'likelihood', 'chi2')
             active_names, _ = get_param_config(
@@ -3484,6 +3732,16 @@ def main():
 
                 if 'reduced_chi2' in stats:
                     f.write(f"Reduced chi-square: {stats['reduced_chi2']:.3f}\n")
+                if 'bic' in stats and np.isfinite(stats['bic']):
+                    delta_bic = float(stats['bic'] - bic_best) if np.isfinite(bic_best) else np.nan
+                    stats['delta_bic'] = delta_bic
+                    f.write(
+                        f"BIC: {stats['bic']:.3f} "
+                        f"(ΔBIC={delta_bic:.3f}, logL_hat={stats.get('logL_hat', np.nan):.3f}, "
+                        f"k={int(stats.get('k_params', np.nan)) if np.isfinite(stats.get('k_params', np.nan)) else 'nan'}, "
+                        f"n={int(stats.get('n_obs', np.nan)) if np.isfinite(stats.get('n_obs', np.nan)) else 'nan'}, "
+                        f"source={stats.get('theta_source', 'unknown')})\n"
+                    )
                 f.write("\n")
 
             f.write(
