@@ -67,6 +67,7 @@ Usage:
 import argparse
 import csv
 import copy
+from dataclasses import dataclass, field
 import glob
 import multiprocessing as mp
 import os
@@ -197,6 +198,146 @@ REPARAM_PARAM_LABELS = [
     r'$i$ (deg)'
 ]
 
+KEPLER_PRIORS = {
+    'M_X': {'mean': 30.0, 'std': 10.0, 'min': 1.0, 'max': 100.0},     # Solar masses
+    'M_RH': {'mean': 20.0, 'std': 10.0, 'min': 1.0, 'max': 100.0},    # Solar masses
+    'r': {'mean': 0.001, 'std': 0.001, 'min': 0.0001, 'max': 0.1},    # Solar radii
+    'R': {'mean': 2.0, 'std': 0.5, 'min': 1.0, 'max': 5.0},           # Solar radii
+    'i0': {'mean': 26.0, 'std': 20.0, 'min': 10.0, 'max': 85.0},      # Degrees
+}
+
+KEPLER_PARAM_NAMES = ['M_X', 'M_RH', 'r', 'R', 'i0']
+KEPLER_PARAM_LABELS = [
+    r'$M_X$ (M$_\odot$)',
+    r'$M_\mathrm{RH}$ (M$_\odot$)',
+    r'$r$ (R$_\odot$)',
+    r'$R$ (R$_\odot$)',
+    r'$i$ (deg)',
+]
+
+G_SI = 6.674e-11
+R_SUN_M = 6.957e8
+M_SUN_KG = 1.989e30
+
+
+@dataclass
+class ParamSpec:
+    mode: str = 'phys'  # 'phys' | 'reparam' | 'kepler'
+    active_names: List[str] = field(default_factory=list)
+    active_labels: List[str] = field(default_factory=list)
+    frozen: Dict[str, float] = field(default_factory=dict)
+    fit_wind_shape: bool = False
+    wind_model: str = 'smooth_pl'
+    likelihood: str = 'chi2'
+    orbital_period_s: float = float(ORBITAL_PERIOD)
+    K_kepler: float = 0.0
+
+
+def _compute_kepler_prefactor(orbital_period_s: float) -> float:
+    """Return factor K for a = K * (Mtot/Msun)^(1/3) in solar radii."""
+    p = float(orbital_period_s)
+    return ((G_SI * M_SUN_KG * p ** 2) / (4.0 * np.pi ** 2)) ** (1.0 / 3.0) / R_SUN_M
+
+
+def parse_freeze_map(freeze_arg: Optional[str]) -> Dict[str, float]:
+    """Parse --freeze NAME=VAL[,NAME=VAL,...] into a dict."""
+    out: Dict[str, float] = {}
+    if not freeze_arg:
+        return out
+    for chunk in str(freeze_arg).split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"Invalid --freeze entry '{item}'. Expected NAME=VALUE."
+            )
+        name, value = item.split("=", 1)
+        key = name.strip()
+        if not key:
+            raise ValueError(f"Invalid --freeze entry '{item}': missing parameter name.")
+        if key in out:
+            raise ValueError(f"Duplicate frozen parameter '{key}' in --freeze.")
+        out[key] = float(value)
+    return out
+
+
+def get_mode_name_label(mode: str) -> Tuple[List[str], List[str]]:
+    if mode == 'reparam':
+        return list(REPARAM_PARAM_NAMES), list(REPARAM_PARAM_LABELS)
+    if mode == 'kepler':
+        return list(KEPLER_PARAM_NAMES), list(KEPLER_PARAM_LABELS)
+    return list(PARAM_NAMES), list(PARAM_LABELS)
+
+
+def build_param_spec(
+    likelihood: str = 'chi2',
+    reparam: bool = False,
+    kepler: bool = False,
+    wind_model: str = 'smooth_pl',
+    fit_wind_shape: bool = False,
+    frozen: Optional[Dict[str, float]] = None,
+    orbital_period_s: float = ORBITAL_PERIOD,
+) -> ParamSpec:
+    """Build canonical active-parameter layout for this run."""
+    if reparam and kepler:
+        raise ValueError("--reparam and --kepler are mutually exclusive.")
+    mode = 'kepler' if kepler else ('reparam' if reparam else 'phys')
+    frozen = dict(frozen or {})
+
+    names, labels = get_mode_name_label(mode)
+    if likelihood == 'jitter':
+        names.append('log_f')
+        labels.append(r'$\ln\,f$')
+    if fit_wind_shape:
+        if wind_model not in WIND_SHAPE_FIT:
+            raise ValueError(
+                f"--fit-wind-shape is not supported for wind_model "
+                f"'{wind_model}'. Choose one of: {list(WIND_SHAPE_FIT)}"
+            )
+        for sname in WIND_SHAPE_FIT[wind_model]:
+            names.append(sname)
+            labels.append(WIND_SHAPE_LABELS.get(sname, sname))
+
+    valid_frozen = set(names)
+    # Allow freezing shape parameters even when fit_wind_shape is off.
+    valid_frozen.update(WIND_SHAPE_FIT.get(wind_model, []))
+
+    if 'log_f' in frozen:
+        raise ValueError("Freezing log_f is not supported. Use --likelihood chi2/studentt.")
+
+    unknown = [k for k in frozen if k not in valid_frozen]
+    if unknown:
+        allowed = sorted(valid_frozen)
+        raise ValueError(
+            f"Unknown frozen parameter(s): {unknown}. "
+            f"Allowed names for this run: {allowed}"
+        )
+
+    active_names: List[str] = []
+    active_labels: List[str] = []
+    for n, l in zip(names, labels):
+        if n not in frozen:
+            active_names.append(n)
+            active_labels.append(l)
+
+    if ('R' in frozen) and ('Rb' in frozen) and (frozen['Rb'] < frozen['R']):
+        raise ValueError(
+            "Invalid freeze combination: require Rb >= R when both are frozen."
+        )
+
+    return ParamSpec(
+        mode=mode,
+        active_names=active_names,
+        active_labels=active_labels,
+        frozen=frozen,
+        fit_wind_shape=fit_wind_shape,
+        wind_model=wind_model,
+        likelihood=likelihood,
+        orbital_period_s=float(orbital_period_s),
+        K_kepler=_compute_kepler_prefactor(orbital_period_s),
+    )
+
 
 def _grid_priors_from_reparam(reparam_priors: Dict) -> Dict:
     """Derive ``(d1, d2, r, R, i0)`` grid bounds from ``(a, q)`` priors.
@@ -222,6 +363,32 @@ def _grid_priors_from_reparam(reparam_priors: Dict) -> Dict:
         'r':  reparam_priors['r'].copy(),
         'R':  reparam_priors['R'].copy(),
         'i0': reparam_priors['i0'].copy(),
+    }
+
+
+def _grid_priors_from_kepler(kepler_priors: Dict, orbital_period_s: float) -> Dict:
+    """Derive physical grid bounds from mass-space priors."""
+    mx_min, mx_max = kepler_priors['M_X']['min'], kepler_priors['M_X']['max']
+    mrh_min, mrh_max = kepler_priors['M_RH']['min'], kepler_priors['M_RH']['max']
+    mtot_min = mx_min + mrh_min
+    mtot_max = mx_max + mrh_max
+    K = _compute_kepler_prefactor(orbital_period_s)
+    a_min = K * mtot_min ** (1.0 / 3.0)
+    a_max = K * mtot_max ** (1.0 / 3.0)
+    q_min = mrh_min / (mx_max + mrh_min)
+    q_max = mrh_max / (mx_min + mrh_max)
+    d1_min = a_min * q_min
+    d1_max = a_max * q_max
+    d2_min = a_min * (1.0 - q_max)
+    d2_max = a_max * (1.0 - q_min)
+    return {
+        'd1': {'mean': (d1_min + d1_max) / 2, 'std': max((d1_max - d1_min) / 4, 1e-6),
+               'min': d1_min, 'max': d1_max},
+        'd2': {'mean': (d2_min + d2_max) / 2, 'std': max((d2_max - d2_min) / 4, 1e-6),
+               'min': d2_min, 'max': d2_max},
+        'r':  kepler_priors['r'].copy(),
+        'R':  kepler_priors['R'].copy(),
+        'i0': kepler_priors['i0'].copy(),
     }
 
 # Wind model descriptions (matches xrb_lightcurve.WIND_MODEL_IDS keys,
@@ -289,8 +456,11 @@ SAMPLER_TYPES = {
 def get_param_config(
     likelihood: str = 'chi2',
     reparam: bool = False,
+    kepler: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
+    frozen: Optional[Dict[str, float]] = None,
+    orbital_period_s: float = ORBITAL_PERIOD,
 ):
     """Return (param_names, param_labels) for the active MCMC vector.
 
@@ -303,25 +473,16 @@ def get_param_config(
     When *fit_wind_shape* is True the model-specific shape params from
     ``WIND_SHAPE_FIT[wind_model]`` are appended (in their listed order).
     """
-    if reparam:
-        names = list(REPARAM_PARAM_NAMES)
-        labels = list(REPARAM_PARAM_LABELS)
-    else:
-        names = list(PARAM_NAMES)
-        labels = list(PARAM_LABELS)
-    if likelihood == 'jitter':
-        names.append('log_f')
-        labels.append(r'$\ln\,f$')
-    if fit_wind_shape:
-        if wind_model not in WIND_SHAPE_FIT:
-            raise ValueError(
-                f"--fit-wind-shape is not supported for wind_model "
-                f"'{wind_model}'. Choose one of: {list(WIND_SHAPE_FIT)}"
-            )
-        for name in WIND_SHAPE_FIT[wind_model]:
-            names.append(name)
-            labels.append(WIND_SHAPE_LABELS.get(name, name))
-    return names, labels
+    spec = build_param_spec(
+        likelihood=likelihood,
+        reparam=reparam,
+        kepler=kepler,
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
+        frozen=frozen,
+        orbital_period_s=orbital_period_s,
+    )
+    return list(spec.active_names), list(spec.active_labels)
 
 
 def get_active_priors(
@@ -330,6 +491,7 @@ def get_active_priors(
     fit_wind_shape: bool,
     likelihood: str,
     shape_prior_overrides: Dict[str, Dict] = None,
+    frozen: Optional[Dict[str, float]] = None,
 ) -> Dict:
     """Build the merged prior dict covering geometry + jitter + shape params.
 
@@ -347,6 +509,9 @@ def get_active_priors(
             if shape_prior_overrides and name in shape_prior_overrides:
                 prior.update(shape_prior_overrides[name])
             out[name] = prior
+    if frozen:
+        for name in frozen:
+            out.pop(name, None)
     return out
 
 
@@ -356,6 +521,7 @@ def _to_wind_params(
     wind_model: str,
     R_value: float,
     fit_wind_shape: bool = False,
+    frozen: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """Build the wind_params dict for simulate_lightcurve from a sample.
 
@@ -365,18 +531,19 @@ def _to_wind_params(
     """
     wp: Dict[str, float] = dict(WIND_SHAPE_FIXED.get(wind_model, {}))
 
-    if fit_wind_shape:
-        for name in WIND_SHAPE_FIT.get(wind_model, []):
+    frozen = frozen or {}
+    for name in WIND_SHAPE_FIT.get(wind_model, []):
+        if name in frozen:
+            wp[name] = float(frozen[name])
+            continue
+        if fit_wind_shape:
             try:
                 idx = active_names.index(name)
             except ValueError:
-                # Shape param expected but not in chain; fall back to default
                 wp[name] = float(WIND_SHAPE_PRIORS[name]['mean'])
                 continue
             wp[name] = float(theta[idx])
-    else:
-        # Use prior means as the constant value of the would-be free params
-        for name in WIND_SHAPE_FIT.get(wind_model, []):
+        else:
             wp[name] = float(WIND_SHAPE_PRIORS[name]['mean'])
 
     if wind_model in ('beta_law', 'confinement'):
@@ -1226,12 +1393,88 @@ class DirectLightCurveModel:
 # Likelihood Functions
 # =============================================================================
 
+def _theta_value(
+    theta: np.ndarray,
+    name: str,
+    active_names: Optional[List[str]] = None,
+    frozen: Optional[Dict[str, float]] = None,
+):
+    frozen = frozen or {}
+    if name in frozen:
+        return float(frozen[name])
+    if active_names is not None and name in active_names:
+        return float(theta[active_names.index(name)])
+    return None
+
+
+def _resolve_geom(
+    theta: np.ndarray,
+    reparam: bool = False,
+    active_names: Optional[List[str]] = None,
+    param_spec: Optional[ParamSpec] = None,
+) -> Tuple[float, float, float, float, float]:
+    """Resolve geometry from theta for phys/reparam/kepler modes."""
+    if param_spec is not None:
+        mode = param_spec.mode
+        names = param_spec.active_names
+        frozen = param_spec.frozen
+    else:
+        mode = 'reparam' if reparam else 'phys'
+        names = active_names
+        frozen = {}
+
+    if mode == 'phys':
+        d1 = _theta_value(theta, 'd1', names, frozen)
+        d2 = _theta_value(theta, 'd2', names, frozen)
+    elif mode == 'reparam':
+        a = _theta_value(theta, 'a', names, frozen)
+        q = _theta_value(theta, 'q', names, frozen)
+        d1 = a * q
+        d2 = a * (1.0 - q)
+    elif mode == 'kepler':
+        mx = _theta_value(theta, 'M_X', names, frozen)
+        mrh = _theta_value(theta, 'M_RH', names, frozen)
+        mtot = mx + mrh
+        if mtot <= 0:
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+        a = float(param_spec.K_kepler) * mtot ** (1.0 / 3.0)
+        q = mrh / mtot
+        d1 = a * q
+        d2 = a * (1.0 - q)
+    else:
+        raise ValueError(f"Unknown parameter mode '{mode}'")
+
+    r = _theta_value(theta, 'r', names, frozen)
+    R = _theta_value(theta, 'R', names, frozen)
+    i0 = _theta_value(theta, 'i0', names, frozen)
+    return float(d1), float(d2), float(r), float(R), float(i0)
+
+
 def _to_physical(theta, reparam: bool = False):
-    """Convert sampling-space parameters to physical ``(d1, d2, r, R, i0)``."""
-    if reparam:
-        a, q = theta[0], theta[1]
-        return a * q, a * (1.0 - q), theta[2], theta[3], theta[4]
-    return theta[0], theta[1], theta[2], theta[3], theta[4]
+    """Backward-compatible wrapper for legacy callers."""
+    return _resolve_geom(theta, reparam=reparam)
+
+
+def _resolve_shape(
+    theta: np.ndarray,
+    R_value: float,
+    active_names: Optional[List[str]],
+    wind_model: str,
+    fit_wind_shape: bool,
+    frozen: Optional[Dict[str, float]] = None,
+) -> Optional[Dict[str, float]]:
+    if (not fit_wind_shape) and not any(
+        name in (frozen or {}) for name in WIND_SHAPE_FIT.get(wind_model, [])
+    ):
+        return None
+    return _to_wind_params(
+        theta=theta,
+        active_names=(active_names or []),
+        wind_model=wind_model,
+        R_value=R_value,
+        fit_wind_shape=fit_wind_shape,
+        frozen=frozen,
+    )
 
 
 def _evaluate_model(
@@ -1242,6 +1485,7 @@ def _evaluate_model(
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
+    param_spec: Optional[ParamSpec] = None,
 ):
     """Evaluate the physical model. Returns model_flux or None on failure.
 
@@ -1250,17 +1494,24 @@ def _evaluate_model(
     *wind_params* to ``model.evaluate``. When False, the model uses its
     constructor-time defaults.
     """
-    d1, d2, r, R, i0 = _to_physical(theta, reparam=reparam)
+    if param_spec is not None:
+        active_names = param_spec.active_names
+        wind_model = param_spec.wind_model
+        fit_wind_shape = param_spec.fit_wind_shape
+    d1, d2, r, R, i0 = _resolve_geom(
+        theta, reparam=reparam, active_names=active_names, param_spec=param_spec
+    )
+    if not np.all(np.isfinite([d1, d2, r, R, i0])):
+        return None
 
-    # Build wind_params only if we need shape-varying behavior. Skipping the
-    # dict construction in the geometry-only fast path avoids ~1 us / call.
-    if fit_wind_shape and active_names is not None:
-        wind_params = _to_wind_params(
-            theta, active_names, wind_model, R_value=R,
-            fit_wind_shape=True,
-        )
-    else:
-        wind_params = None
+    wind_params = _resolve_shape(
+        theta=theta,
+        R_value=R,
+        active_names=active_names,
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
+        frozen=(param_spec.frozen if param_spec is not None else None),
+    )
 
     try:
         model_flux = model.evaluate(
@@ -1291,12 +1542,14 @@ def log_likelihood_chi2(
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
     obs_err2: np.ndarray = None,
+    param_spec: Optional[ParamSpec] = None,
 ) -> float:
     """Standard Gaussian log-likelihood (chi-squared)."""
     model_flux = _evaluate_model(
         theta, model, obs_phase, reparam=reparam,
         wind_model=wind_model, fit_wind_shape=fit_wind_shape,
         active_names=active_names,
+        param_spec=param_spec,
     )
     if model_flux is None:
         return -np.inf
@@ -1318,6 +1571,7 @@ def log_likelihood_jitter(
     active_names: List[str] = None,
     obs_err2: np.ndarray = None,
     jitter_logf_index: Optional[int] = None,
+    param_spec: Optional[ParamSpec] = None,
 ) -> float:
     """Gaussian log-likelihood with a free fractional systematic error term.
 
@@ -1329,6 +1583,7 @@ def log_likelihood_jitter(
         theta, model, obs_phase, reparam=reparam,
         wind_model=wind_model, fit_wind_shape=fit_wind_shape,
         active_names=active_names,
+        param_spec=param_spec,
     )
     if model_flux is None:
         return -np.inf
@@ -1357,6 +1612,7 @@ def log_likelihood_studentt(
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
     log_obs_err: np.ndarray = None,
+    param_spec: Optional[ParamSpec] = None,
 ) -> float:
     """Student-t log-likelihood (heavier tails than Gaussian).
 
@@ -1366,6 +1622,7 @@ def log_likelihood_studentt(
         theta, model, obs_phase, reparam=reparam,
         wind_model=wind_model, fit_wind_shape=fit_wind_shape,
         active_names=active_names,
+        param_spec=param_spec,
     )
     if model_flux is None:
         return -np.inf
@@ -1396,6 +1653,7 @@ def log_prior(
     likelihood: str = 'chi2',
     reparam: bool = False,
     active_names: List[str] = None,
+    param_spec: Optional[ParamSpec] = None,
 ) -> float:
     """Log prior probability for geometry + jitter + wind-shape parameters.
 
@@ -1409,12 +1667,19 @@ def log_prior(
     ``log(a)`` is added to account for the change of variables
     ``d(d1) d(d2) = a · d(a) d(q)``.
     """
-    pnames = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
-
-    if active_names is None:
-        active_names = list(pnames)
-        if likelihood == 'jitter':
-            active_names.append('log_f')
+    if param_spec is None:
+        mode = 'reparam' if reparam else 'phys'
+        pnames, _ = get_mode_name_label(mode)
+        frozen = {}
+        if active_names is None:
+            active_names = list(pnames)
+            if likelihood == 'jitter':
+                active_names.append('log_f')
+    else:
+        mode = param_spec.mode
+        pnames, _ = get_mode_name_label(mode)
+        active_names = list(param_spec.active_names)
+        frozen = dict(param_spec.frozen)
 
     # Box check on every active parameter (geometry + jitter + shape).
     for name, value in zip(active_names, theta):
@@ -1425,31 +1690,39 @@ def log_prior(
         if not (prior['min'] < value < prior['max']):
             return -np.inf
 
-    # Physical constraint r < R (indices 2, 3 regardless of reparam).
-    if theta[2] >= theta[3]:
+    _, _, r_value, R_value, _ = _resolve_geom(
+        theta, reparam=reparam, active_names=active_names, param_spec=param_spec
+    )
+    # Physical constraint r < R.
+    if not np.isfinite(r_value) or not np.isfinite(R_value) or (r_value >= R_value):
         return -np.inf
 
     log_p = 0.0
 
-    # Gaussian penalty on geometry parameters.
-    for i, name in enumerate(pnames):
-        prior = priors.get(name)
-        if prior is None:
-            continue
-        log_p += -0.5 * ((theta[i] - prior['mean']) / prior['std']) ** 2
-
-    # Jacobian |d(d1,d2)/d(a,q)| = a.
-    if reparam:
-        log_p += np.log(theta[0])
-
-    # Gaussian penalty on jitter and shape parameters (anything beyond geometry).
     for i, name in enumerate(active_names):
-        if i < len(pnames):
-            continue
         prior = priors.get(name)
         if prior is None:
             continue
         log_p += -0.5 * ((theta[i] - prior['mean']) / prior['std']) ** 2
+
+    # Jacobian |d(d1,d2)/d(a,q)| = a in reparameterized mode.
+    if mode == 'reparam':
+        a_value = _theta_value(theta, 'a', active_names, frozen)
+        if (a_value is None) or (a_value <= 0):
+            return -np.inf
+        log_p += np.log(a_value)
+
+    # Physically sensible smooth_pl break radius.
+    if (param_spec is not None) and (param_spec.wind_model == 'smooth_pl'):
+        rb_val = _theta_value(theta, 'Rb', active_names, frozen)
+        if rb_val is not None and rb_val < R_value:
+            return -np.inf
+
+    if mode == 'kepler':
+        mx = _theta_value(theta, 'M_X', active_names, frozen)
+        mrh = _theta_value(theta, 'M_RH', active_names, frozen)
+        if (mx is None) or (mrh is None) or ((mx + mrh) <= 0):
+            return -np.inf
 
     return log_p
 
@@ -1468,11 +1741,13 @@ def log_probability(
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
     like_terms: Dict[str, object] = None,
+    param_spec: Optional[ParamSpec] = None,
 ) -> float:
     """Log posterior = log prior + log likelihood."""
     lp = log_prior(
         theta, priors, likelihood=likelihood, reparam=reparam,
         active_names=active_names,
+        param_spec=param_spec,
     )
     if not np.isfinite(lp):
         return -np.inf
@@ -1482,6 +1757,7 @@ def log_probability(
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
         active_names=active_names,
+        param_spec=param_spec,
     )
     like_terms = like_terms or {}
     obs_err2 = like_terms.get('obs_err2')
@@ -1527,9 +1803,13 @@ def run_mcmc(
     likelihood: str = 'chi2',
     studentt_nu: float = 5.0,
     reparam: bool = False,
+    kepler: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     numba_threads_per_worker: Optional[int] = None,
+    frozen: Optional[Dict[str, float]] = None,
+    orbital_period_s: float = ORBITAL_PERIOD,
+    param_spec: Optional[ParamSpec] = None,
 ) -> Tuple:
     """
     Run MCMC sampling with emcee or zeus.
@@ -1573,10 +1853,23 @@ def run_mcmc(
     active_param_names : list of str
     active_param_labels : list of str
     """
-    active_names, active_labels = get_param_config(
-        likelihood, reparam=reparam,
-        wind_model=wind_model, fit_wind_shape=fit_wind_shape,
-    )
+    if param_spec is None:
+        param_spec = build_param_spec(
+            likelihood=likelihood,
+            reparam=reparam,
+            kepler=kepler,
+            wind_model=wind_model,
+            fit_wind_shape=fit_wind_shape,
+            frozen=frozen,
+            orbital_period_s=orbital_period_s,
+        )
+    active_names = list(param_spec.active_names)
+    active_labels = list(param_spec.active_labels)
+    reparam = (param_spec.mode == 'reparam')
+    kepler = (param_spec.mode == 'kepler')
+    wind_model = param_spec.wind_model
+    fit_wind_shape = param_spec.fit_wind_shape
+    likelihood = param_spec.likelihood
     n_dim = len(active_names)
 
     # Build initial positions and per-dim scatter from the (already merged)
@@ -1599,10 +1892,13 @@ def run_mcmc(
             prior['max'] - 0.01 * abs(prior['max']) - 1e-12,
         )
 
-    # Enforce r < R (indices 2, 3 regardless of reparam).
-    for j in range(n_walkers):
-        if pos[j, 2] >= pos[j, 3]:
-            pos[j, 2] = pos[j, 3] * 0.1
+    # Enforce r < R only when both are free dimensions.
+    idx_r = active_names.index('r') if 'r' in active_names else None
+    idx_R = active_names.index('R') if 'R' in active_names else None
+    if (idx_r is not None) and (idx_R is not None):
+        for j in range(n_walkers):
+            if pos[j, idx_r] >= pos[j, idx_R]:
+                pos[j, idx_r] = pos[j, idx_R] * 0.1
 
     # Auto-disable multiprocessing when using a PrecomputedModelGrid.
     # Each evaluate() call is a microsecond-scale RegularGridInterpolator
@@ -1635,6 +1931,8 @@ def run_mcmc(
           f"{n_steps} steps{parallel_info}")
     if reparam:
         print("Reparameterization: (d1, d2) -> (a = d1+d2, q = d1/a)")
+    elif kepler:
+        print("Kepler mode: sample (M_X, M_RH); derive a and q from period.")
     print(f"Likelihood: {LIKELIHOOD_TYPES[likelihood]}")
     print(f"Wind model: {WIND_MODELS.get(wind_model, wind_model)} "
           f"({wind_model})  | fit_wind_shape={fit_wind_shape}")
@@ -1663,6 +1961,7 @@ def run_mcmc(
                 if ('log_f' in active_names) else None
             ),
         },
+        param_spec,
         # fmt: on
     )
 
@@ -1744,6 +2043,9 @@ def compute_statistics(
     samples: np.ndarray,
     param_names: List[str] = None,
     reparam: bool = False,
+    kepler: bool = False,
+    orbital_period_s: float = ORBITAL_PERIOD,
+    param_spec: Optional[ParamSpec] = None,
     log_prob: Optional[np.ndarray] = None,
 ) -> Dict:
     """Compute summary statistics from MCMC samples.
@@ -1766,6 +2068,11 @@ def compute_statistics(
     """
     if param_names is None:
         param_names = PARAM_NAMES
+    if param_spec is not None:
+        mode = param_spec.mode
+        orbital_period_s = param_spec.orbital_period_s
+    else:
+        mode = 'kepler' if kepler else ('reparam' if reparam else 'phys')
     stats = {}
 
     for i, param in enumerate(param_names):
@@ -1779,13 +2086,41 @@ def compute_statistics(
             'std': np.std(param_samples)
         }
 
-    if reparam:
-        a_samples = samples[:, 0]
-        q_samples = samples[:, 1]
-        for derived_name, derived_vals in [
+    if mode == 'reparam':
+        frozen = (param_spec.frozen if param_spec is not None else {})
+        if 'a' in param_names:
+            a_samples = samples[:, param_names.index('a')]
+        elif 'a' in frozen:
+            a_samples = np.full(len(samples), float(frozen['a']))
+        else:
+            raise ValueError("Could not resolve 'a' for reparameterized statistics.")
+        if 'q' in param_names:
+            q_samples = samples[:, param_names.index('q')]
+        elif 'q' in frozen:
+            q_samples = np.full(len(samples), float(frozen['q']))
+        else:
+            raise ValueError("Could not resolve 'q' for reparameterized statistics.")
+        derived = [
             ('d1', a_samples * q_samples),
             ('d2', a_samples * (1.0 - q_samples)),
-        ]:
+        ]
+    elif mode == 'kepler':
+        mx_samples = samples[:, param_names.index('M_X')]
+        mrh_samples = samples[:, param_names.index('M_RH')]
+        mtot = mx_samples + mrh_samples
+        K = _compute_kepler_prefactor(orbital_period_s)
+        a_samples = K * np.power(mtot, 1.0 / 3.0)
+        q_samples = mrh_samples / mtot
+        derived = [
+            ('a', a_samples),
+            ('q', q_samples),
+            ('d1', a_samples * q_samples),
+            ('d2', a_samples * (1.0 - q_samples)),
+        ]
+    else:
+        derived = []
+
+    for derived_name, derived_vals in derived:
             p16, p50, p84 = np.percentile(derived_vals, [16, 50, 84])
             stats[derived_name] = {
                 'median': p50,
@@ -1803,9 +2138,26 @@ def compute_statistics(
             map_sample = samples[map_idx]
             for i, param in enumerate(param_names):
                 stats[param]['map'] = float(map_sample[i])
-            if reparam:
-                a_map = float(map_sample[0])
-                q_map = float(map_sample[1])
+            if mode == 'reparam':
+                frozen = (param_spec.frozen if param_spec is not None else {})
+                if 'a' in param_names:
+                    a_map = float(map_sample[param_names.index('a')])
+                else:
+                    a_map = float(frozen['a'])
+                if 'q' in param_names:
+                    q_map = float(map_sample[param_names.index('q')])
+                else:
+                    q_map = float(frozen['q'])
+                stats['d1']['map'] = a_map * q_map
+                stats['d2']['map'] = a_map * (1.0 - q_map)
+            elif mode == 'kepler':
+                mx_map = float(map_sample[param_names.index('M_X')])
+                mrh_map = float(map_sample[param_names.index('M_RH')])
+                mtot_map = mx_map + mrh_map
+                a_map = _compute_kepler_prefactor(orbital_period_s) * (mtot_map ** (1.0 / 3.0))
+                q_map = mrh_map / mtot_map
+                stats['a']['map'] = a_map
+                stats['q']['map'] = q_map
                 stats['d1']['map'] = a_map * q_map
                 stats['d2']['map'] = a_map * (1.0 - q_map)
             stats['_map_meta'] = {
@@ -1846,6 +2198,9 @@ def load_existing_results(
     band: str,
     wind_model: str,
     reparam: bool = False,
+    kepler: bool = False,
+    orbital_period_s: float = ORBITAL_PERIOD,
+    param_spec: Optional[ParamSpec] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[Dict], Optional[List[str]]]:
     """
     Load existing MCMC results from saved files.
@@ -1881,7 +2236,12 @@ def load_existing_results(
         samples_df['log_prob'].values if 'log_prob' in samples_df.columns else None
     )
     stats = compute_statistics(
-        samples, param_names=loaded_names, reparam=reparam,
+        samples,
+        param_names=loaded_names,
+        reparam=reparam,
+        kepler=kepler,
+        orbital_period_s=orbital_period_s,
+        param_spec=param_spec,
         log_prob=log_prob_loaded,
     )
 
@@ -1904,6 +2264,7 @@ def compute_chi2_for_samples(
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
     likelihood: str = 'chi2',
+    param_spec: Optional[ParamSpec] = None,
 ) -> None:
     """
     Compute chi-square for all (or a subset of) MCMC samples and save to compressed file.
@@ -1946,6 +2307,12 @@ def compute_chi2_for_samples(
     dof = len(obs_flux) - n_phys
 
     results = []
+    if param_spec is not None:
+        active_names = list(param_spec.active_names)
+        wind_model = param_spec.wind_model
+        fit_wind_shape = param_spec.fit_wind_shape
+        likelihood = param_spec.likelihood
+    frozen = (param_spec.frozen if param_spec is not None else None)
     use_jitter = (likelihood == 'jitter' and active_names is not None and 'log_f' in active_names)
 
     if HAS_TQDM and verbose:
@@ -1955,15 +2322,17 @@ def compute_chi2_for_samples(
 
     for idx in iterator:
         sample_params = samples[idx]
-        d1, d2, r, R, i0 = _to_physical(sample_params, reparam=reparam)
-
-        if fit_wind_shape and active_names is not None:
-            wp = _to_wind_params(
-                sample_params, active_names, wind_model, R_value=R,
-                fit_wind_shape=True,
-            )
-        else:
-            wp = None
+        d1, d2, r, R, i0 = _resolve_geom(
+            sample_params, reparam=reparam, active_names=active_names, param_spec=param_spec
+        )
+        wp = _resolve_shape(
+            theta=sample_params,
+            R_value=R,
+            active_names=active_names,
+            wind_model=wind_model,
+            fit_wind_shape=fit_wind_shape,
+            frozen=frozen,
+        )
 
         try:
             try:
@@ -2052,7 +2421,7 @@ def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str
         s = stats[param]
         print(f"{param:<15} {s['median']:<12.6f} {s['lower']:<12.6f} {s['upper']:<12.6f}")
 
-    if reparam:
+    if reparam or ('d1' in stats and 'd2' in stats):
         print('-'*60)
         print("Derived physical parameters:")
         for derived in ('d1', 'd2'):
@@ -2136,6 +2505,7 @@ def plot_best_fit(
     fit_wind_shape: bool = False,
     is_binned: bool = True,
     likelihood: str = 'chi2',
+    param_spec: Optional[ParamSpec] = None,
 ):
     """
     Plot observed data with best-fit model overlay.
@@ -2173,13 +2543,28 @@ def plot_best_fit(
     )
     point_key = 'map' if use_map else 'median'
 
+    def _value_from_stats_or_frozen(name: str) -> float:
+        if name in stats and point_key in stats[name]:
+            return float(stats[name][point_key])
+        if param_spec is not None and name in param_spec.frozen:
+            return float(param_spec.frozen[name])
+        raise KeyError(
+            f"Missing '{name}' in statistics for best-fit plotting. "
+            f"If this parameter is frozen, pass param_spec with frozen values."
+        )
+
     if reparam:
-        best_d1 = stats['d1'][point_key]
-        best_d2 = stats['d2'][point_key]
-        best_params = [best_d1, best_d2, stats['r'][point_key],
-                       stats['R'][point_key], stats['i0'][point_key]]
+        best_d1 = _value_from_stats_or_frozen('d1')
+        best_d2 = _value_from_stats_or_frozen('d2')
+        best_params = [
+            best_d1,
+            best_d2,
+            _value_from_stats_or_frozen('r'),
+            _value_from_stats_or_frozen('R'),
+            _value_from_stats_or_frozen('i0'),
+        ]
     else:
-        best_params = [stats[p][point_key] for p in PARAM_NAMES]
+        best_params = [_value_from_stats_or_frozen(p) for p in PARAM_NAMES]
 
     # Build best-fit wind_params if shape was fitted.
     best_R = best_params[3]
@@ -2188,6 +2573,8 @@ def plot_best_fit(
         for sname in WIND_SHAPE_FIT[wind_model]:
             if sname in stats:
                 best_wp[sname] = float(stats[sname][point_key])
+            elif param_spec is not None and sname in param_spec.frozen:
+                best_wp[sname] = float(param_spec.frozen[sname])
         if wind_model in ('beta_law', 'confinement'):
             best_wp['R_star'] = float(best_R)
     else:
@@ -2375,9 +2762,11 @@ def compute_pointwise_loglik(
     studentt_nu: float = 5.0,
     n_samples: int = 200,
     reparam: bool = False,
+    kepler: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
+    param_spec: Optional[ParamSpec] = None,
 ) -> np.ndarray:
     """Compute per-observation log-likelihood for a subset of posterior samples.
 
@@ -2388,6 +2777,14 @@ def compute_pointwise_loglik(
     indices = np.random.choice(n_total, size=n_use, replace=False)
     n_obs = len(obs_phase)
     log_lik = np.full((n_use, n_obs), np.nan)
+
+    if param_spec is not None:
+        active_names = list(param_spec.active_names)
+        reparam = (param_spec.mode == 'reparam')
+        kepler = (param_spec.mode == 'kepler')
+        wind_model = param_spec.wind_model
+        fit_wind_shape = param_spec.fit_wind_shape
+        likelihood = param_spec.likelihood
 
     if active_names is not None and 'log_f' in active_names:
         idx_logf = active_names.index('log_f')
@@ -2400,6 +2797,7 @@ def compute_pointwise_loglik(
             theta, model, obs_phase, reparam=reparam,
             wind_model=wind_model, fit_wind_shape=fit_wind_shape,
             active_names=active_names,
+            param_spec=param_spec,
         )
         if model_flux is None:
             continue
@@ -2437,9 +2835,11 @@ def compute_bic_metrics(
     likelihood: str = 'chi2',
     studentt_nu: float = 5.0,
     reparam: bool = False,
+    kepler: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     log_prob_flat: Optional[np.ndarray] = None,
+    param_spec: Optional[ParamSpec] = None,
 ) -> Dict[str, float]:
     """Compute BIC from the best posterior point under the selected likelihood."""
     if samples_flat is None or len(samples_flat) == 0:
@@ -2456,11 +2856,21 @@ def compute_bic_metrics(
             theta_hat = samples_flat[idx]
             theta_source = "map_log_prob"
 
+    if param_spec is not None:
+        reparam = (param_spec.mode == 'reparam')
+        kepler = (param_spec.mode == 'kepler')
+        wind_model = param_spec.wind_model
+        fit_wind_shape = param_spec.fit_wind_shape
+        likelihood = param_spec.likelihood
+        if param_names is None:
+            param_names = list(param_spec.active_names)
+
     like_kwargs = dict(
         reparam=reparam,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
         active_names=param_names,
+        param_spec=param_spec,
     )
     obs_err2 = obs_err ** 2
     log_obs_err = np.log(obs_err)
@@ -2550,8 +2960,10 @@ def run_arviz_diagnostics(
     samples_flat: np.ndarray = None,
     log_prob_flat: np.ndarray = None,
     reparam: bool = False,
+    kepler: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
+    param_spec: Optional[ParamSpec] = None,
 ):
     """Run ArviZ convergence diagnostics and optionally BIC.
 
@@ -2622,9 +3034,11 @@ def run_arviz_diagnostics(
             likelihood=likelihood,
             studentt_nu=studentt_nu,
             reparam=reparam,
+            kepler=kepler,
             wind_model=wind_model,
             fit_wind_shape=fit_wind_shape,
             log_prob_flat=log_prob_flat,
+            param_spec=param_spec,
         )
         if bic_info:
             print(
@@ -2662,6 +3076,7 @@ def run_single_fit(
     priors: Dict = None,
     sim_params: Dict = None,
     reparam: bool = False,
+    kepler: bool = False,
     fit_wind_shape: bool = False,
     shape_prior_overrides: Dict[str, Dict] = None,
     is_binned: bool = True,
@@ -2669,11 +3084,28 @@ def run_single_fit(
     """Run MCMC fit for a single band/wind_model combination."""
 
     if priors is None:
-        priors = REPARAM_PRIORS.copy() if reparam else DEFAULT_PRIORS.copy()
+        if kepler:
+            priors = copy.deepcopy(KEPLER_PRIORS)
+        elif reparam:
+            priors = REPARAM_PRIORS.copy()
+        else:
+            priors = DEFAULT_PRIORS.copy()
     if sim_params is None:
         sim_params = {}
 
     likelihood = getattr(args, 'likelihood', 'chi2')
+    frozen_params = dict(getattr(args, 'frozen_params', {}) or {})
+    orbital_period_s = float(getattr(args, 'orbital_period', ORBITAL_PERIOD))
+
+    param_spec = build_param_spec(
+        likelihood=likelihood,
+        reparam=reparam,
+        kepler=kepler,
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
+        frozen=frozen_params,
+        orbital_period_s=orbital_period_s,
+    )
 
     # Active priors include geometry + (optional) jitter + (optional) shape.
     active_priors = get_active_priors(
@@ -2682,10 +3114,14 @@ def run_single_fit(
         fit_wind_shape=fit_wind_shape,
         likelihood=likelihood,
         shape_prior_overrides=shape_prior_overrides,
+        frozen=param_spec.frozen,
     )
 
     # Grid always uses (d1, d2, r, R, i0) bounds
-    grid_priors = _grid_priors_from_reparam(priors) if reparam else priors
+    if kepler:
+        grid_priors = _grid_priors_from_kepler(priors, orbital_period_s=orbital_period_s)
+    else:
+        grid_priors = _grid_priors_from_reparam(priors) if reparam else priors
 
     print(f"\n{'#'*60}")
     print(f"# Fitting {band.upper()} band - {WIND_MODELS[wind_model]}")
@@ -2772,8 +3208,12 @@ def run_single_fit(
         likelihood=likelihood,
         studentt_nu=studentt_nu,
         reparam=reparam,
+        kepler=kepler,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
+        frozen=param_spec.frozen,
+        orbital_period_s=orbital_period_s,
+        param_spec=param_spec,
         numba_threads_per_worker=getattr(
             args, "numba_threads_per_worker", None
         ),
@@ -2784,7 +3224,12 @@ def run_single_fit(
     except Exception:
         chain_log_prob_flat = None
     stats = compute_statistics(
-        samples, param_names=active_names, reparam=reparam,
+        samples,
+        param_names=active_names,
+        reparam=reparam,
+        kepler=kepler,
+        orbital_period_s=orbital_period_s,
+        param_spec=param_spec,
         log_prob=chain_log_prob_flat,
     )
     print_results(stats, band, wind_model, param_names=active_names, reparam=reparam)
@@ -2800,8 +3245,10 @@ def run_single_fit(
         suffix=f"{band}_{wind_model}",
         log_prob_flat=chain_log_prob_flat,
         reparam=reparam,
+        kepler=kepler,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
+        param_spec=param_spec,
     )
     bic_info = (diag_out or {}).get("bic", {})
     if bic_info:
@@ -2831,6 +3278,7 @@ def run_single_fit(
             fit_wind_shape=fit_wind_shape,
             is_binned=is_binned,
             likelihood=likelihood,
+            param_spec=param_spec,
         )
         stats['reduced_chi2'] = red_chi2
 
@@ -2873,6 +3321,10 @@ def run_single_fit(
             likelihood=likelihood,
             studentt_nu=studentt_nu,
             reparam=reparam,
+            mode=param_spec.mode,
+            frozen_names=np.array(list(param_spec.frozen.keys()), dtype=str),
+            frozen_values=np.array(list(param_spec.frozen.values()), dtype=float),
+            orbital_period_s=float(param_spec.orbital_period_s),
             wind_model=wind_model,
             fit_wind_shape=fit_wind_shape,
             bic=(bic_info.get("bic") if bic_info else np.nan),
@@ -2896,6 +3348,7 @@ def run_single_fit(
             fit_wind_shape=fit_wind_shape,
             active_names=active_names,
             likelihood=likelihood,
+            param_spec=param_spec,
         )
 
     stats['wind_model'] = wind_model
@@ -2912,6 +3365,7 @@ def replot_from_existing(
     priors: Dict = None,
     sim_params: Dict = None,
     reparam: bool = False,
+    kepler: bool = False,
     fit_wind_shape: bool = False,
     shape_prior_overrides: Dict[str, Dict] = None,
     is_binned: bool = True,
@@ -2924,32 +3378,83 @@ def replot_from_existing(
     is auto-detected.
     """
     if priors is None:
-        priors = REPARAM_PRIORS.copy() if reparam else DEFAULT_PRIORS.copy()
+        if kepler:
+            priors = copy.deepcopy(KEPLER_PRIORS)
+        elif reparam:
+            priors = REPARAM_PRIORS.copy()
+        else:
+            priors = DEFAULT_PRIORS.copy()
     if sim_params is None:
         sim_params = {}
 
-    grid_priors = _grid_priors_from_reparam(priors) if reparam else priors
+    if kepler:
+        grid_priors = _grid_priors_from_kepler(
+            priors, orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD))
+        )
+    else:
+        grid_priors = _grid_priors_from_reparam(priors) if reparam else priors
 
     print(f"\n{'#'*60}")
     print(f"# Replotting {band.upper()} band - {WIND_MODELS[wind_model]}")
     print('#'*60)
 
+    saved_mode = 'kepler' if kepler else ('reparam' if reparam else 'phys')
+    saved_orbital_period_s = float(getattr(args, 'orbital_period', ORBITAL_PERIOD))
+    saved_frozen = dict(getattr(args, 'frozen_params', {}) or {})
+    chain_path = os.path.join(args.output_dir, f"{band}_{wind_model}_chain.npz")
+    if os.path.exists(chain_path):
+        try:
+            _meta = np.load(chain_path, allow_pickle=True)
+            saved_mode = str(_meta.get('mode', saved_mode))
+            saved_orbital_period_s = float(_meta.get('orbital_period_s', saved_orbital_period_s))
+            fn = list(_meta.get('frozen_names', []))
+            fv = list(_meta.get('frozen_values', []))
+            if len(fn) == len(fv):
+                saved_frozen = {str(k): float(v) for k, v in zip(fn, fv)}
+        except Exception:
+            pass
+
+    spec_for_replot = build_param_spec(
+        likelihood=getattr(args, 'likelihood', 'chi2'),
+        reparam=(saved_mode == 'reparam'),
+        kepler=(saved_mode == 'kepler'),
+        wind_model=wind_model,
+        fit_wind_shape=fit_wind_shape,
+        frozen=saved_frozen,
+        orbital_period_s=saved_orbital_period_s,
+    )
+
     samples, stats, loaded_names = load_existing_results(
-        args.output_dir, band, wind_model, reparam=reparam,
+        args.output_dir,
+        band,
+        wind_model,
+        reparam=(saved_mode == 'reparam'),
+        kepler=(saved_mode == 'kepler'),
+        orbital_period_s=saved_orbital_period_s,
+        param_spec=spec_for_replot,
     )
 
     if samples is None or stats is None:
         print(f"Could not load existing results for {band}_{wind_model}")
         return None
 
-    print_results(stats, band, wind_model,
-                  param_names=loaded_names, reparam=reparam)
+    print_results(
+        stats, band, wind_model,
+        param_names=loaded_names, reparam=(saved_mode == 'reparam')
+    )
 
     # Auto-detect shape-fit from the saved column names.
-    geom_names = REPARAM_PARAM_NAMES if reparam else PARAM_NAMES
+    if saved_mode == 'reparam':
+        geom_names = REPARAM_PARAM_NAMES
+    elif saved_mode == 'kepler':
+        geom_names = KEPLER_PARAM_NAMES
+    else:
+        geom_names = PARAM_NAMES
     extra_dims = [n for n in loaded_names
                   if n not in geom_names and n != 'log_f']
     saved_fit_wind_shape = bool(extra_dims) or fit_wind_shape
+    spec_for_replot.active_names = list(loaded_names)
+    spec_for_replot.fit_wind_shape = bool(saved_fit_wind_shape)
 
     # Model for best-fit overlay.  Replotting doesn't need fast likelihood
     # evaluation, so we default to the direct evaluator unless the user
@@ -2995,6 +3500,7 @@ def replot_from_existing(
         try:
             _meta = np.load(chain_path, allow_pickle=True)
             saved_likelihood = str(_meta.get('likelihood', saved_likelihood))
+            spec_for_replot.likelihood = saved_likelihood
         except Exception:
             pass
 
@@ -3002,7 +3508,12 @@ def replot_from_existing(
         # Use the loaded column names as the active set.
         active_names = list(loaded_names)
         active_labels = []
-        geom_labels = REPARAM_PARAM_LABELS if reparam else PARAM_LABELS
+        if saved_mode == 'reparam':
+            geom_labels = REPARAM_PARAM_LABELS
+        elif saved_mode == 'kepler':
+            geom_labels = KEPLER_PARAM_LABELS
+        else:
+            geom_labels = PARAM_LABELS
         for name in active_names:
             if name in geom_names:
                 active_labels.append(geom_labels[geom_names.index(name)])
@@ -3023,10 +3534,11 @@ def replot_from_existing(
             model, obs_phase, obs_flux, obs_err, stats, band, wind_model,
             os.path.join(args.output_dir, f"{suffix}_bestfit.png"),
             param_names=active_names,
-            reparam=reparam,
+            reparam=(saved_mode == 'reparam'),
             fit_wind_shape=saved_fit_wind_shape,
             is_binned=is_binned,
             likelihood=saved_likelihood,
+            param_spec=spec_for_replot,
         )
         stats['reduced_chi2'] = red_chi2
 
@@ -3039,6 +3551,7 @@ def replot_from_existing(
             saved_lp = chain_data['log_prob'] if 'log_prob' in chain_data else None
             saved_names = list(chain_data['param_names'])
             saved_likelihood = str(chain_data.get('likelihood', 'chi2'))
+            spec_for_replot.likelihood = saved_likelihood
             saved_nu = float(chain_data.get('studentt_nu', 5.0))
             saved_reparam = bool(chain_data.get('reparam', False))
             saved_wind_model = str(chain_data.get('wind_model', wind_model))
@@ -3062,8 +3575,10 @@ def replot_from_existing(
                     saved_lp.reshape(-1) if isinstance(saved_lp, np.ndarray) else None
                 ),
                 reparam=saved_reparam,
+                kepler=(saved_mode == 'kepler'),
                 wind_model=saved_wind_model,
                 fit_wind_shape=saved_fws,
+                param_spec=spec_for_replot,
             )
             bic_info = (diag_out or {}).get("bic", {})
             if bic_info:
@@ -3079,11 +3594,12 @@ def replot_from_existing(
             output_path=chi2_path,
             n_samples=getattr(args, 'chi2_n_samples', None),
             verbose=True,
-            reparam=reparam,
+            reparam=(saved_mode == 'reparam'),
             wind_model=wind_model,
             fit_wind_shape=saved_fit_wind_shape,
             active_names=loaded_names,
             likelihood=saved_likelihood,
+            param_spec=spec_for_replot,
         )
 
     return stats
@@ -3204,6 +3720,27 @@ def main():
         help="Reparameterize (d1, d2) as (a, q) where a = d1+d2 (orbital separation) "
              "and q = d1/(d1+d2) (mass-ratio proxy). Decorrelates the two distance "
              "parameters for faster MCMC convergence."
+    )
+    parser.add_argument(
+        "--kepler",
+        action="store_true",
+        help="Sample (M_X, M_RH) and derive (a, q) from Kepler's third law and lever-arm. "
+             "Mutually exclusive with --reparam."
+    )
+    parser.add_argument(
+        "--orbital-period",
+        type=float,
+        default=float(ORBITAL_PERIOD),
+        help="Fixed orbital period in seconds for --kepler mode."
+    )
+    parser.add_argument(
+        "--freeze",
+        type=str,
+        default=None,
+        metavar="NAME=VAL[,NAME=VAL,...]",
+        help="Freeze selected free parameters at fixed values and remove them from sampling. "
+             "Supported names: d1,d2,a,q,r,R,i0,M_X,M_RH,Rb,p,beta,fconf,ell. "
+             "log_f cannot be frozen."
     )
     parser.add_argument(
         "--n-walkers",
@@ -3467,6 +4004,24 @@ def main():
         help="Prior for q = d1/(d1+d2) (mass-ratio proxy, only with --reparam). "
              "Format: mean,std,min,max. Default: 0.58,0.15,0.01,0.99"
     )
+    prior_group.add_argument(
+        "--prior-MX",
+        dest="prior_M_X",
+        type=str,
+        default=None,
+        metavar="MEAN,STD,MIN,MAX",
+        help="Prior for compact-object mass M_X (solar masses, only with --kepler). "
+             "Format: mean,std,min,max. Default: 30.0,10.0,1.0,100.0"
+    )
+    prior_group.add_argument(
+        "--prior-MRH",
+        dest="prior_M_RH",
+        type=str,
+        default=None,
+        metavar="MEAN,STD,MIN,MAX",
+        help="Prior for companion mass M_RH (solar masses, only with --kepler). "
+             "Format: mean,std,min,max. Default: 20.0,10.0,1.0,100.0"
+    )
 
     # Wind-shape prior overrides (only used with --fit-wind-shape).
     shape_prior_group = parser.add_argument_group(
@@ -3498,6 +4053,15 @@ def main():
         )
         args.compute_bic = True
 
+    if args.reparam and getattr(args, 'kepler', False):
+        parser.error("--reparam and --kepler are mutually exclusive.")
+    if getattr(args, 'orbital_period', 0.0) <= 0:
+        parser.error("--orbital-period must be > 0.")
+    try:
+        args.frozen_params = parse_freeze_map(getattr(args, 'freeze', None))
+    except Exception as e:
+        parser.error(f"Invalid --freeze: {e}")
+
     # Warn on very large grids when fitting wind shape + lots of points.
     if getattr(args, 'fit_wind_shape', False) and not args.no_grid:
         wm = getattr(args, 'wind_model', 'smooth_pl')
@@ -3526,7 +4090,11 @@ def main():
 
     # Build custom geometry priors
     reparam = getattr(args, 'reparam', False)
-    if reparam:
+    kepler = bool(getattr(args, 'kepler', False))
+    if kepler:
+        priors = copy.deepcopy(KEPLER_PRIORS)
+        base_names = KEPLER_PARAM_NAMES
+    elif reparam:
         priors = copy.deepcopy(REPARAM_PRIORS)
         base_names = REPARAM_PARAM_NAMES
     else:
@@ -3583,6 +4151,44 @@ def main():
     # Wind models: a single value (no more 'both' loop).
     wind_models = [args.wind_model]
     fit_wind_shape = bool(getattr(args, 'fit_wind_shape', False))
+    frozen_params = dict(getattr(args, 'frozen_params', {}) or {})
+
+    # Validate frozen names against run configuration before sampling starts.
+    try:
+        _spec_check = build_param_spec(
+            likelihood=getattr(args, 'likelihood', 'chi2'),
+            reparam=reparam,
+            kepler=kepler,
+            wind_model=args.wind_model,
+            fit_wind_shape=fit_wind_shape,
+            frozen=frozen_params,
+            orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
+        )
+    except Exception as e:
+        parser.error(str(e))
+
+    _check_priors = get_active_priors(
+        base_priors=priors,
+        wind_model=args.wind_model,
+        fit_wind_shape=fit_wind_shape,
+        likelihood=getattr(args, 'likelihood', 'chi2'),
+        shape_prior_overrides=shape_prior_overrides,
+        frozen=None,
+    )
+    for sname in WIND_SHAPE_FIT.get(args.wind_model, []):
+        _check_priors.setdefault(sname, dict(WIND_SHAPE_PRIORS[sname]))
+        if sname in shape_prior_overrides:
+            _check_priors[sname].update(shape_prior_overrides[sname])
+    for fname, fval in frozen_params.items():
+        fp = _check_priors.get(fname)
+        if fp is None:
+            continue
+        if (fval <= fp['min']) or (fval >= fp['max']):
+            warnings.warn(
+                f"Frozen value {fname}={fval} lies outside prior box "
+                f"({fp['min']}, {fp['max']}). Continuing because frozen values "
+                f"are treated as fixed constants."
+            )
 
     # Run MCMC or replot from existing results
     all_results = {}
@@ -3629,6 +4235,7 @@ def main():
                             priors=priors,
                             sim_params=sim_params,
                             reparam=reparam,
+                            kepler=kepler,
                             fit_wind_shape=fit_wind_shape,
                             shape_prior_overrides=shape_prior_overrides,
                             is_binned=is_binned,
@@ -3643,6 +4250,7 @@ def main():
                             priors=priors,
                             sim_params=sim_params,
                             reparam=reparam,
+                            kepler=kepler,
                             fit_wind_shape=fit_wind_shape,
                             shape_prior_overrides=shape_prior_overrides,
                             is_binned=is_binned,
@@ -3678,7 +4286,10 @@ def main():
             likelihood = getattr(args, 'likelihood', 'chi2')
             active_names, _ = get_param_config(
                 likelihood, reparam=reparam,
+                kepler=kepler,
                 wind_model=args.wind_model, fit_wind_shape=fit_wind_shape,
+                frozen=getattr(args, 'frozen_params', {}),
+                orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
             )
             for key, stats in all_results.items():
                 band, wind_model = key
@@ -3691,7 +4302,7 @@ def main():
                         s = stats[param]
                         f.write(f"  {param}: {s['median']:.6f} "
                                 f"(+{s['upper']:.6f}/-{s['lower']:.6f})\n")
-                if reparam:
+                if reparam or kepler:
                     for derived in ('d1', 'd2'):
                         if derived in stats:
                             s = stats[derived]
@@ -3711,14 +4322,14 @@ def main():
                     for param in active_names:
                         if param in stats and 'map' in stats[param]:
                             f.write(f"  {param}: {stats[param]['map']:.6f}\n")
-                    if reparam:
+                    if reparam or kepler:
                         for derived in ('d1', 'd2'):
                             if derived in stats and 'map' in stats[derived]:
                                 f.write(
                                     f"  {derived} (derived): "
                                     f"{stats[derived]['map']:.6f}\n"
                                 )
-                    if reparam:
+                    if (reparam or kepler) and all(k in stats for k in ('a', 'q', 'd1', 'd2')):
                         a_map = stats['a']['map']
                         d1_map = stats['d1']['map']
                         d2_map = stats['d2']['map']

@@ -1988,8 +1988,8 @@ def main():
     parser.add_argument(
         "--Delta",
         type=float,
-        default=2.0,
-        help="Smoothness parameter for smooth_pl. Larger -> sharper break. Default: 2.0.",
+        default=1.0,
+        help="Smoothness parameter for smooth_pl. Larger -> sharper break. Default: 1.0.",
     )
     parser.add_argument(
         "--beta",
