@@ -219,6 +219,12 @@ G_SI = 6.674e-11
 R_SUN_M = 6.957e8
 M_SUN_KG = 1.989e30
 
+# Per-sample phase-shift optimization defaults.
+# Coarse grid + local refinement gives near-fine-grid accuracy at lower cost.
+DEFAULT_PHASE_SHIFT_GRID_SIZE = 25
+DEFAULT_PHASE_SHIFT_EVAL_POINTS = 240
+DEFAULT_PHASE_SHIFT_REFINE_POINTS = 9
+
 
 @dataclass
 class ParamSpec:
@@ -771,6 +777,102 @@ def _interp_periodic_phases(
     phase_ext = np.concatenate([phase_sorted - 1.0, phase_sorted, phase_sorted + 1.0])
     flux_ext = np.concatenate([flux_sorted, flux_sorted, flux_sorted])
     return np.interp(obs_phases, phase_ext, flux_ext)
+
+
+def _build_phase_shift_terms(
+    enabled: bool,
+    obs_phase: np.ndarray,
+    *,
+    grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
+    eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
+    refine_points: int = DEFAULT_PHASE_SHIFT_REFINE_POINTS,
+) -> Dict[str, object]:
+    """Precompute reusable arrays for per-sample phase-shift optimization.
+
+    The search runs in two stages:
+      1) coarse uniform grid over phase shifts in [0, 1)
+      2) local refinement around the best coarse shift
+    """
+    if not enabled:
+        return {"enabled": False}
+    n_grid = max(3, int(grid_size))
+    n_eval = max(16, int(eval_points))
+    n_refine = max(0, int(refine_points))
+    shift_grid = np.linspace(0.0, 1.0, n_grid, endpoint=False)
+    phase_eval_grid = np.linspace(0.0, 1.0, n_eval, endpoint=False)
+    shifted_obs_phase = np.mod(obs_phase[None, :] - shift_grid[:, None], 1.0)
+    return {
+        "enabled": True,
+        "shift_grid": shift_grid,
+        "phase_eval_grid": phase_eval_grid,
+        "shifted_obs_phase": shifted_obs_phase,
+        "refine_points": n_refine,
+    }
+
+
+def _apply_best_phase_shift(
+    model_phase: np.ndarray,
+    model_flux: np.ndarray,
+    obs_phase: np.ndarray,
+    obs_flux: np.ndarray,
+    obs_err2: np.ndarray,
+    phase_shift_terms: Optional[Dict[str, object]],
+) -> Tuple[Optional[np.ndarray], float]:
+    """Align model to observations by minimizing weighted chi-square over shift."""
+    if not phase_shift_terms or not bool(phase_shift_terms.get("enabled", False)):
+        return model_flux, 0.0
+
+    shift_grid = np.asarray(phase_shift_terms.get("shift_grid", []), dtype=float)
+    shifted_obs_phase = phase_shift_terms.get("shifted_obs_phase")
+    if shift_grid.size == 0:
+        return model_flux, 0.0
+
+    if shifted_obs_phase is None or np.shape(shifted_obs_phase) != (shift_grid.size, obs_phase.size):
+        shifted_obs_phase = np.mod(obs_phase[None, :] - shift_grid[:, None], 1.0)
+
+    best_model = None
+    best_idx = -1
+    best_shift = 0.0
+    best_chi2 = np.inf
+
+    for i, shift in enumerate(shift_grid):
+        shifted_phase = shifted_obs_phase[i]
+        shifted_flux = _interp_periodic_phases(shifted_phase, model_phase, model_flux)
+        if np.any(~np.isfinite(shifted_flux)):
+            continue
+        chi2 = np.sum((obs_flux - shifted_flux) ** 2 / obs_err2)
+        if chi2 < best_chi2:
+            best_chi2 = float(chi2)
+            best_model = shifted_flux
+            best_idx = i
+            best_shift = float(shift)
+
+    if best_model is None:
+        return None, 0.0
+
+    # Local refinement around the best coarse shift to recover sub-grid accuracy
+    # without paying for a globally dense shift grid.
+    n_refine = int(phase_shift_terms.get("refine_points", 0) or 0)
+    if n_refine > 1 and shift_grid.size >= 3 and best_idx >= 0:
+        coarse_step = 1.0 / float(shift_grid.size)
+        fine_shifts = np.linspace(
+            best_shift - coarse_step,
+            best_shift + coarse_step,
+            n_refine,
+            endpoint=True,
+        )
+        for shift in np.mod(fine_shifts, 1.0):
+            shifted_phase = np.mod(obs_phase - shift, 1.0)
+            shifted_flux = _interp_periodic_phases(shifted_phase, model_phase, model_flux)
+            if np.any(~np.isfinite(shifted_flux)):
+                continue
+            chi2 = np.sum((obs_flux - shifted_flux) ** 2 / obs_err2)
+            if chi2 < best_chi2:
+                best_chi2 = float(chi2)
+                best_model = shifted_flux
+                best_shift = float(shift)
+
+    return best_model, best_shift
 
 
 class PrecomputedModelGrid:
@@ -1542,11 +1644,17 @@ def log_likelihood_chi2(
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
     obs_err2: np.ndarray = None,
+    phase_shift_terms: Optional[Dict[str, object]] = None,
     param_spec: Optional[ParamSpec] = None,
 ) -> float:
     """Standard Gaussian log-likelihood (chi-squared)."""
+    eval_phases = (
+        np.asarray(phase_shift_terms["phase_eval_grid"], dtype=float)
+        if (phase_shift_terms and phase_shift_terms.get("enabled", False))
+        else obs_phase
+    )
     model_flux = _evaluate_model(
-        theta, model, obs_phase, reparam=reparam,
+        theta, model, eval_phases, reparam=reparam,
         wind_model=wind_model, fit_wind_shape=fit_wind_shape,
         active_names=active_names,
         param_spec=param_spec,
@@ -1555,6 +1663,12 @@ def log_likelihood_chi2(
         return -np.inf
     if obs_err2 is None:
         obs_err2 = obs_err ** 2
+    if phase_shift_terms and phase_shift_terms.get("enabled", False):
+        model_flux, _ = _apply_best_phase_shift(
+            eval_phases, model_flux, obs_phase, obs_flux, obs_err2, phase_shift_terms
+        )
+        if model_flux is None:
+            return -np.inf
     chi2 = np.sum((obs_flux - model_flux) ** 2 / obs_err2)
     return -0.5 * chi2
 
@@ -1571,6 +1685,7 @@ def log_likelihood_jitter(
     active_names: List[str] = None,
     obs_err2: np.ndarray = None,
     jitter_logf_index: Optional[int] = None,
+    phase_shift_terms: Optional[Dict[str, object]] = None,
     param_spec: Optional[ParamSpec] = None,
 ) -> float:
     """Gaussian log-likelihood with a free fractional systematic error term.
@@ -1579,8 +1694,13 @@ def log_likelihood_jitter(
     The effective variance per point is  sigma_obs^2 + (f * model)^2
     where f = exp(log_f).
     """
+    eval_phases = (
+        np.asarray(phase_shift_terms["phase_eval_grid"], dtype=float)
+        if (phase_shift_terms and phase_shift_terms.get("enabled", False))
+        else obs_phase
+    )
     model_flux = _evaluate_model(
-        theta, model, obs_phase, reparam=reparam,
+        theta, model, eval_phases, reparam=reparam,
         wind_model=wind_model, fit_wind_shape=fit_wind_shape,
         active_names=active_names,
         param_spec=param_spec,
@@ -1596,6 +1716,12 @@ def log_likelihood_jitter(
     f = np.exp(theta[idx_logf])
     if obs_err2 is None:
         obs_err2 = obs_err ** 2
+    if phase_shift_terms and phase_shift_terms.get("enabled", False):
+        model_flux, _ = _apply_best_phase_shift(
+            eval_phases, model_flux, obs_phase, obs_flux, obs_err2, phase_shift_terms
+        )
+        if model_flux is None:
+            return -np.inf
     sigma2 = obs_err2 + (f * model_flux) ** 2
     return -0.5 * np.sum((obs_flux - model_flux) ** 2 / sigma2 + np.log(sigma2))
 
@@ -1612,20 +1738,33 @@ def log_likelihood_studentt(
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
     log_obs_err: np.ndarray = None,
+    phase_shift_terms: Optional[Dict[str, object]] = None,
     param_spec: Optional[ParamSpec] = None,
 ) -> float:
     """Student-t log-likelihood (heavier tails than Gaussian).
 
     ``nu`` controls tail weight; nu -> inf recovers the Gaussian.
     """
+    eval_phases = (
+        np.asarray(phase_shift_terms["phase_eval_grid"], dtype=float)
+        if (phase_shift_terms and phase_shift_terms.get("enabled", False))
+        else obs_phase
+    )
     model_flux = _evaluate_model(
-        theta, model, obs_phase, reparam=reparam,
+        theta, model, eval_phases, reparam=reparam,
         wind_model=wind_model, fit_wind_shape=fit_wind_shape,
         active_names=active_names,
         param_spec=param_spec,
     )
     if model_flux is None:
         return -np.inf
+    if phase_shift_terms and phase_shift_terms.get("enabled", False):
+        obs_err2 = obs_err ** 2
+        model_flux, _ = _apply_best_phase_shift(
+            eval_phases, model_flux, obs_phase, obs_flux, obs_err2, phase_shift_terms
+        )
+        if model_flux is None:
+            return -np.inf
     if log_obs_err is None:
         log_obs_err = np.log(obs_err)
     resid = (obs_flux - model_flux) / obs_err
@@ -1763,22 +1902,26 @@ def log_probability(
     obs_err2 = like_terms.get('obs_err2')
     log_obs_err = like_terms.get('log_obs_err')
     jitter_logf_index = like_terms.get('jitter_logf_index')
+    phase_shift_terms = like_terms.get('phase_shift_terms')
     if likelihood == 'jitter':
         ll = log_likelihood_jitter(
             theta, model, obs_phase, obs_flux, obs_err, **common_kwargs,
             obs_err2=obs_err2,
             jitter_logf_index=jitter_logf_index,
+            phase_shift_terms=phase_shift_terms,
         )
     elif likelihood == 'studentt':
         ll = log_likelihood_studentt(
             theta, model, obs_phase, obs_flux, obs_err,
             nu=studentt_nu, **common_kwargs,
             log_obs_err=log_obs_err,
+            phase_shift_terms=phase_shift_terms,
         )
     else:
         ll = log_likelihood_chi2(
             theta, model, obs_phase, obs_flux, obs_err, **common_kwargs,
             obs_err2=obs_err2,
+            phase_shift_terms=phase_shift_terms,
         )
 
     return lp + ll
@@ -1809,6 +1952,9 @@ def run_mcmc(
     numba_threads_per_worker: Optional[int] = None,
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
+    fit_phase_shift: bool = True,
+    phase_shift_grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
+    phase_shift_eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     param_spec: Optional[ParamSpec] = None,
 ) -> Tuple:
     """
@@ -1936,8 +2082,22 @@ def run_mcmc(
     print(f"Likelihood: {LIKELIHOOD_TYPES[likelihood]}")
     print(f"Wind model: {WIND_MODELS.get(wind_model, wind_model)} "
           f"({wind_model})  | fit_wind_shape={fit_wind_shape}")
+    if fit_phase_shift:
+        print(
+            f"Per-sample phase-shift search: enabled "
+            f"(grid={phase_shift_grid_size}, eval_points={phase_shift_eval_points})"
+        )
+    else:
+        print("Per-sample phase-shift search: disabled")
     print(f"Active params ({n_dim}): {active_names}")
     print(f"Initial parameter values (first walker): {pos[0]}")
+
+    phase_shift_terms = _build_phase_shift_terms(
+        fit_phase_shift,
+        obs_phase,
+        grid_size=phase_shift_grid_size,
+        eval_points=phase_shift_eval_points,
+    )
 
     log_prob_args = (
         # Precomputed invariants to reduce per-call overhead in likelihood eval.
@@ -1960,6 +2120,7 @@ def run_mcmc(
                 active_names.index('log_f')
                 if ('log_f' in active_names) else None
             ),
+            'phase_shift_terms': phase_shift_terms,
         },
         param_spec,
         # fmt: on
@@ -2264,6 +2425,9 @@ def compute_chi2_for_samples(
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
     likelihood: str = 'chi2',
+    fit_phase_shift: bool = True,
+    phase_shift_grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
+    phase_shift_eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     param_spec: Optional[ParamSpec] = None,
 ) -> None:
     """
@@ -2320,6 +2484,19 @@ def compute_chi2_for_samples(
     else:
         iterator = sample_indices
 
+    phase_shift_terms = _build_phase_shift_terms(
+        fit_phase_shift,
+        obs_phase,
+        grid_size=phase_shift_grid_size,
+        eval_points=phase_shift_eval_points,
+    )
+    phase_eval_grid = (
+        np.asarray(phase_shift_terms["phase_eval_grid"], dtype=float)
+        if phase_shift_terms.get("enabled", False)
+        else obs_phase
+    )
+    obs_err2 = obs_err ** 2
+
     for idx in iterator:
         sample_params = samples[idx]
         d1, d2, r, R, i0 = _resolve_geom(
@@ -2337,12 +2514,23 @@ def compute_chi2_for_samples(
         try:
             try:
                 model_flux = model.evaluate(
-                    d1, d2, r, R, i0, obs_phase, wind_params=wp,
+                    d1, d2, r, R, i0, phase_eval_grid, wind_params=wp,
                 )
             except TypeError:
-                model_flux = model.evaluate(d1, d2, r, R, i0, obs_phase)
+                model_flux = model.evaluate(d1, d2, r, R, i0, phase_eval_grid)
 
             if np.all(np.isfinite(model_flux)):
+                if phase_shift_terms.get("enabled", False):
+                    model_flux, _ = _apply_best_phase_shift(
+                        phase_eval_grid,
+                        model_flux,
+                        obs_phase,
+                        obs_flux,
+                        obs_err2,
+                        phase_shift_terms,
+                    )
+                    if model_flux is None:
+                        raise ValueError("phase-shift optimization failed")
                 # Always compute classical chi2 on measurement errors for
                 # comparability across likelihood choices.
                 chi2 = np.sum(((obs_flux - model_flux) / obs_err) ** 2)
@@ -2355,7 +2543,7 @@ def compute_chi2_for_samples(
                 if use_jitter:
                     idx_logf = active_names.index('log_f')
                     f = np.exp(sample_params[idx_logf])
-                    sigma2 = obs_err ** 2 + (f * model_flux) ** 2
+                    sigma2 = obs_err2 + (f * model_flux) ** 2
                     sigma2 = np.maximum(sigma2, np.finfo(float).eps)
                     chi2_eff = np.sum((obs_flux - model_flux) ** 2 / sigma2)
                     red_chi2_eff = chi2_eff / dof if dof > 0 else np.nan
@@ -2505,6 +2693,9 @@ def plot_best_fit(
     fit_wind_shape: bool = False,
     is_binned: bool = True,
     likelihood: str = 'chi2',
+    fit_phase_shift: bool = True,
+    phase_shift_grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
+    phase_shift_eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     param_spec: Optional[ParamSpec] = None,
 ):
     """
@@ -2588,10 +2779,35 @@ def plot_best_fit(
     except TypeError:
         model_flux = eval_fn(*best_params, model_phases)
 
-    try:
-        obs_model = eval_fn(*best_params, obs_phase, wind_params=best_wp)
-    except TypeError:
-        obs_model = eval_fn(*best_params, obs_phase)
+    phase_shift_terms = _build_phase_shift_terms(
+        fit_phase_shift,
+        obs_phase,
+        grid_size=phase_shift_grid_size,
+        eval_points=phase_shift_eval_points,
+    )
+    best_phase_shift = 0.0
+    if phase_shift_terms.get("enabled", False):
+        phase_eval_grid = np.asarray(phase_shift_terms["phase_eval_grid"], dtype=float)
+        try:
+            model_eval = eval_fn(*best_params, phase_eval_grid, wind_params=best_wp)
+        except TypeError:
+            model_eval = eval_fn(*best_params, phase_eval_grid)
+        obs_model, best_phase_shift = _apply_best_phase_shift(
+            phase_eval_grid,
+            model_eval,
+            obs_phase,
+            obs_flux,
+            obs_err ** 2,
+            phase_shift_terms,
+        )
+        if obs_model is None:
+            obs_model = np.full_like(obs_phase, np.nan)
+            best_phase_shift = 0.0
+    else:
+        try:
+            obs_model = eval_fn(*best_params, obs_phase, wind_params=best_wp)
+        except TypeError:
+            obs_model = eval_fn(*best_params, obs_phase)
     f_best = None
     chi2_obs = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
     chi2_eff = np.nan
@@ -2620,8 +2836,17 @@ def plot_best_fit(
             label='Observed (raw 100s)', zorder=4
         )
 
-    ax.plot(model_phases, model_flux, 'r-', lw=2,
-            label=f'Best-fit model ({WIND_MODELS[wind_model]})', zorder=10)
+    if fit_phase_shift:
+        phase_overlay = np.mod(model_phases + best_phase_shift, 1.0)
+        order = np.argsort(phase_overlay)
+        ax.plot(
+            phase_overlay[order], model_flux[order], 'r-', lw=2,
+            label=f'Best-fit model ({WIND_MODELS[wind_model]})',
+            zorder=10,
+        )
+    else:
+        ax.plot(model_phases, model_flux, 'r-', lw=2,
+                label=f'Best-fit model ({WIND_MODELS[wind_model]})', zorder=10)
 
     if (not is_binned) and likelihood == 'jitter' and (f_best is not None):
         phase_mod = np.mod(obs_phase, 1.0)
@@ -2679,6 +2904,8 @@ def plot_best_fit(
         s = stats[p]
         sigma = (s['lower'] + s['upper']) / 2
         rows.append(f"{p}: {s[point_key]:.4f}  (median +/- {sigma:.4f})")
+    if fit_phase_shift:
+        rows.append(f"phase_shift: {best_phase_shift:.4f}")
     if f_best is not None:
         rows.append(f"f: {f_best:.4f}  (from log_f)")
         if np.isfinite(red_chi2_eff):
@@ -2766,6 +2993,9 @@ def compute_pointwise_loglik(
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     active_names: List[str] = None,
+    fit_phase_shift: bool = True,
+    phase_shift_grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
+    phase_shift_eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     param_spec: Optional[ParamSpec] = None,
 ) -> np.ndarray:
     """Compute per-observation log-likelihood for a subset of posterior samples.
@@ -2791,20 +3021,39 @@ def compute_pointwise_loglik(
     else:
         idx_logf = 5
 
+    phase_shift_terms = _build_phase_shift_terms(
+        fit_phase_shift,
+        obs_phase,
+        grid_size=phase_shift_grid_size,
+        eval_points=phase_shift_eval_points,
+    )
+    eval_phases = (
+        np.asarray(phase_shift_terms["phase_eval_grid"], dtype=float)
+        if phase_shift_terms.get("enabled", False)
+        else obs_phase
+    )
+    obs_err2 = obs_err ** 2
+
     for k, idx in enumerate(indices):
         theta = samples[idx]
         model_flux = _evaluate_model(
-            theta, model, obs_phase, reparam=reparam,
+            theta, model, eval_phases, reparam=reparam,
             wind_model=wind_model, fit_wind_shape=fit_wind_shape,
             active_names=active_names,
             param_spec=param_spec,
         )
         if model_flux is None:
             continue
+        if phase_shift_terms.get("enabled", False):
+            model_flux, _ = _apply_best_phase_shift(
+                eval_phases, model_flux, obs_phase, obs_flux, obs_err2, phase_shift_terms
+            )
+            if model_flux is None:
+                continue
 
         if likelihood == 'jitter':
             f = np.exp(theta[idx_logf])
-            sigma2 = obs_err ** 2 + (f * model_flux) ** 2
+            sigma2 = obs_err2 + (f * model_flux) ** 2
             log_lik[k] = -0.5 * ((obs_flux - model_flux) ** 2 / sigma2
                                   + np.log(sigma2) + np.log(2 * np.pi))
         elif likelihood == 'studentt':
@@ -2839,6 +3088,9 @@ def compute_bic_metrics(
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
     log_prob_flat: Optional[np.ndarray] = None,
+    fit_phase_shift: bool = True,
+    phase_shift_grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
+    phase_shift_eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     param_spec: Optional[ParamSpec] = None,
 ) -> Dict[str, float]:
     """Compute BIC from the best posterior point under the selected likelihood."""
@@ -2872,6 +3124,12 @@ def compute_bic_metrics(
         active_names=param_names,
         param_spec=param_spec,
     )
+    phase_shift_terms = _build_phase_shift_terms(
+        fit_phase_shift,
+        obs_phase,
+        grid_size=phase_shift_grid_size,
+        eval_points=phase_shift_eval_points,
+    )
     obs_err2 = obs_err ** 2
     log_obs_err = np.log(obs_err)
     if likelihood == 'jitter':
@@ -2879,17 +3137,19 @@ def compute_bic_metrics(
             theta_hat, model, obs_phase, obs_flux, obs_err,
             obs_err2=obs_err2,
             jitter_logf_index=(param_names.index('log_f') if 'log_f' in param_names else None),
+            phase_shift_terms=phase_shift_terms,
             **like_kwargs,
         )
     elif likelihood == 'studentt':
         logL_hat = log_likelihood_studentt(
             theta_hat, model, obs_phase, obs_flux, obs_err,
-            nu=studentt_nu, log_obs_err=log_obs_err, **like_kwargs,
+            nu=studentt_nu, log_obs_err=log_obs_err,
+            phase_shift_terms=phase_shift_terms, **like_kwargs,
         )
     else:
         logL_hat = log_likelihood_chi2(
             theta_hat, model, obs_phase, obs_flux, obs_err,
-            obs_err2=obs_err2, **like_kwargs,
+            obs_err2=obs_err2, phase_shift_terms=phase_shift_terms, **like_kwargs,
         )
 
     k = int(len(param_names))
@@ -2963,6 +3223,9 @@ def run_arviz_diagnostics(
     kepler: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
+    fit_phase_shift: bool = True,
+    phase_shift_grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
+    phase_shift_eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     param_spec: Optional[ParamSpec] = None,
 ):
     """Run ArviZ convergence diagnostics and optionally BIC.
@@ -3037,6 +3300,9 @@ def run_arviz_diagnostics(
             kepler=kepler,
             wind_model=wind_model,
             fit_wind_shape=fit_wind_shape,
+            fit_phase_shift=fit_phase_shift,
+            phase_shift_grid_size=phase_shift_grid_size,
+            phase_shift_eval_points=phase_shift_eval_points,
             log_prob_flat=log_prob_flat,
             param_spec=param_spec,
         )
@@ -3217,6 +3483,9 @@ def run_single_fit(
         numba_threads_per_worker=getattr(
             args, "numba_threads_per_worker", None
         ),
+        fit_phase_shift=not getattr(args, "no_fit_phase_shift", False),
+        phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
+        phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
     )
 
     try:
@@ -3248,6 +3517,9 @@ def run_single_fit(
         kepler=kepler,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
+        fit_phase_shift=not getattr(args, "no_fit_phase_shift", False),
+        phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
+        phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
         param_spec=param_spec,
     )
     bic_info = (diag_out or {}).get("bic", {})
@@ -3278,6 +3550,9 @@ def run_single_fit(
             fit_wind_shape=fit_wind_shape,
             is_binned=is_binned,
             likelihood=likelihood,
+            fit_phase_shift=not getattr(args, "no_fit_phase_shift", False),
+            phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
+            phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
             param_spec=param_spec,
         )
         stats['reduced_chi2'] = red_chi2
@@ -3348,6 +3623,9 @@ def run_single_fit(
             fit_wind_shape=fit_wind_shape,
             active_names=active_names,
             likelihood=likelihood,
+            fit_phase_shift=not getattr(args, "no_fit_phase_shift", False),
+            phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
+            phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
             param_spec=param_spec,
         )
 
@@ -3538,6 +3816,9 @@ def replot_from_existing(
             fit_wind_shape=saved_fit_wind_shape,
             is_binned=is_binned,
             likelihood=saved_likelihood,
+            fit_phase_shift=not getattr(args, "no_fit_phase_shift", False),
+            phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
+            phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
             param_spec=spec_for_replot,
         )
         stats['reduced_chi2'] = red_chi2
@@ -3578,6 +3859,9 @@ def replot_from_existing(
                 kepler=(saved_mode == 'kepler'),
                 wind_model=saved_wind_model,
                 fit_wind_shape=saved_fws,
+                fit_phase_shift=not getattr(args, "no_fit_phase_shift", False),
+                phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
+                phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
                 param_spec=spec_for_replot,
             )
             bic_info = (diag_out or {}).get("bic", {})
@@ -3599,6 +3883,9 @@ def replot_from_existing(
             fit_wind_shape=saved_fit_wind_shape,
             active_names=loaded_names,
             likelihood=saved_likelihood,
+            fit_phase_shift=not getattr(args, "no_fit_phase_shift", False),
+            phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
+            phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
             param_spec=spec_for_replot,
         )
 
@@ -3753,6 +4040,29 @@ def main():
         type=int,
         default=5000,
         help="Number of MCMC steps"
+    )
+    parser.add_argument(
+        "--no-fit-phase-shift",
+        action="store_true",
+        help="Disable per-sample phase-shift alignment in likelihood evaluation. "
+             "By default, each likelihood call searches for the best phase shift "
+             "that minimizes weighted chi-square against the observed light curve."
+    )
+    parser.add_argument(
+        "--phase-shift-grid-size",
+        type=int,
+        default=DEFAULT_PHASE_SHIFT_GRID_SIZE,
+        help="Number of coarse trial phase shifts per likelihood call when "
+             "phase-shift alignment is enabled. A local refinement pass is "
+             "applied around the best coarse shift, so moderate values are "
+             "typically both fast and accurate."
+    )
+    parser.add_argument(
+        "--phase-shift-eval-points",
+        type=int,
+        default=DEFAULT_PHASE_SHIFT_EVAL_POINTS,
+        help="Number of model phase points used internally before per-sample "
+             "phase-shift alignment (higher = smoother shift interpolation, slower)."
     )
     parser.add_argument(
         "--n-burn",

@@ -71,6 +71,7 @@ from scipy.optimize import minimize
 # Constants adopted from the R script (seconds)
 # -----------------------------------------------------------------------------
 REF_EPOCH: float = 278801348  # Reference time (t0) used for phase zero
+# REF_EPOCH: float = 278800407.267 # corrected reference epoch from find_reference_epoch.py
 ORBITAL_PERIOD: float = 125431  # Orbital period of the system
 
 
@@ -194,7 +195,7 @@ def _derive_err_from_rate_err(df: pd.DataFrame, obs_col: str) -> Optional[pd.Ser
     return pd.Series(derived, index=df.index, dtype=float)
 
 
-def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None, phase_column: Optional[str] = None) -> pd.DataFrame:
+def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None) -> pd.DataFrame:
     """Read a single Chandra observation text file.
 
     The files can be whitespace-delimited with or without headers.
@@ -204,7 +205,6 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
     Supports multiple formats:
     1. Standard format: TIME in first column, tab or space delimited
     2. CIAO format: time column (t_raw or time), space delimited, with "# Columns:" or "# #Columns:" header
-    3. Pre-computed phase: if phase_column is specified, uses that instead of computing from time
     
     Parameters
     ----------
@@ -220,10 +220,6 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
         (e.g., "ERR_RATE" for "NET_RATE", "FLUX_ERR" for "FLUX", "rate_err" for CIAO).
     time_column : str, optional
         Name of column containing timestamps (e.g., "TIME", "time", "t_raw"). If None, will auto-detect.
-    phase_column : str, optional
-        Name of column containing pre-computed orbital phase. If specified, uses this instead of
-        computing phase from time. Useful for CIAO files that already have phase computed.
-    
     Returns
     -------
     DataFrame with columns: time, phase, obs, and the specified observable column renamed to "rate"
@@ -297,27 +293,11 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
                             if time_col:
                                 break
                     
-                    # Check for phase column (pre-computed)
-                    phase_col = None
-                    if phase_column:
-                        for col in df.columns:
-                            if col.upper() == phase_column.upper():
-                                phase_col = col
-                                break
-                        if not phase_col:
-                            print(f"⚠️  Warning: Specified phase column '{phase_column}' not found in {file_path}")
-                    else:
-                        # Auto-detect phase column
-                        for col in df.columns:
-                            if col.upper() == 'PHASE':
-                                phase_col = col
-                                break
-                    
-                    # Need either time or phase column
-                    if not time_col and not phase_col:
-                        print(f"⚠️  Warning: No time or phase column found in {file_path}")
+                    # Need a time column to compute phase
+                    if not time_col:
+                        print(f"⚠️  Warning: No time column found in {file_path}")
                         print(f"   Available columns: {list(df.columns)}")
-                        raise ValueError("No time or phase column found")
+                        raise ValueError("No time column found")
                     
                     # Case-insensitive column matching for obs_column
                     actual_obs_column = None
@@ -337,12 +317,8 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
                         'rate': df[actual_obs_column],
                     })
                     
-                    # Add time column if available
-                    if time_col:
-                        result_df['time'] = df[time_col]
-                    elif phase_col:
-                        # Use a dummy time value if only phase is available
-                        result_df['time'] = 0.0
+                    # Add time column (required for phase computation)
+                    result_df['time'] = df[time_col]
                     
                     # Try to find error column
                     error_col = None
@@ -388,11 +364,8 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
                         if derived is not None:
                             result_df['error'] = derived
                     
-                    # Determine phase: use pre-computed if available, otherwise compute from time
-                    if phase_col:
-                        result_df['phase'] = df[phase_col]
-                    elif time_col:
-                        result_df['phase'] = frac((result_df['time'] - REF_EPOCH) / ORBITAL_PERIOD)
+                    # Always compute phase from timestamps and current ephemeris.
+                    result_df['phase'] = frac((result_df['time'] - REF_EPOCH) / ORBITAL_PERIOD)
                     
                     result_df['obs'] = label
                     
@@ -418,7 +391,7 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
 # Data loading helpers
 # -----------------------------------------------------------------------------
 
-def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None, phase_column: Optional[str] = None) -> pd.DataFrame:
+def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None) -> pd.DataFrame:
     """Load observational data from *data_dir*.
 
     Parameters
@@ -431,9 +404,6 @@ def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optiona
         Name of column to use for errors. If None, will auto-detect based on obs_column.
     time_column : str, optional
         Name of column containing timestamps. If None, will auto-detect (looks for 'time', 't_raw').
-    phase_column : str, optional
-        Name of column containing pre-computed phase. If None, will auto-detect or compute from time.
-
     Returns
     -------
     DataFrame with columns: time, rate (containing the specified observable), error (optional), phase, obs
@@ -448,7 +418,7 @@ def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optiona
         )
 
     print(f"Loading {len(files)} observation file(s) from {data_dir}")
-    dfs = [read_observation(fp, os.path.basename(fp), obs_column, obs_error_column, time_column, phase_column) for fp in files]
+    dfs = [read_observation(fp, os.path.basename(fp), obs_column, obs_error_column, time_column) for fp in files]
     return pd.concat(dfs, ignore_index=True)
 
 
@@ -868,14 +838,6 @@ def main() -> None:
              "Useful for CIAO format files where time may be in a different column.",
     )
     parser.add_argument(
-        "--phase-column",
-        type=str,
-        default=None,
-        help="Column name for pre-computed orbital phase (e.g., 'phase'). "
-             "If specified, uses this column instead of computing phase from time. "
-             "Useful for CIAO files that already have phase computed.",
-    )
-    parser.add_argument(
         "--sim-column",
         type=str,
         nargs='+',
@@ -922,7 +884,6 @@ def main() -> None:
     obs_column = args.obs_column if args.obs_column else "rate"
     obs_error_column = args.obs_error_column
     time_column = args.time_column
-    phase_column = args.phase_column
     
     if args.obs_column:
         print(f"Using observation column: {obs_column}")
@@ -932,15 +893,11 @@ def main() -> None:
             print(f"Error column will be auto-detected")
     if time_column:
         print(f"Using time column: {time_column}")
-    if phase_column:
-        print(f"Using pre-computed phase column: {phase_column}")
-    
     df = load_data(
         args.data_dir,
         obs_column=obs_column,
         obs_error_column=obs_error_column,
         time_column=time_column,
-        phase_column=phase_column,
     )
     print(f"Loaded {len(df)} data point(s) from {df['obs'].nunique()} observation(s).")
     
