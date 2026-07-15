@@ -195,7 +195,14 @@ def _derive_err_from_rate_err(df: pd.DataFrame, obs_col: str) -> Optional[pd.Ser
     return pd.Series(derived, index=df.index, dtype=float)
 
 
-def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None) -> pd.DataFrame:
+def read_observation(
+    file_path: str,
+    label: str,
+    obs_column: str = "rate",
+    obs_error_column: Optional[str] = None,
+    time_column: Optional[str] = None,
+    counts_column: Optional[str] = "counts",
+) -> pd.DataFrame:
     """Read a single Chandra observation text file.
 
     The files can be whitespace-delimited with or without headers.
@@ -220,6 +227,9 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
         (e.g., "ERR_RATE" for "NET_RATE", "FLUX_ERR" for "FLUX", "rate_err" for CIAO).
     time_column : str, optional
         Name of column containing timestamps (e.g., "TIME", "time", "t_raw"). If None, will auto-detect.
+    counts_column : str, optional
+        Name of column containing counts. If present in the file, it is passed through
+        to the output as ``counts``.
     Returns
     -------
     DataFrame with columns: time, phase, obs, and the specified observable column renamed to "rate"
@@ -363,6 +373,17 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
                         derived = _derive_err_from_rate_err(df, actual_obs_column)
                         if derived is not None:
                             result_df['error'] = derived
+
+                    if counts_column:
+                        actual_counts_column = None
+                        for col in df.columns:
+                            if col.upper() == counts_column.upper():
+                                actual_counts_column = col
+                                break
+                        if actual_counts_column:
+                            result_df['counts'] = pd.to_numeric(
+                                df[actual_counts_column], errors='coerce'
+                            )
                     
                     # Always compute phase from timestamps and current ephemeris.
                     result_df['phase'] = frac((result_df['time'] - REF_EPOCH) / ORBITAL_PERIOD)
@@ -391,7 +412,13 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
 # Data loading helpers
 # -----------------------------------------------------------------------------
 
-def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None) -> pd.DataFrame:
+def load_data(
+    data_dir: str,
+    obs_column: str = "rate",
+    obs_error_column: Optional[str] = None,
+    time_column: Optional[str] = None,
+    counts_column: Optional[str] = "counts",
+) -> pd.DataFrame:
     """Load observational data from *data_dir*.
 
     Parameters
@@ -404,6 +431,9 @@ def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optiona
         Name of column to use for errors. If None, will auto-detect based on obs_column.
     time_column : str, optional
         Name of column containing timestamps. If None, will auto-detect (looks for 'time', 't_raw').
+    counts_column : str, optional
+        Name of column containing counts. If present, propagated into the
+        combined output as ``counts``.
     Returns
     -------
     DataFrame with columns: time, rate (containing the specified observable), error (optional), phase, obs
@@ -418,7 +448,17 @@ def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optiona
         )
 
     print(f"Loading {len(files)} observation file(s) from {data_dir}")
-    dfs = [read_observation(fp, os.path.basename(fp), obs_column, obs_error_column, time_column) for fp in files]
+    dfs = [
+        read_observation(
+            fp,
+            os.path.basename(fp),
+            obs_column,
+            obs_error_column,
+            time_column,
+            counts_column=counts_column,
+        )
+        for fp in files
+    ]
     return pd.concat(dfs, ignore_index=True)
 
 
@@ -522,6 +562,149 @@ def phase_bin_data(
         print(f"Phase binning: {len(df)} points -> {len(result)} bins "
               f"(avg {len(df)/n_bins:.1f} points/bin)")
     
+    return result
+
+
+def phase_bin_data_snr(
+    df: pd.DataFrame,
+    counts_per_bin: int = 100,
+    counts_column: str = 'counts',
+    rate_column: str = 'rate',
+    error_column: str = 'error',
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Adaptive phase binning with approximately constant counts per bin.
+
+    Points are sorted by phase and grouped greedily until each bin reaches
+    ``counts_per_bin`` total counts, yielding variable phase-width bins.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Observed data with at least ``phase``, *rate_column*, and *counts_column*.
+    counts_per_bin : int
+        Target counts per bin.
+    counts_column : str
+        Name of column containing counts.
+    rate_column : str
+        Name of column containing flux/rate values.
+    error_column : str
+        Name of column containing error values.
+    verbose : bool
+        Print summary of the binning operation.
+
+    Returns
+    -------
+    DataFrame
+        Columns: phase, rate, error, n_points, total_counts, phase_lo, phase_hi, width
+    """
+    if counts_per_bin <= 0:
+        raise ValueError("counts_per_bin must be > 0")
+    if counts_column not in df.columns:
+        raise ValueError(f"counts column '{counts_column}' not found in DataFrame")
+    if rate_column not in df.columns:
+        raise ValueError(f"rate column '{rate_column}' not found in DataFrame")
+
+    work = df.copy()
+    work = work[np.isfinite(work['phase']) & np.isfinite(work[rate_column])].copy()
+    if work.empty:
+        return pd.DataFrame(
+            columns=['phase', 'rate', 'error', 'n_points', 'total_counts', 'phase_lo', 'phase_hi', 'width']
+        )
+
+    work[counts_column] = pd.to_numeric(work[counts_column], errors='coerce').fillna(0.0)
+    work[counts_column] = np.where(work[counts_column] > 0.0, work[counts_column], 0.0)
+    work = work.sort_values('phase').reset_index(drop=True)
+
+    target = float(counts_per_bin)
+    bins: List[List[int]] = []
+    current: List[int] = []
+    current_counts = 0.0
+    counts_vals = work[counts_column].to_numpy(dtype=float)
+
+    for i, c in enumerate(counts_vals):
+        current.append(i)
+        current_counts += c
+        if current_counts >= target:
+            bins.append(current)
+            current = []
+            current_counts = 0.0
+
+    if current:
+        bins.append(current)
+
+    if len(bins) >= 2:
+        tail_counts = float(np.sum(counts_vals[bins[-1]]))
+        if tail_counts < target:
+            bins[-2].extend(bins[-1])
+            bins.pop()
+
+    binned_data = []
+    for indices in bins:
+        bin_df = work.iloc[indices]
+        rate_vals = bin_df[rate_column].to_numpy(dtype=float)
+        err_vals = (
+            bin_df[error_column].to_numpy(dtype=float)
+            if (error_column in bin_df.columns)
+            else np.full(len(bin_df), np.nan, dtype=float)
+        )
+        has_errors = np.any(np.isfinite(err_vals))
+
+        if has_errors:
+            valid_err = err_vals[(err_vals > 0) & np.isfinite(err_vals)]
+            if len(valid_err) > 0:
+                median_err = float(np.median(valid_err))
+                err_vals = np.where(
+                    (err_vals <= 0) | ~np.isfinite(err_vals),
+                    median_err,
+                    err_vals,
+                )
+            else:
+                fallback = np.std(rate_vals) if len(rate_vals) > 1 else np.abs(rate_vals[0]) * 0.1
+                err_vals = np.full_like(rate_vals, max(float(fallback), np.finfo(float).eps))
+            weights = 1.0 / err_vals ** 2
+            mean_rate = float(np.average(rate_vals, weights=weights))
+            mean_err = float(np.sqrt(1.0 / np.sum(weights)))
+        else:
+            mean_rate = float(np.mean(rate_vals))
+            mean_err = float(np.std(rate_vals) / np.sqrt(len(rate_vals))) if len(rate_vals) > 1 else 0.0
+
+        phase_vals = bin_df['phase'].to_numpy(dtype=float)
+        bin_counts = np.maximum(bin_df[counts_column].to_numpy(dtype=float), 0.0)
+        total_counts = float(np.sum(bin_counts))
+        if total_counts > 0:
+            phase_center = float(np.average(phase_vals, weights=bin_counts))
+        else:
+            phase_center = float(np.mean(phase_vals))
+
+        phase_lo = float(np.min(phase_vals))
+        phase_hi = float(np.max(phase_vals))
+        width = float(max(phase_hi - phase_lo, 0.0))
+
+        binned_data.append(
+            {
+                'phase': phase_center,
+                'rate': mean_rate,
+                'error': mean_err,
+                'n_points': int(len(bin_df)),
+                'total_counts': total_counts,
+                'phase_lo': phase_lo,
+                'phase_hi': phase_hi,
+                'width': width,
+            }
+        )
+
+    result = pd.DataFrame(binned_data)
+    if 'obs' in work.columns:
+        result['obs'] = 'binned'
+
+    if verbose:
+        avg_counts = float(np.mean(result['total_counts'])) if len(result) > 0 else 0.0
+        print(
+            f"Adaptive phase binning: {len(work)} points -> {len(result)} bins "
+            f"(target {counts_per_bin} counts/bin, avg {avg_counts:.1f})"
+        )
     return result
 
 
