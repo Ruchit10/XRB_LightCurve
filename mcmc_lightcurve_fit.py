@@ -131,6 +131,9 @@ from chandra_phase_analysis import (
     load_data as _load_data_base,
     phase_bin_data as _phase_bin_data_base,
     phase_bin_data_snr as _phase_bin_data_snr_base,
+    smooth_lightcurve,
+    estimate_scattered_flux,
+    add_residual_panel,
 )
 
 
@@ -227,6 +230,7 @@ class ParamSpec:
     active_labels: List[str] = field(default_factory=list)
     frozen: Dict[str, float] = field(default_factory=dict)
     fit_wind_shape: bool = False
+    fit_scatter: bool = False
     wind_model: str = 'smooth_pl'
     likelihood: str = 'chi2'
     orbital_period_s: float = float(ORBITAL_PERIOD)
@@ -276,6 +280,7 @@ def build_param_spec(
     kepler: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
+    fit_scatter: bool = False,
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
 ) -> ParamSpec:
@@ -289,6 +294,9 @@ def build_param_spec(
     if likelihood == 'jitter':
         names.append('log_f')
         labels.append(r'$\ln\,f$')
+    if fit_scatter:
+        names.append('f_scatter')
+        labels.append(r'$f_\mathrm{scat}$')
     if fit_wind_shape:
         if wind_model not in WIND_SHAPE_FIT:
             raise ValueError(
@@ -302,6 +310,7 @@ def build_param_spec(
     valid_frozen = set(names)
     # Allow freezing shape parameters even when fit_wind_shape is off.
     valid_frozen.update(WIND_SHAPE_FIT.get(wind_model, []))
+    valid_frozen.add('f_scatter')
 
     if 'log_f' in frozen:
         raise ValueError("Freezing log_f is not supported. Use --likelihood chi2/jitter.")
@@ -332,6 +341,7 @@ def build_param_spec(
         active_labels=active_labels,
         frozen=frozen,
         fit_wind_shape=fit_wind_shape,
+        fit_scatter=fit_scatter,
         wind_model=wind_model,
         likelihood=likelihood,
         orbital_period_s=float(orbital_period_s),
@@ -406,6 +416,7 @@ def get_param_config(
     kepler: bool = False,
     wind_model: str = 'smooth_pl',
     fit_wind_shape: bool = False,
+    fit_scatter: bool = False,
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
 ):
@@ -426,6 +437,7 @@ def get_param_config(
         kepler=kepler,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
+        fit_scatter=fit_scatter,
         frozen=frozen,
         orbital_period_s=orbital_period_s,
     )
@@ -438,6 +450,8 @@ def get_active_priors(
     fit_wind_shape: bool,
     likelihood: str,
     shape_prior_overrides: Dict[str, Dict] = None,
+    fit_scatter: bool = False,
+    scatter_prior: Optional[Dict[str, float]] = None,
     frozen: Optional[Dict[str, float]] = None,
 ) -> Dict:
     """Build the merged prior dict covering geometry + jitter + shape params.
@@ -456,6 +470,8 @@ def get_active_priors(
             if shape_prior_overrides and name in shape_prior_overrides:
                 prior.update(shape_prior_overrides[name])
             out[name] = prior
+    if fit_scatter and scatter_prior is not None:
+        out.setdefault('f_scatter', dict(scatter_prior))
     if frozen:
         for name in frozen:
             out.pop(name, None)
@@ -980,6 +996,23 @@ def _resolve_shape(
     )
 
 
+def _resolve_scatter(
+    theta: np.ndarray,
+    active_names: Optional[List[str]],
+    param_spec: Optional[ParamSpec],
+) -> float:
+    """Resolve additive scattered flux from active or frozen parameters."""
+    names = list(active_names or [])
+    if param_spec is not None and param_spec.active_names:
+        names = list(param_spec.active_names)
+    if 'f_scatter' in names:
+        idx = names.index('f_scatter')
+        return float(theta[idx])
+    if param_spec is not None and 'f_scatter' in param_spec.frozen:
+        return float(param_spec.frozen['f_scatter'])
+    return 0.0
+
+
 def _evaluate_model(
     theta,
     model,
@@ -1031,6 +1064,11 @@ def _evaluate_model(
         return None
     if np.any(~np.isfinite(model_flux)):
         return None
+    model_flux = np.asarray(model_flux, dtype=float) + _resolve_scatter(
+        np.asarray(theta, dtype=float),
+        active_names=active_names,
+        param_spec=param_spec,
+    )
     return model_flux
 
 
@@ -1366,14 +1404,26 @@ def run_mcmc(
 
     pos = initial + scatter * np.random.randn(n_walkers, n_dim)
 
-    # Clip walkers inside the box for every dim.
+    # Clip walkers just inside the box for every dim.
+    #
+    # The inset must be relative to each parameter's own scale. A hardcoded
+    # absolute epsilon breaks parameters whose natural scale is tiny: for
+    # f_scatter (a flux, ~1e-13 erg/cm^2/s, prior min = 0) an absolute 1e-12
+    # floor exceeded the entire plausible range, so every walker was clipped to
+    # the same value, the column had zero variance, and emcee aborted with
+    # "Initial state has a large condition number".
     for i, name in enumerate(active_names):
         prior = priors[name]
-        pos[:, i] = np.clip(
-            pos[:, i],
-            prior['min'] + 0.01 * abs(prior['min']) + 1e-12,
-            prior['max'] - 0.01 * abs(prior['max']) - 1e-12,
-        )
+        lo_bound = float(prior['min'])
+        hi_bound = float(prior['max'])
+        span = hi_bound - lo_bound
+        pad = 1e-9 * span if np.isfinite(span) and span > 0 else 0.0
+        lo = lo_bound + 0.01 * abs(lo_bound) + pad
+        hi = hi_bound - 0.01 * abs(hi_bound) - pad
+        if not (lo < hi):
+            # Degenerate/inverted box after the inset: fall back to the raw box.
+            lo, hi = lo_bound, hi_bound
+        pos[:, i] = np.clip(pos[:, i], lo, hi)
 
     # Enforce r < R only when both are free dimensions.
     idx_r = active_names.index('r') if 'r' in active_names else None
@@ -1382,6 +1432,25 @@ def run_mcmc(
         for j in range(n_walkers):
             if pos[j, idx_r] >= pos[j, idx_R]:
                 pos[j, idx_r] = pos[j, idx_R] * 0.1
+
+    # Final guard: emcee/zeus require linearly independent walkers, so any dim
+    # that ended up constant (all walkers pinned to a bound) must be re-spread.
+    for i, name in enumerate(active_names):
+        if np.ptp(pos[:, i]) > 0:
+            continue
+        prior = priors[name]
+        lo_bound, hi_bound = float(prior['min']), float(prior['max'])
+        span = hi_bound - lo_bound
+        if not (np.isfinite(span) and span > 0):
+            continue
+        warnings.warn(
+            f"Walker initialization for '{name}' collapsed to a single value "
+            f"({pos[0, i]:.6g}); re-spreading uniformly inside its prior box. "
+            f"Check that the prior for '{name}' is on a sensible scale."
+        )
+        pos[:, i] = np.random.uniform(
+            lo_bound + 0.05 * span, hi_bound - 0.05 * span, size=n_walkers
+        )
 
     parallel_info = f", {n_threads} threads" if n_threads > 1 else " (serial)"
     print(f"\nStarting MCMC ({sampler_type}) with {n_walkers} walkers, "
@@ -1786,7 +1855,6 @@ def compute_chi2_for_samples(
         wind_model = param_spec.wind_model
         fit_wind_shape = param_spec.fit_wind_shape
         likelihood = param_spec.likelihood
-    frozen = (param_spec.frozen if param_spec is not None else None)
     use_jitter = (likelihood == 'jitter' and active_names is not None and 'log_f' in active_names)
 
     if HAS_TQDM and verbose:
@@ -1812,24 +1880,24 @@ def compute_chi2_for_samples(
         d1, d2, r, R, i0 = _resolve_geom(
             sample_params, reparam=reparam, active_names=active_names, param_spec=param_spec
         )
-        wp = _resolve_shape(
-            theta=sample_params,
-            R_value=R,
-            active_names=active_names,
-            wind_model=wind_model,
-            fit_wind_shape=fit_wind_shape,
-            frozen=frozen,
-        )
-
         try:
-            try:
-                model_flux = model.evaluate(
-                    d1, d2, r, R, i0, phase_eval_grid, wind_params=wp,
-                )
-            except TypeError:
-                model_flux = model.evaluate(d1, d2, r, R, i0, phase_eval_grid)
+            # Route through _evaluate_model rather than calling model.evaluate
+            # directly, so the wind-shape resolution AND the additive f_scatter
+            # term are identical to what the likelihood used. Evaluating here
+            # by hand previously omitted f_scatter, silently biasing every
+            # per-sample chi2 whenever --fit-scatter was active.
+            model_flux = _evaluate_model(
+                sample_params,
+                model,
+                phase_eval_grid,
+                reparam=reparam,
+                wind_model=wind_model,
+                fit_wind_shape=fit_wind_shape,
+                active_names=active_names,
+                param_spec=param_spec,
+            )
 
-            if np.all(np.isfinite(model_flux)):
+            if model_flux is not None:
                 if phase_shift_terms.get("enabled", False):
                     model_flux, _ = _apply_best_phase_shift(
                         phase_eval_grid,
@@ -1904,6 +1972,27 @@ def compute_chi2_for_samples(
         print(f"Chi-square data saved to: {output_path} ({file_size:.1f} KB)")
 
 
+def _fmt_val(value: float, width: int = 0) -> str:
+    """Format a parameter value without silently rounding it to zero.
+
+    Fixed-point ``%.6f`` is fine for geometry (order 1-100) but destroys
+    flux-scale parameters: ``f_scatter`` has a natural size of ~1e-13
+    erg/cm^2/s and printed as "0.000000", which reads as "not fitted". Fall
+    back to scientific notation for small-magnitude values.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(v):
+        text = f"{v}"
+    elif v != 0.0 and abs(v) < 1e-4:
+        text = f"{v:.6e}"
+    else:
+        text = f"{v:.6f}"
+    return f"{text:<{width}}" if width else text
+
+
 def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str] = None,
                    reparam: bool = False):
     """Print formatted results table."""
@@ -1917,7 +2006,7 @@ def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str
 
     for param in param_names:
         s = stats[param]
-        print(f"{param:<15} {s['median']:<12.6f} {s['lower']:<12.6f} {s['upper']:<12.6f}")
+        print(f"{param:<15} {_fmt_val(s['median'], 12)} {_fmt_val(s['lower'], 12)} {_fmt_val(s['upper'], 12)}")
 
     if reparam or ('d1' in stats and 'd2' in stats):
         print('-'*60)
@@ -1925,7 +2014,7 @@ def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str
         for derived in ('d1', 'd2'):
             if derived in stats:
                 s = stats[derived]
-                print(f"{derived:<15} {s['median']:<12.6f} {s['lower']:<12.6f} {s['upper']:<12.6f}")
+                print(f"{derived:<15} {_fmt_val(s['median'], 12)} {_fmt_val(s['lower'], 12)} {_fmt_val(s['upper'], 12)}")
 
     print('='*60)
 
@@ -2008,6 +2097,10 @@ def plot_best_fit(
     phase_shift_grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
     phase_shift_eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     param_spec: Optional[ParamSpec] = None,
+    smooth_phase: Optional[np.ndarray] = None,
+    smooth_flux: Optional[np.ndarray] = None,
+    smooth_flux_err: Optional[np.ndarray] = None,
+    smooth_sigma: float = 0.01,
 ):
     """
     Plot observed data with best-fit model overlay.
@@ -2055,40 +2148,37 @@ def plot_best_fit(
             f"If this parameter is frozen, pass param_spec with frozen values."
         )
 
-    if reparam:
-        best_d1 = _value_from_stats_or_frozen('d1')
-        best_d2 = _value_from_stats_or_frozen('d2')
-        best_params = [
-            best_d1,
-            best_d2,
-            _value_from_stats_or_frozen('r'),
-            _value_from_stats_or_frozen('R'),
-            _value_from_stats_or_frozen('i0'),
-        ]
-    else:
-        best_params = [_value_from_stats_or_frozen(p) for p in PARAM_NAMES]
+    # Reconstruct the point-estimate theta in active-parameter order and reuse
+    # _evaluate_model — the same entry point the likelihood uses. That routes
+    # geometry resolution (phys / reparam / kepler / frozen), wind-shape
+    # resolution and the additive f_scatter through one implementation, so the
+    # drawn curve, the residual basis and the reported chi2 cannot drift apart.
+    theta_best = np.array(
+        [_value_from_stats_or_frozen(name) for name in param_names],
+        dtype=float,
+    )
 
-    # Build best-fit wind_params if shape was fitted.
-    best_R = best_params[3]
-    if fit_wind_shape and wind_model in WIND_SHAPE_FIT:
-        best_wp = dict(WIND_SHAPE_FIXED.get(wind_model, {}))
-        for sname in WIND_SHAPE_FIT[wind_model]:
-            if sname in stats:
-                best_wp[sname] = float(stats[sname][point_key])
-            elif param_spec is not None and sname in param_spec.frozen:
-                best_wp[sname] = float(param_spec.frozen[sname])
-        if wind_model in ('beta_law', 'confinement'):
-            best_wp['R_star'] = float(best_R)
-    else:
-        best_wp = None
+    def _eval_at(phases: np.ndarray) -> np.ndarray:
+        out = _evaluate_model(
+            theta_best,
+            model,
+            np.asarray(phases, dtype=float),
+            reparam=reparam,
+            wind_model=wind_model,
+            fit_wind_shape=fit_wind_shape,
+            active_names=param_names,
+            param_spec=param_spec,
+        )
+        if out is None:
+            return np.full(np.shape(phases), np.nan, dtype=float)
+        return np.asarray(out, dtype=float)
 
-    eval_fn = getattr(model, 'evaluate_direct', model.evaluate)
+    # Reported separately in the annotation box; the value itself is already
+    # baked into every _eval_at() result by _evaluate_model.
+    f_scatter_best = _resolve_scatter(theta_best, param_names, param_spec)
 
     model_phases = np.linspace(0, 1, 360)
-    try:
-        model_flux = eval_fn(*best_params, model_phases, wind_params=best_wp)
-    except TypeError:
-        model_flux = eval_fn(*best_params, model_phases)
+    model_flux = _eval_at(model_phases)
 
     phase_shift_terms = _build_phase_shift_terms(
         fit_phase_shift,
@@ -2099,13 +2189,9 @@ def plot_best_fit(
     best_phase_shift = 0.0
     if phase_shift_terms.get("enabled", False):
         phase_eval_grid = np.asarray(phase_shift_terms["phase_eval_grid"], dtype=float)
-        try:
-            model_eval = eval_fn(*best_params, phase_eval_grid, wind_params=best_wp)
-        except TypeError:
-            model_eval = eval_fn(*best_params, phase_eval_grid)
         obs_model, best_phase_shift = _apply_best_phase_shift(
             phase_eval_grid,
-            model_eval,
+            _eval_at(phase_eval_grid),
             obs_phase,
             obs_flux,
             obs_err ** 2,
@@ -2115,10 +2201,7 @@ def plot_best_fit(
             obs_model = np.full_like(obs_phase, np.nan)
             best_phase_shift = 0.0
     else:
-        try:
-            obs_model = eval_fn(*best_params, obs_phase, wind_params=best_wp)
-        except TypeError:
-            obs_model = eval_fn(*best_params, obs_phase)
+        obs_model = _eval_at(obs_phase)
     f_best = None
     chi2_obs = np.sum(((obs_flux - obs_model) / obs_err) ** 2)
     chi2_eff = np.nan
@@ -2133,10 +2216,16 @@ def plot_best_fit(
     red_chi2 = chi2 / dof if dof > 0 else np.nan
     red_chi2_eff = chi2_eff / dof if (dof > 0 and np.isfinite(chi2_eff)) else np.nan
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, (ax, ax_res) = plt.subplots(
+        2,
+        1,
+        figsize=(10, 8),
+        sharex=True,
+        gridspec_kw={'height_ratios': [3, 1]},
+    )
+    xerr = None
 
     if is_binned:
-        xerr = None
         if obs_phase_width is not None:
             width_arr = np.asarray(obs_phase_width, dtype=float)
             if width_arr.shape == obs_phase.shape:
@@ -2164,7 +2253,34 @@ def plot_best_fit(
         ax.plot(model_phases, model_flux, 'r-', lw=2,
                 label=f'Best-fit model ({WIND_MODELS[wind_model]})', zorder=10)
 
-    ax.set_xlabel('Orbital Phase', fontsize=12)
+    if smooth_phase is not None and smooth_flux is not None:
+        sphase = np.mod(np.asarray(smooth_phase, dtype=float), 1.0)
+        sflux = np.asarray(smooth_flux, dtype=float)
+        sorder = np.argsort(sphase)
+        sphase = sphase[sorder]
+        sflux = sflux[sorder]
+        ax.plot(
+            sphase,
+            sflux,
+            '--',
+            color='green',
+            lw=1.5,
+            label=f'Gaussian-smoothed data ($\\sigma$={smooth_sigma:.3f})',
+            zorder=8,
+        )
+        if smooth_flux_err is not None:
+            serr = np.asarray(smooth_flux_err, dtype=float)[sorder]
+            if np.any(np.isfinite(serr)):
+                ax.fill_between(
+                    sphase,
+                    sflux - serr,
+                    sflux + serr,
+                    color='green',
+                    alpha=0.2,
+                    label='Smoothed 1$\\sigma$ (MC)',
+                    zorder=3,
+                )
+
     ax.set_ylabel('Flux (erg/cm²/s)', fontsize=12)
     if np.isfinite(red_chi2) and red_chi2 < 1e-2:
         red_chi2_label = f"{red_chi2:.2e}"
@@ -2199,10 +2315,23 @@ def plot_best_fit(
         rows.append(f"f: {f_best:.4f}  (from log_f)")
         if np.isfinite(red_chi2_eff):
             rows.append(f"reduced_chi2_eff: {red_chi2_eff:.3e}")
+    if 'f_scatter' in stats or (param_spec is not None and 'f_scatter' in param_spec.frozen):
+        rows.append(f"f_scatter: {f_scatter_best:.4g}")
     param_text = '\n'.join(rows)
     ax.text(0.02, 0.98, param_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    add_residual_panel(
+        ax_res,
+        obs_phase,
+        obs_flux,
+        obs_model,
+        obs_err,
+        xerr=xerr,
+    )
+    ax_res.set_ylim(-5.0, 5.0)
+    ax_res.set_xlabel('Orbital Phase', fontsize=12)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -2627,6 +2756,8 @@ def run_single_fit(
     fit_wind_shape: bool = False,
     shape_prior_overrides: Dict[str, Dict] = None,
     is_binned: bool = True,
+    smoothed: Optional[pd.DataFrame] = None,
+    scatter_prior: Optional[Dict[str, float]] = None,
 ) -> Tuple[Dict, object]:
     """Run MCMC fit for a single band/wind_model combination."""
 
@@ -2641,6 +2772,7 @@ def run_single_fit(
         sim_params = {}
 
     likelihood = getattr(args, 'likelihood', 'chi2')
+    fit_scatter = bool(getattr(args, 'fit_scatter', False))
     frozen_params = dict(getattr(args, 'frozen_params', {}) or {})
     orbital_period_s = float(getattr(args, 'orbital_period', ORBITAL_PERIOD))
 
@@ -2650,6 +2782,7 @@ def run_single_fit(
         kepler=kepler,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
+        fit_scatter=fit_scatter,
         frozen=frozen_params,
         orbital_period_s=orbital_period_s,
     )
@@ -2661,6 +2794,8 @@ def run_single_fit(
         fit_wind_shape=fit_wind_shape,
         likelihood=likelihood,
         shape_prior_overrides=shape_prior_overrides,
+        fit_scatter=fit_scatter,
+        scatter_prior=scatter_prior,
         frozen=param_spec.frozen,
     )
 
@@ -2791,6 +2926,19 @@ def run_single_fit(
             phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
             phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
             param_spec=param_spec,
+            smooth_phase=(
+                smoothed["phase"].to_numpy(dtype=float)
+                if smoothed is not None else None
+            ),
+            smooth_flux=(
+                smoothed["flux_smooth"].to_numpy(dtype=float)
+                if smoothed is not None else None
+            ),
+            smooth_flux_err=(
+                smoothed["flux_smooth_err"].to_numpy(dtype=float)
+                if smoothed is not None else None
+            ),
+            smooth_sigma=float(getattr(args, "smooth_sigma", 0.01)),
         )
         stats['reduced_chi2'] = red_chi2
 
@@ -2884,6 +3032,7 @@ def replot_from_existing(
     fit_wind_shape: bool = False,
     shape_prior_overrides: Dict[str, Dict] = None,
     is_binned: bool = True,
+    smoothed: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict]:
     """Regenerate plots from existing MCMC results without re-running MCMC.
 
@@ -2928,6 +3077,7 @@ def replot_from_existing(
         kepler=(saved_mode == 'kepler'),
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
+        fit_scatter=bool(getattr(args, 'fit_scatter', False)),
         frozen=saved_frozen,
         orbital_period_s=saved_orbital_period_s,
     )
@@ -2958,11 +3108,12 @@ def replot_from_existing(
         geom_names = KEPLER_PARAM_NAMES
     else:
         geom_names = PARAM_NAMES
-    extra_dims = [n for n in loaded_names
-                  if n not in geom_names and n != 'log_f']
+    extra_dims = [n for n in loaded_names if n not in geom_names and n not in ('log_f', 'f_scatter')]
     saved_fit_wind_shape = bool(extra_dims) or fit_wind_shape
+    saved_fit_scatter = ('f_scatter' in loaded_names) or bool(getattr(args, 'fit_scatter', False))
     spec_for_replot.active_names = list(loaded_names)
     spec_for_replot.fit_wind_shape = bool(saved_fit_wind_shape)
+    spec_for_replot.fit_scatter = bool(saved_fit_scatter)
 
     print("\nUsing DirectLightCurveModel for replot.")
     model = DirectLightCurveModel(
@@ -2999,6 +3150,8 @@ def replot_from_existing(
                 active_labels.append(geom_labels[geom_names.index(name)])
             elif name == 'log_f':
                 active_labels.append(r'$\ln\,f$')
+            elif name == 'f_scatter':
+                active_labels.append(r'$f_\mathrm{scat}$')
             elif name in WIND_SHAPE_LABELS:
                 active_labels.append(WIND_SHAPE_LABELS[name])
             else:
@@ -3022,6 +3175,19 @@ def replot_from_existing(
             phase_shift_grid_size=getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE),
             phase_shift_eval_points=getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS),
             param_spec=spec_for_replot,
+            smooth_phase=(
+                smoothed["phase"].to_numpy(dtype=float)
+                if smoothed is not None else None
+            ),
+            smooth_flux=(
+                smoothed["flux_smooth"].to_numpy(dtype=float)
+                if smoothed is not None else None
+            ),
+            smooth_flux_err=(
+                smoothed["flux_smooth_err"].to_numpy(dtype=float)
+                if smoothed is not None else None
+            ),
+            smooth_sigma=float(getattr(args, "smooth_sigma", 0.01)),
         )
         stats['reduced_chi2'] = red_chi2
 
@@ -3230,8 +3396,21 @@ def main():
         default=None,
         metavar="NAME=VAL[,NAME=VAL,...]",
         help="Freeze selected free parameters at fixed values and remove them from sampling. "
-             "Supported names: d1,d2,a,q,r,R,i0,M_X,M_RH,Rb,p,beta,fconf,ell. "
+             "Supported names: d1,d2,a,q,r,R,i0,M_X,M_RH,f_scatter,Rb,p,beta,fconf,ell. "
              "log_f cannot be frozen."
+    )
+    parser.add_argument(
+        "--fit-scatter",
+        action="store_true",
+        help="Add a free constant scattered-flux parameter f_scatter to the model.",
+    )
+    parser.add_argument(
+        "--scatter-eclipse-phase",
+        nargs=2,
+        type=float,
+        default=(0.4, 0.6),
+        metavar=("PHASE_MIN", "PHASE_MAX"),
+        help="Phase window used to center the f_scatter prior on the observed eclipse-floor flux.",
     )
     parser.add_argument(
         "--n-walkers",
@@ -3318,6 +3497,29 @@ def main():
         "--no-plots",
         action="store_true",
         help="Skip generating diagnostic plots"
+    )
+    parser.add_argument(
+        "--smooth",
+        action="store_true",
+        help="Overlay a Gaussian-smoothed observed light curve and MC uncertainty band in best-fit plots.",
+    )
+    parser.add_argument(
+        "--smooth-sigma",
+        type=float,
+        default=0.01,
+        help="Gaussian kernel width in phase for --smooth.",
+    )
+    parser.add_argument(
+        "--smooth-n-mc",
+        type=int,
+        default=2000,
+        help="Number of Monte Carlo perturbations used to estimate the smoothed 1-sigma band (0 disables band).",
+    )
+    parser.add_argument(
+        "--smooth-seed",
+        type=int,
+        default=None,
+        help="RNG seed for smoothing Monte Carlo perturbations.",
     )
     parser.add_argument(
         "--quiet",
@@ -3515,6 +3717,15 @@ def main():
 
     if args.reparam and getattr(args, 'kepler', False):
         parser.error("--reparam and --kepler are mutually exclusive.")
+    if getattr(args, "smooth_sigma", 0.0) <= 0:
+        parser.error("--smooth-sigma must be > 0.")
+    if getattr(args, "smooth_n_mc", 0) < 0:
+        parser.error("--smooth-n-mc must be >= 0.")
+    if len(args.scatter_eclipse_phase) != 2:
+        parser.error("--scatter-eclipse-phase requires two values: PHASE_MIN PHASE_MAX")
+    scatter_lo, scatter_hi = map(float, args.scatter_eclipse_phase)
+    if not (0.0 <= scatter_lo <= scatter_hi <= 1.0):
+        parser.error("--scatter-eclipse-phase must satisfy 0 <= PHASE_MIN <= PHASE_MAX <= 1.")
     if getattr(args, 'orbital_period', 0.0) <= 0:
         parser.error("--orbital-period must be > 0.")
     try:
@@ -3593,6 +3804,7 @@ def main():
     # Wind models: a single value (no more 'both' loop).
     wind_models = [args.wind_model]
     fit_wind_shape = bool(getattr(args, 'fit_wind_shape', False))
+    fit_scatter = bool(getattr(args, 'fit_scatter', False))
     frozen_params = dict(getattr(args, 'frozen_params', {}) or {})
 
     # Validate frozen names against run configuration before sampling starts.
@@ -3603,6 +3815,7 @@ def main():
             kepler=kepler,
             wind_model=args.wind_model,
             fit_wind_shape=fit_wind_shape,
+            fit_scatter=fit_scatter,
             frozen=frozen_params,
             orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
         )
@@ -3615,6 +3828,11 @@ def main():
         fit_wind_shape=fit_wind_shape,
         likelihood=getattr(args, 'likelihood', 'chi2'),
         shape_prior_overrides=shape_prior_overrides,
+        fit_scatter=fit_scatter,
+        scatter_prior=(
+            {'mean': 0.0, 'std': 1.0, 'min': 0.0, 'max': np.inf}
+            if fit_scatter else None
+        ),
         frozen=None,
     )
     for sname in WIND_SHAPE_FIT.get(args.wind_model, []):
@@ -3680,6 +3898,39 @@ def main():
                     f"Replaced {np.sum(invalid_err)} invalid errors with max(10% flux, median valid error)"
                 )
 
+            smoothed = None
+            if getattr(args, "smooth", False):
+                smoothed = smooth_lightcurve(
+                    obs_phase,
+                    obs_flux,
+                    obs_err,
+                    sigma=float(getattr(args, "smooth_sigma", 0.01)),
+                    n_mc=int(getattr(args, "smooth_n_mc", 2000)),
+                    random_state=getattr(args, "smooth_seed", None),
+                    verbose=not bool(getattr(args, "quiet", False)),
+                )
+
+            scatter_prior = None
+            if fit_scatter:
+                scatter_center = estimate_scattered_flux(
+                    obs_phase,
+                    obs_flux,
+                    window=tuple(map(float, args.scatter_eclipse_phase)),
+                )
+                flux_max = float(np.nanmax(obs_flux)) if np.any(np.isfinite(obs_flux)) else 1.0
+                tiny = max(1e-30, abs(float(np.nanmedian(obs_flux))) * 1e-6)
+                scatter_prior = {
+                    'mean': float(scatter_center),
+                    'std': float(max(scatter_center, tiny)),
+                    'min': 0.0,
+                    'max': float(max(flux_max, scatter_center + tiny)),
+                }
+                if not getattr(args, "quiet", False):
+                    print(
+                        "Scatter prior: mean={mean:.4g}, std={std:.4g}, "
+                        "min={min:.4g}, max={max:.4g}".format(**scatter_prior)
+                    )
+
             for wind_model in wind_models:
                 try:
                     key = (band, wind_model)
@@ -3695,6 +3946,7 @@ def main():
                             fit_wind_shape=fit_wind_shape,
                             shape_prior_overrides=shape_prior_overrides,
                             is_binned=is_binned,
+                            smoothed=smoothed,
                         )
                         if stats is not None:
                             all_results[key] = stats
@@ -3709,6 +3961,8 @@ def main():
                             fit_wind_shape=fit_wind_shape,
                             shape_prior_overrides=shape_prior_overrides,
                             is_binned=is_binned,
+                            smoothed=smoothed,
+                            scatter_prior=scatter_prior,
                         )
                         all_results[key] = stats
 
@@ -3743,6 +3997,7 @@ def main():
                 likelihood, reparam=reparam,
                 kepler=kepler,
                 wind_model=args.wind_model, fit_wind_shape=fit_wind_shape,
+                fit_scatter=fit_scatter,
                 frozen=getattr(args, 'frozen_params', {}),
                 orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
             )
@@ -3773,19 +4028,19 @@ def main():
                 for param in active_names:
                     if param in stats:
                         s = stats[param]
-                        f.write(f"  {param}: {s['median']:.6f} "
-                                f"(+{s['upper']:.6f}/-{s['lower']:.6f})")
+                        f.write(f"  {param}: {_fmt_val(s['median'])} "
+                                f"(+{_fmt_val(s['upper'])}/-{_fmt_val(s['lower'])})")
                         if ('mean' in s) and ('std' in s):
-                            f.write(f"  [mean={s['mean']:.6f}, std={s['std']:.6f}]")
+                            f.write(f"  [mean={_fmt_val(s['mean'])}, std={_fmt_val(s['std'])}]")
                         f.write("\n")
                 if reparam or kepler:
                     for derived in ('d1', 'd2'):
                         if derived in stats:
                             s = stats[derived]
-                            f.write(f"  {derived} (derived): {s['median']:.6f} "
-                                    f"(+{s['upper']:.6f}/-{s['lower']:.6f})")
+                            f.write(f"  {derived} (derived): {_fmt_val(s['median'])} "
+                                    f"(+{_fmt_val(s['upper'])}/-{_fmt_val(s['lower'])})")
                             if ('mean' in s) and ('std' in s):
-                                f.write(f"  [mean={s['mean']:.6f}, std={s['std']:.6f}]")
+                                f.write(f"  [mean={_fmt_val(s['mean'])}, std={_fmt_val(s['std'])}]")
                             f.write("\n")
 
                 # Self-consistent point estimate (single sample with max log-prob).
@@ -3800,13 +4055,13 @@ def main():
                     f.write(f"Best-fit (MAP, max log-prob){lp_str}:\n")
                     for param in active_names:
                         if param in stats and 'map' in stats[param]:
-                            f.write(f"  {param}: {stats[param]['map']:.6f}\n")
+                            f.write(f"  {param}: {_fmt_val(stats[param]['map'])}\n")
                     if reparam or kepler:
                         for derived in ('d1', 'd2'):
                             if derived in stats and 'map' in stats[derived]:
                                 f.write(
                                     f"  {derived} (derived): "
-                                    f"{stats[derived]['map']:.6f}\n"
+                                    f"{_fmt_val(stats[derived]['map'])}\n"
                                 )
                     if (reparam or kepler) and all(k in stats for k in ('a', 'q', 'd1', 'd2')):
                         a_map = stats['a']['map']

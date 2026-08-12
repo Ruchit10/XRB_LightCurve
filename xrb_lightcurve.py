@@ -1164,6 +1164,7 @@ def simulate_lightcurve(
     converge_rmax: bool = False,
     wind_model: str = "smooth_pl",
     wind_params: Optional[Dict[str, float]] = None,
+    scattered_flux: float = 0.0,
 ) -> pd.DataFrame:
     """
     Main simulation function for lightcurve calculation.
@@ -1197,6 +1198,9 @@ def simulate_lightcurve(
             "broken_pl", "smooth_pl", "beta_law", "confinement". Default "smooth_pl".
         wind_params: Dict of profile parameters (see WIND_MODEL_PARAM_KEYS).
             If None, uses defaults from default_wind_params(wind_model, R).
+        scattered_flux: Constant additive flux offset applied to all ``nfl_*``
+            columns after eclipse handling. Useful for modeling phase-invariant
+            scattered flux floors.
 
     Returns:
         DataFrame with simulation results. Key columns:
@@ -1488,6 +1492,11 @@ def simulate_lightcurve(
         flux_cols = [col for col in results.columns if col.startswith("nfl_")]
         for col in flux_cols:
             results.loc[eclipse_mask, col] = 0.0
+
+    if float(scattered_flux) != 0.0:
+        flux_cols = [col for col in results.columns if col.startswith("nfl_")]
+        for col in flux_cols:
+            results[col] = results[col].astype(float) + float(scattered_flux)
 
     return results
 
