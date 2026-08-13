@@ -18,9 +18,21 @@ fitting, and inference stack since the original R port.
 9. [Phase 8 — MCMC Pipeline & Performance](#phase-8--mcmc-pipeline--performance)
 10. [Phase 9 — Convergence Improvements (Reparameterization)](#phase-9--convergence-improvements-reparameterization)
 11. [Phase 10 — Wind-Shape MCMC Parameters](#phase-10--wind-shape-mcmc-parameters)
-12. [Phase 11 — N-D Precomputed Grid for Shape-Fit MCMC](#phase-11--n-d-precomputed-grid-for-shape-fit-mcmc)
-13. [Current File Inventory](#current-file-inventory)
-14. [Current Status & Quick Commands](#current-status--quick-commands)
+12. [Phase 11 — N-D Precomputed Grid for Shape-Fit MCMC](#phase-11--n-d-precomputed-grid-for-shape-fit-mcmc) *(later removed)*
+13. [Phase 12 — flux_t Errors & First-Class Unbinned MCMC](#phase-12--flux_t-errors--first-class-unbinned-mcmc)
+14. [Phase 13 — Wind Normalization Constants](#phase-13--wind-normalization-constants)
+15. [Phase 14 — Pooled Direct-Model MCMC](#phase-14--pooled-direct-model-mcmc)
+16. [Phase 15 — Speed/Memory Pass & BIC Replaces WAIC/LOO](#phase-15--speedmemory-pass--bic-replaces-waicloo)
+17. [Phase 16 — Frozen Parameters & Kepler Mode (`ParamSpec`)](#phase-16--frozen-parameters--kepler-mode-paramspec)
+18. [Phase 17 — Per-Sample Phase-Shift Alignment](#phase-17--per-sample-phase-shift-alignment)
+19. [Phase 18 — Adaptive Constant-SNR Binning & Grid Removal](#phase-18--adaptive-constant-snr-binning--grid-removal)
+20. [Phase 19 — Gaussian Phase Smoothing, Scattered Flux & Residual Panels](#phase-19--gaussian-phase-smoothing-scattered-flux--residual-panels)
+21. [Phase 20 — Remove Multiplicative Flux Scale from the Single-Model χ² Fit](#phase-20--remove-multiplicative-flux-scale-from-the-single-model-χ-fit)
+22. [Phase 21 — MCMC Scatter-Path Audit](#phase-21--mcmc-scatter-path-audit)
+23. [Phase 22 — Adaptive Binning in the Single-Model CLI](#phase-22--adaptive-binning-in-the-single-model-cli)
+24. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
+25. [Current File Inventory](#current-file-inventory)
+26. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -179,9 +191,12 @@ emcee/zeus pipeline. Headline pieces:
 - **Likelihoods** (`--likelihood`) — `chi2` (Gaussian, default), `jitter`
   (Gaussian + free `log_f` systematic term), `studentt` (heavy-tailed,
   configurable `--studentt-nu`). Cash/Poisson was scoped out.
+  *(`PrecomputedModelGrid` was deleted in Phase 18, along with `studentt`;
+  only `chi2` and `jitter` remain.)*
 - **Diagnostics** — ArviZ summary (`r_hat`, `mcse_*`, `eti89_*`),
   autocorrelation, optional WAIC/LOO via `--compute-waic`, corner plots,
   best-fit overlay with reduced χ².
+  *(WAIC/LOO replaced by BIC in Phase 15; `--compute-waic` removed in Phase 18.)*
 
 **Performance work** done in `xrb_lightcurve.py`:
 
@@ -299,6 +314,10 @@ summaries, samples CSV, and `mcmc_summary.txt`.
 
 ## Phase 11 — N-D Precomputed Grid for Shape-Fit MCMC
 
+> **Superseded:** the entire precomputed-grid path described below was deleted in
+> [Phase 18](#phase-18--adaptive-constant-snr-binning--grid-removal). MCMC now
+> always uses the direct evaluator. Kept here for history.
+
 After Phase 10 a short (`~1k-step`) shape-fit chain still took ~2 h
 because `--fit-wind-shape` auto-forced the direct evaluator
 (≈ 63 ms × 32 walkers × 1000 steps × all phases ≈ hours). The grid
@@ -348,41 +367,618 @@ forcing a slow path.
 
 ---
 
+## Phase 12 — flux_t Errors & First-Class Unbinned MCMC
+
+Plan: `flux_t_error_and_unbinned_mcmc_1bf81aa9.plan.md`. Commit `fa672e3`.
+
+CIAO files carry `flux_t` but **no** `flux_t_err`, so the MCMC's
+`error_column = obs_column + "_ERR"` guess (`flux_t_ERR`) never matched and
+silently fell back to `0.1·|flux|`.
+
+- **`chandra_phase_analysis.py`** — new `_derive_err_from_rate_err(df, obs_col)`,
+  invoked only when no error column is matched. Derives per-row
+  `err = rate_err · (obs/rate)` for `rate > 0`, falling back to a file-level
+  `cf = median(obs/rate)` for the rest (verified constant per file, e.g.
+  `cf ≈ 4.56e-12` for soft 11080).
+- **Master-file code removed** — `verify_master_contains_individual()`, the
+  `master_file` parameter in `load_data`/`read_observation`, and the
+  `--master-file` / `--verify-master` CLI args are gone.
+- **`mcmc_lightcurve_fit.py`** — passes `obs_error_column=None` when the user
+  didn't set it explicitly so auto-derivation fires; keeps the `flux > 0` drop in
+  *both* binned and unbinned modes (zero-flux rows are GTI gaps, and with jitter
+  `σ²_eff = σ_obs² + (f·model)² ≈ 0` would blow up `log σ²`), and prints the drop
+  count. The invalid-error patch tightened from `0.1·|flux|` to
+  `max(0.1·|flux|, median(valid obs_err))`.
+- **`is_binned`** threaded from `main()` through `run_single_fit` /
+  `replot_from_existing` / `plot_best_fit` so labels and marker style match
+  reality ("Observed (phase-binned)" with error bars vs "Observed (raw 100s)" as
+  translucent scatter).
+- **Jitter-aware χ²** — `plot_best_fit` and `compute_chi2_for_samples` report the
+  effective-variance χ² alongside the classical measurement-error χ² when
+  `--likelihood jitter` is active.
+- `--no-phase-bin` help now recommends pairing with `--likelihood jitter`, and
+  the module docstring gained an unbinned `flux_t` example.
+
+---
+
+## Phase 13 — Wind Normalization Constants
+
+Plan: `wind_normalization_constants_76f1ef51.plan.md`. Commit `fa672e3`.
+
+Since every profile is coded as a dimensionless `g(r)`, the physical amplitude has
+to be recovered after the fit. Added to `xrb_lightcurve.py`:
+
+- Constants `M_H_G`, `M_SUN_G`, `KM_TO_CM` alongside the existing `R_SUN_CM`.
+- **`compute_wind_normalization_constants(lam, flx_mean, wind_model, wind_params,
+  v_inf=None, mu=1.4)`** — computes `n0 = lam·1e22/(R_sun·flx_mean)` then, per
+  model: `smooth_pl` → `g_break`, `n_break_cm3`, `rho_b_g_cm3`;
+  `beta_law`/`confinement` → `n_surface_cm3`, `rho_surface_g_cm3`,
+  `mdot_over_vinf_g_per_cm`, plus `mdot_g_s` / `mdot_msun_yr` when `v_inf`
+  (km/s) is supplied. `v_inf` is not fitted — it was absorbed into `n0` by the
+  `lam` normalization — so the caller must provide it for a mass-loss rate.
+- **`wind_normalization_constants_posterior(...)`** — mirrors
+  `wind_density_posterior`, looping the point estimator over posterior samples
+  and returning `{samples, median, p16, p84}` per constant.
+
+---
+
+## Phase 14 — Pooled Direct-Model MCMC
+
+Commit `36c8c8b`.
+
+The direct evaluator's `simulate_lightcurve` is already Numba
+`parallel=True`, so naively adding `--n-threads` worker processes caused severe
+thread oversubscription (workers × numba threads ≫ cores), while pinning workers
+to one thread made each LC so slow that process parallelism barely beat serial.
+
+- `_init_numba_worker(max_numba_threads)` is used as the `Pool` initializer and
+  calls `numba.set_num_threads(...)` inside each worker.
+- `--numba-threads-per-worker` exposes the knob; the default `auto` is
+  `max(1, cpu_count // n_threads)`, so workers collectively use ≈ one thread per
+  logical CPU.
+- The pool uses the `spawn` context (safest cross-platform, avoids inheriting
+  heavy state) and is only enabled for `DirectLightCurveModel`; requesting
+  `--n-threads > 1` with any other model type prints a `[notice]` and runs
+  serial.
+- Also fixed an indentation bug in `xrb_lightcurve.py`.
+
+---
+
+## Phase 15 — Speed/Memory Pass & BIC Replaces WAIC/LOO
+
+Plan: `mcmc_speed_memory_optimization_68fc497a.plan.md`. Commit `7116302`.
+
+A staged, accuracy-preserving optimization program with a reproducible benchmark
+harness (`utils/benchmark_mcmc_performance.py`, documented in
+`PERFORMANCE_VALIDATION_REPORT.md`; acceptance thresholds: parameter median drift
+< 0.1σ, reduced-χ² change ≤ 2%, BIC ranking consistency).
+
+**Runtime (`xrb_lightcurve.py`):**
+- Module-level `_FLUX_CACHE` keyed by `(abs csv path, flux_type)` caching cleaned
+  arrays, prebuilt log-log `interp1d` objects, and per-band exponential fits
+  (`_build_flux_context`, `_interpolate_flux_from_context`). Previously every
+  `simulate_lightcurve` call re-read and re-sorted the CSV.
+- Mega-kernel results assembled straight from NumPy arrays into the DataFrame
+  (no `tolist()`/`zip()` round-trips).
+- Theta-ring trig tables precomputed once per `_simulate_phases_numba` call
+  instead of per phase.
+
+**Memory (`mcmc_lightcurve_fit.py`):** grid precompute streamed worker results
+directly into `flux_grid` instead of materializing a full `list(...)`, and
+interpolator setup avoided whole-grid copies during NaN cleanup. *(Both became
+moot once the grid path was deleted in Phase 18.)*
+
+**Hot path:** likelihood invariants precomputed once in `run_mcmc` and passed as
+a `like_terms` dict (`obs_err2`, `jitter_logf_index`), replacing repeated
+`active_names.index('log_f')` lookups and per-call `obs_err**2` allocations.
+`_interp_periodic_phases` gained a monotonic fast path that skips the sort.
+
+**Output:** `save_samples_csv_chunked` writes samples in configurable chunks
+(`--csv-chunk-size`, default 50000); `--compact-output` adds an NPZ companion;
+`--no-csv-output` skips the large CSV entirely.
+
+**Model comparison:** WAIC/LOO removed in favor of BIC. `compute_bic_metrics`
+computes `BIC = k·ln n - 2 ln L̂` with `k = len(active_names)`,
+`n = len(obs_flux)` after all binning/filtering, and `L̂` obtained by calling the
+run's own likelihood at the max-log-prob sample (not by subtracting priors from
+`log_prob`, avoiding Jacobian bookkeeping). Reports `bic`, `logL_hat`,
+`k_params`, `n_obs`, `theta_source` (`map_log_prob` | `median_fallback`) to the
+console, `mcmc_summary.txt`, and `*_model_metrics.csv`; `ΔBIC` is computed
+against the best model in the run. ArviZ is now used for convergence
+diagnostics only.
+
+---
+
+## Phase 16 — Frozen Parameters & Kepler Mode (`ParamSpec`)
+
+Plan: `freeze_params_and_kepler_3368d554.plan.md`. Commit `be56359`.
+
+Two features plus the refactor that made both tractable.
+
+**`ParamSpec` dataclass** (built once in `main()` by `build_param_spec(...)` and
+threaded through every consumer) replaces ad-hoc positional `theta` indexing:
+`mode`, `active_names`, `active_labels`, `frozen`, `fit_wind_shape`,
+`fit_scatter`, `wind_model`, `likelihood`, `orbital_period_s`, `K_kepler`.
+Central resolvers by name, not index:
+- `_resolve_geom(theta, spec)` (replaces `_to_physical`, kept as a shim),
+- `_resolve_shape(theta, spec)` (generalizes `_to_wind_params`),
+- `_theta_value(theta, name, names, frozen)`.
+
+**`--freeze NAME=VAL[,NAME=VAL,…]`** — pins parameters and drops them from the
+chain. Valid: `d1, d2, a, q, r, R, i0, M_X, M_RH, f_scatter, Rb, p, beta, fconf,
+ell`. Shape params can be frozen even without `--fit-wind-shape`. `log_f`
+cannot be frozen. Unknown names are rejected with the allowed list; values
+outside the prior box warn but proceed; `Rb < R` with both frozen fails fast
+before sampling. `get_active_priors` drops frozen entries.
+
+**`--kepler`** — samples `(M_X, M_RH)` in M☉ with `KEPLER_PARAM_NAMES` /
+`KEPLER_PARAM_LABELS` / `KEPLER_PRIORS`, then derives
+`a = K·M_tot^{1/3}` (with `K = (G·M☉·P²/4π²)^{1/3}/R☉` precomputed by
+`_compute_kepler_prefactor`) and `q = M_RH/M_tot` from the lever arm
+`d1·M_X = d2·M_RH`. `--orbital-period` sets `P` (default `ORBITAL_PERIOD`);
+`--prior-MX` / `--prior-MRH` override the mass priors. Mutually exclusive with
+`--reparam`. Composes with freezing (e.g. `--kepler --freeze M_RH=20`).
+
+**Prior rewrite** — `log_prior` iterates `spec.active_names`, applies box +
+Gaussian per dim, then enforces constraints on *resolved* values so they hold
+under freezing and Kepler mode: `r < R` (was a positional `theta[2] >= theta[3]`)
+and `Rb ≥ R` for `smooth_pl`. `_log_jacobian` contributes `+log(a)` only in
+`reparam` mode (Kepler priors are already in mass space).
+
+**Stats / persistence** — `compute_statistics` derives `(a, q, d1, d2)` in Kepler
+mode and `(d1, d2)` in reparam mode, and records a MAP entry (max-log-prob single
+sample) which — unlike the marginal medians — exactly satisfies `d1+d2 = a` and
+`d1/(d1+d2) = q`. `*_chain.npz` gained `mode`, `frozen_names`, `frozen_values`,
+`orbital_period_s`; `replot_from_existing` reads them back to rebuild the spec,
+with old chains defaulting to previous behavior. `plot_best_fit` gained
+`_value_from_stats_or_frozen` so frozen parameters no longer break the overlay.
+
+Also in this commit: `xrb_lightcurve.py --Delta` default changed from `2.0` to
+`1.0`. Note this was *not* mirrored in `default_wind_params` or
+`WIND_SHAPE_FIXED`, which still use `2.0` — see PROJECT.md "Known rough edges".
+
+---
+
+## Phase 17 — Per-Sample Phase-Shift Alignment
+
+Commit `67448c3`.
+
+Rather than trusting the ephemeris to align model and data, every likelihood call
+now minimizes weighted χ² over a phase shift, so the fit is insensitive to
+residual epoch error.
+
+- `_build_phase_shift_terms(enabled, obs_phase, grid_size, eval_points,
+  refine_points)` precomputes the coarse shift grid, the dense model evaluation
+  grid, and the shifted observation-phase matrix once per run.
+- `_apply_best_phase_shift(...)` does a two-stage search: a coarse uniform grid
+  over `[0,1)`, then a local refinement across ±1 coarse step around the best
+  shift — near-fine-grid accuracy at a fraction of the cost. The model is
+  evaluated once on the dense grid and re-interpolated per trial shift.
+- Defaults: `DEFAULT_PHASE_SHIFT_GRID_SIZE = 25`,
+  `DEFAULT_PHASE_SHIFT_EVAL_POINTS = 240`,
+  `DEFAULT_PHASE_SHIFT_REFINE_POINTS = 9`. CLI:
+  `--no-fit-phase-shift`, `--phase-shift-grid-size`,
+  `--phase-shift-eval-points`.
+- Because the shift is a per-sample nuisance minimization rather than a sampled
+  parameter, it is applied consistently in `log_likelihood_chi2`,
+  `log_likelihood_jitter`, `compute_chi2_for_samples`,
+  `compute_pointwise_loglik`, `compute_bic_metrics`, and `plot_best_fit` (which
+  also draws the model shifted by the best-fit value and prints it in the
+  annotation box).
+- `mcmc_summary.txt` gained a "Run configuration" block recording
+  `fit_phase_shift`, grid size, eval points, and wall time
+  (`stats['_run_meta']`), plus a chain-diagnostics block from
+  `print_diagnostics` (`stats['_diagnostics']`).
+
+---
+
+## Phase 18 — Adaptive Constant-SNR Binning & Grid Removal
+
+Plan: `adaptive_constant-snr_binning_249c8cba.plan.md`. Commit `b376585`.
+
+**Constant-counts binning.** `counts` is now carried through
+`read_observation` / `load_data` (`counts_column='counts'`) and
+`load_observed_lightcurves`. New `phase_bin_data_snr(df, counts_per_bin=100, …)`
+in `chandra_phase_analysis.py` (with a flux-naming wrapper in the MCMC module)
+sorts by phase and greedily accumulates `counts` until each bin reaches the
+target, so every binned point carries roughly equal Poisson weight
+(100 counts ⇒ SNR ≈ 10) and low-signal eclipse troughs merge into wide bins
+instead of many noisy narrow ones. Per bin it returns the counts-weighted phase
+center, inverse-variance weighted flux, `error = √(1/Σw)`, `n_points`,
+`total_counts`, and `phase_lo`/`phase_hi`/`width`; a trailing under-target bin is
+merged into its predecessor.
+
+Mode is selected by argument *presence*, not a `--bin-mode` flag:
+`--no-phase-bin` (raw) > `--counts-per-bin N` (adaptive) > `--n-phase-bins N`
+(fixed) > neither (50 fixed bins, backward compatible). `--n-phase-bins` default
+changed from `50` to `None`; supplying both binners is an error. Bin widths are
+threaded as `obs_phase_width` into `plot_best_fit` and drawn as horizontal error
+bars.
+
+**Precomputed grid deleted.** `PrecomputedModelGrid` and its
+`_precompute_models` / `_compute_single_model` / `_setup_interpolators` /
+`_save_grid` / `_load_grid` machinery are gone, along with `--save-grid`,
+`--load-grid`, `--no-grid`, `--grid-points`, and `--shape-grid-points`. MCMC
+always uses `DirectLightCurveModel`: at ~60 ms/LC it is fast enough, it avoids
+grid interpolation artifacts, and it is the only path that keeps the likelihood
+physically faithful for every sample (including per-step wind shape).
+
+**Likelihood CLI simplified.** Student-t and the deprecated WAIC shim removed:
+`log_likelihood_studentt()`, `'studentt'` from `LIKELIHOOD_TYPES` and
+`--likelihood` choices, `--studentt-nu`, all `studentt_nu` plumbing through
+`log_probability` / `run_mcmc` / `compute_chi2_for_samples` / BIC /
+`run_single_fit` / save / replot, the `scipy.special.gammaln` import, and
+`--compute-waic` plus its shim mapping to `--compute-bic`. Only `chi2` and
+`jitter` remain; `--compute-bic` is the model-comparison flag.
+
+---
+
+## Phase 19 — Gaussian Phase Smoothing, Scattered Flux & Residual Panels
+
+Plan: `gaussian_phase_smoothing_reference_d1a46172.plan.md`.
+**Status: implemented but uncommitted** on branch `add_generic_wind`.
+
+Three reusable primitives live in `chandra_phase_analysis.py` so both the
+single-model and MCMC plot paths share one source of truth:
+
+1. **`smooth_lightcurve(phase, flux, flux_err, sigma=0.01, n_eval=300,
+   n_mc=2000, random_state=None)`** — periodic Gaussian-kernel phase smoother.
+   Periodic distance `d = |((φ_i-φ_eval+0.5) mod 1) - 0.5|`, weights
+   `exp(-½(d/σ)²)`, so it is continuous across `phase = 0/1`. Generalizes the
+   MATLAB reference in `temp/LC_MC/*.m` from index windows to a phase-distance
+   kernel, so it is correct for fixed-width bins, constant-SNR bins, *and* raw
+   unbinned data. The 1σ band is a vectorized Monte Carlo (perturb all points at
+   once, one matmul, `std` over realizations) rather than a Python loop. Kernel
+   is phase-distance only — no inverse-variance weighting — matching the
+   reference. `σ = 0.01` sits well below the ~0.1–0.25 phase scale of real
+   features and above the ~0.0002 raw sampling.
+2. **`estimate_scattered_flux(phase, flux, window=(0.4, 0.6))`** — mean observed
+   flux in the mid-eclipse window (fallback `0.1 × median`, clamped ≥ 0).
+3. **`add_residual_panel(ax, phase, obs, model, err, xerr=None)`** — normalized
+   pulls `(O-M)/σ` with `0`/`±1` reference lines.
+
+**`xrb_lightcurve.py`** — `simulate_lightcurve(scattered_flux=0.0)` adds a
+constant, phase-independent offset to every `nfl_*` column after eclipse
+handling, so notebooks can bake a scattered-light floor into a directly generated
+model. The fit paths deliberately add scatter at overlay/evaluation time instead,
+so `fit_simulation`'s multiplicative `scale` and MCMC's per-step scaling don't
+rescale an additive constant.
+
+**`chandra_phase_analysis.py` single-model path** — `fit_simulation(scatter=…)`
+adds the constant after scaling inside the inner χ²; `plot_phase` becomes a
+2-panel figure (3:1 heights, shared x) with a residual panel whenever a model
+overlay is present, plus the optional dashed-green smoothed curve and MC band.
+New CLI: `--smooth`, `--smooth-sigma`, `--smooth-n-mc`, `--smooth-seed`,
+`--scatter`, `--scatter-eclipse-phase`. When `--fit` runs without `--scatter`,
+the value is estimated from the eclipse window.
+
+**`mcmc_lightcurve_fit.py`** — imports the three primitives. Same
+`--smooth*` flags, computed once per band and threaded into `plot_best_fit`,
+which is now a 2-panel figure with the residual panel clipped to ±5σ. New
+`--fit-scatter` promotes `f_scatter` to a free MCMC parameter (mirroring
+`log_f`): added by `build_param_spec` / `ParamSpec.fit_scatter`, resolved by
+`_resolve_scatter` and applied in `_evaluate_model` so all likelihoods, BIC, and
+pointwise log-lik inherit it. Its prior is centered on
+`estimate_scattered_flux(...)` with `min = 0` and `max = nanmax(obs_flux)`.
+Being phase-invariant it is unaffected by the phase-shift search; being physical
+it counts toward `dof` automatically (`n_phys` subtracts only `log_f`). It is
+saved as a normal active column, excluded from wind-shape extra-dim detection on
+replot, and can be pinned via `--fit-scatter --freeze f_scatter=<v>`.
+
+---
+
+## Phase 20 — Remove Multiplicative Flux Scale from the Single-Model χ² Fit
+
+`chandra_phase_analysis.py`. **Status: uncommitted** on branch `add_generic_wind`.
+
+`fit_simulation` used to fit *two* parameters — a phase shift and a
+multiplicative flux `scale` — which meant reduced χ² never tested the model's
+absolute normalization. That normalization is not free: it is pinned by `lam`
+(the orbit-averaged nH from the spectral fit) together with the XSPEC
+`flux vs nH` table. A free y-scale therefore absorbed any normalization error
+instead of exposing it. The MCMC path never had such a parameter — it fits a
+per-sample phase shift and an *additive* `f_scatter`, nothing multiplicative —
+so the two χ² paths were also inconsistent with each other.
+
+Note the additive scattered-flux floor is **not** a substitute for the
+multiplicative scale (they are different degrees of freedom); the justification
+for dropping `scale` is that the normalization is externally fixed, and the
+eclipse-floor offset is what the additive term legitimately covers.
+
+- **`fit_simulation(obs_df, sim_df, sim_column, fit_phase_shift=False,
+  scatter=0.0, n_shift_grid=1000)`** now returns `(shift, reduced_chi2)` — the
+  `scale` element is gone from both the fit and the return tuple. The model is
+  `interp((φ_obs - shift) mod 1) + scatter`.
+- **Robust shift search.** χ²(shift) is periodic and strongly multi-modal
+  because of the eclipse, and the old `Nelder-Mead` started at `shift = 0`
+  routinely settled in the wrong basin — a latent defect that mattered more once
+  the shift became the only fitted parameter. Replaced with a vectorized coarse
+  scan over the full period (default 1000 nodes, one `np.interp` over all
+  `(shift, φ_obs)` pairs) followed by a bounded `minimize_scalar` refinement
+  within one coarse step. Verified to recover injected shifts of 0.02, 0.37,
+  0.51, and 0.95 to < 1e-3.
+- **dof corrected.** Was `N - 2` in *both* branches (wrong even before: the
+  no-rescale branch fitted nothing). Now `N - 1` when the shift is fitted and
+  `N` when it is not.
+- **`plot_phase`** lost its `scale` parameter; the overlay is drawn at native
+  normalization plus `scatter`. `rescaled=` renamed to `shift_fitted=`, and the
+  title annotation now reports the phase shift instead of a rescaled/not label.
+- **`plot_multi_column_fits`** — `fit_results` entries are `(shift, chi2)`;
+  `rescaled=` → `shift_fitted=`.
+- **CLI** — `--rescale` renamed to `--fit-phase-shift`, with `--rescale` kept as
+  a deprecated alias on the same `dest` so existing commands keep working.
+- **Unused import removed** — `scipy.optimize.minimize` → `minimize_scalar`.
+- **Notebook call sites migrated** (10 cells across
+  `notebooks/xrb_toy_wind_models.ipynb`, `xrb_model_analysis.ipynb`,
+  `xrb_model_analysis_single_15803.ipynb`); `.bak` copies left alongside.
+
+**Effect on reported fit quality.** On the soft band (12 obs, 100 fixed bins,
+`sim_flux_tbabs_15803_smooth_pl_soft.csv`) the old two-parameter fit returned
+`scale = 0.413` with χ²/dof = 2.06; with the scale removed the same data/model
+give χ²/dof = 20.97. The free scale had been hiding a ≈ 59 % flux-normalization
+deficit. Expect previously "acceptable" reduced χ² values to rise across the
+board — that is the intended behavior, and a coherent non-zero-centered
+residual band is now the diagnostic signature of a normalization mismatch (as
+opposed to a shape mismatch).
+
+*Not changed:* `chandra_analysis_combined_flux.py` carries its own older
+duplicate of `fit_simulation` / `plot_phase` / `plot_multi_column_fits` (no
+`scatter` support at all) and still fits a multiplicative scale.
+
+### Follow-up — model/χ²/residual consistency
+
+Two ways the plot could disagree with the number printed on it, both caused by
+"model evaluated at the observed phases" being written out three separate times
+with three subtly different formulas:
+
+1. **Overlay could omit the scatter floor.** `plot_phase` takes its own
+   `scatter` argument, so a caller that passed `scatter=` to `fit_simulation`
+   but not to `plot_phase` got a curve drawn `scatter` too low while the title
+   showed the χ² that *included* it. `main()` always threaded both, but the
+   notebook call sites did not.
+2. **The residual panel ignored the phase shift entirely.** It built its
+   interpolation grid from the *unshifted* model
+   (`model_interp_phase = phase_sorted`) and evaluated
+   `np.interp(obs_phase, …)`, whereas χ² uses
+   `interp((obs_phase - shift) mod 1, …)`. The plotted *line* was shifted
+   correctly, so only the pulls were wrong — and badly: on a synthetic
+   `shift = 0.30` case with an otherwise perfect fit (χ²/dof = 0), the panel
+   showed residuals implying χ²/dof ≈ 18050, with 50/120 points disagreeing
+   with the χ² model.
+
+Fixed by collapsing all three call sites onto one definition:
+- **`_prepare_model_interpolator(sim_df, sim_column)`** — builds the
+  wrap-around `(phase_wrap, flux_wrap)` arrays, accepting either a `phase` or a
+  `deg` column, and no longer mutates the caller's `sim_df`.
+- **`_model_from_wrap(phase_wrap, flux_wrap, phases, shift, scatter)`** — the
+  single definition of the model. Accepts an array-valued `shift` so the
+  coarse-scan batching in `fit_simulation` uses the *same* expression as a
+  single evaluation.
+- **`evaluate_model_at_phases(sim_df, sim_column, phases, shift, scatter)`** —
+  public one-shot wrapper (useful from notebooks).
+- **`_obs_errors(obs_df)`** — shared uncertainty extraction (provided errors
+  else `sqrt(|rate|)`, with zero/negative/non-finite floored to `1e-3`), so the
+  fit and the residual panel weight points identically. Non-finite errors are
+  now floored too; previously a NaN error propagated into a NaN χ².
+- `plot_phase` draws the overlay on a dense 721-point grid via the shared
+  evaluator instead of shifting the model's own sample points, and computes
+  residuals with the same `shift` and `scatter`.
+
+**Added a self-check.** When `plot_phase` is given a `chi2` to display, it
+recomputes reduced χ² from the curve it actually drew (matching `dof` via
+`shift_fitted`) and warns if the two differ by more than 1 %. This catches a
+mismatched `scatter`, `shift`, or `sim_column` at the point of display rather
+than leaving a plausible-looking number over the wrong curve — it reproduces
+both bugs above as warnings. Verified silent on correct calls.
+
+**Notebook fix.** One genuine mismatch existed —
+`notebooks/xrb_toy_wind_models.ipynb` cell 8 fitted with
+`scatter=1.92174e-13` but called `plot_phase` without it; now passes it. An
+audit of all `fit_simulation` → `plot_phase`/`plot_multi_column_fits` pairs
+across the four notebooks found no others.
+
+---
+
+## Phase 21 — MCMC Scatter-Path Audit
+
+`mcmc_lightcurve_fit.py`. **Status: uncommitted** on branch `add_generic_wind`.
+All tests run under the `henv` conda env (Python 3.13 / numpy 2.2 / emcee 3.1.6
+/ arviz 1.0).
+
+Audit of whether the Phase 20 fixes have analogues in the MCMC path. The MCMC
+never had a multiplicative flux scale, so nothing to remove there, and its
+per-sample phase-shift search (Phase 17) was already the model for the
+`chandra_phase_analysis` one. `plot_best_fit` was already fully consistent — it
+applies both the phase shift and `f_scatter` to the overlay curve, the
+shift-search model, and the residual basis (verified to agree with the
+likelihood to 1.7e-16 relative). Three genuine problems in the `--fit-scatter`
+path were found and fixed.
+
+**1. `compute_chi2_for_samples` silently dropped `f_scatter`.** It duplicated
+the geometry/shape resolution and called `model.evaluate` directly, never
+invoking `_resolve_scatter`. So every per-sample χ² written to
+`*_chi2.csv.gz` was computed against a model missing the additive floor
+whenever `--fit-scatter` was active. Measured bias on a 40-bin broad-band fit:
+
+| `f_scatter` | correct χ² | χ² with floor dropped | error |
+| ----------- | ---------- | --------------------- | ----- |
+| 0           | 6228.11    | 6228.11               | 0.0 % |
+| 1e-13       | 7697.40    | 6228.11               | −19.1 % |
+| 3e-13       | 11120.15   | 6228.11               | −44.0 % |
+| 1e-12       | 28183.54   | 6228.11               | −77.9 % |
+
+Fixed by routing it through `_evaluate_model` (the same entry point the
+likelihood uses) instead of re-implementing the evaluation, which also picks up
+wind-shape resolution and any future additions automatically. The now-dead local
+`frozen` binding was removed. Verified: all five reporting paths —
+`log_likelihood_chi2`, `compute_chi2_for_samples`, `plot_best_fit`,
+`compute_bic_metrics`, `compute_pointwise_loglik` — agree to machine precision
+with `f_scatter` active.
+
+**2. `--fit-scatter` could not start at all under emcee.** Walker
+initialization clipped each dimension to
+`min + 0.01*|min| + 1e-12 … max - 0.01*|max| - 1e-12`. That absolute `1e-12`
+epsilon is meaningless for a parameter whose natural scale *is* ~1e-13: with
+`f_scatter` prior `min = 0`, the lower bound became exactly `1e-12`, roughly 6×
+larger than the entire plausible range, so **every walker was clipped to the
+same value**. The column had zero variance, `emcee.walkers_independent` returned
+False, and the run died with `ValueError: Initial state has a large condition
+number`. The inset is now relative to each parameter's own prior span
+(`pad = 1e-9 * (max - min)`), with a fallback to the raw box if the inset
+inverts. Regression-checked: every existing parameter's clip bounds move by
+~1e-9 relative (numerically identical); only `f_scatter` changes. Added a final
+guard that re-spreads any dimension that still collapses to a constant, with a
+warning naming the parameter, so a badly scaled prior degrades loudly instead of
+aborting inside emcee.
+
+**3. `mcmc_summary.txt` reported `f_scatter: 0.000000`.** The summary and console
+writers used fixed-point `%.6f`, which rounds a ~1e-14 flux floor to zero — it
+read as "not fitted" even though the posterior was well constrained. Added
+`_fmt_val(value, width=0)`, which switches to `%.6e` for non-zero magnitudes
+below 1e-4, and applied it to the marginal-posterior, derived-parameter and MAP
+blocks plus the `print_results` console table.
+
+**Verified end-to-end** under `henv`: `--fit-scatter` with both `chi2` and
+`jitter` likelihoods, `--save-chi2 --compute-bic --smooth`, produces all
+artifacts; `f_scatter` is genuinely sampled (230 unique values spanning
+8.2e-17 to 1.7e-13, no longer pinned); the χ² table is 100 % finite; and
+`plot_best_fit`'s reduced χ² at the MAP matches the χ² table row for that same
+sample (239.2630 vs 239.2631).
+
+**4. `plot_best_fit` duplicated the evaluation logic.** It called
+`eval_fn = getattr(model, 'evaluate_direct', model.evaluate)` in three places and
+added `f_scatter` by hand to each, and it re-implemented geometry resolution
+(its own `if reparam: stats['d1']…` branch). Numerically correct, but it was the
+same duplication pattern that caused problem 1, and the `evaluate_direct`
+fallback was dead — it referenced `PrecomputedModelGrid`, removed in Phase 18.
+Now it reconstructs the point-estimate `theta` in active-parameter order and
+calls `_evaluate_model` through a local `_eval_at(phases)` helper, so geometry
+(phys / reparam / kepler / frozen), wind shape, and `f_scatter` all resolve
+through one implementation. `f_scatter_best` is obtained from
+`_resolve_scatter` and used for display only. Verified behaviour-preserving:
+`plot_best_fit`'s χ² matches the likelihood exactly across eight
+configurations — `phys`, `phys + f_scatter`, `reparam`, `kepler`,
+`jitter + f_scatter`, `smooth_pl` shape fit, `beta_law` shape fit (with
+`R_star` tied to `R`), and `frozen R + f_scatter`.
+
+---
+
+## Phase 22 — Adaptive Binning in the Single-Model CLI
+
+`chandra_phase_analysis.py`. **Status: uncommitted** on branch
+`add_generic_wind`.
+
+Phase 18 added `phase_bin_data_snr` to `chandra_phase_analysis.py` but wired the
+CLI flag only into `mcmc_lightcurve_fit.py`, so the single-model script could not
+use adaptive constant-counts bins from the command line. Added `--counts-per-bin`
+with the same argument-presence semantics as the MCMC script:
+
+`--no-phase-bin` > `--counts-per-bin N` > `--n-phase-bins N` > 50 fixed-width
+bins.
+
+- `--n-phase-bins` default changed from `50` to `None` so mode selection is
+  unambiguous; the effective fallback is still 50, so existing commands behave
+  identically.
+- Supplying both binners is a `parser.error`, as are non-positive values.
+- `--counts-per-bin` on data with no `counts` column fails fast with a message
+  pointing at `--n-phase-bins`, rather than raising from inside the binner.
+- `--min-points-per-bin` help now notes it applies to fixed-width binning only.
+- Variable bin widths already flowed through to horizontal error bars, since
+  `plot_phase` picks up the `width` column when `is_binned` — no plotting change
+  needed.
+
+Verified on ObsID 15803 soft: `--counts-per-bin 100` gives 87 bins averaging
+104.3 counts (vs 60 fixed-width bins), and χ²/dof drops from 8.501 to 6.385 as
+the noisy narrow eclipse-trough bins merge.
+
+---
+
+## Side Investigation — Reference Epoch Recalibration
+
+Plan: `reference_epoch_recalibration_ae1cf98a.plan.md`.
+
+Per Laycock et al. 2015 (`stu2151.pdf`, §4), `T0 = 278801348 s = MJD 54040.87` is
+the **mid-eclipse** time of ObsID 07082, defined to lie at **phase 0.5**, with a
+full eclipse width ~0.2 in phase (~7 h); the paper folds with
+`φ = (t - T0 - 100000P)/P`. The codebase formula `frac((t - T0)/P)` instead puts
+that reference mid-eclipse at phase **0.0**, and the precomputed `phase` column
+stored in the CIAO files reproduces neither exactly.
+
+A read-only study script (`find_reference_epoch.py`) located mid-eclipse two
+ways — anchored on ObsID 15803 (the only observation with a full clean eclipse,
+~1.73 d > one 1.45 d orbit) via sliding-window / threshold / trapezoid-fit, and
+via a joint all-observation scan over trial phase offsets maximizing eclipse
+contrast — with the period held fixed at 125431 s.
+
+Outcome: a corrected epoch of **`278800407.267 s`**, which sits **commented out**
+next to `REF_EPOCH` in `chandra_phase_analysis.py`; the active value is still
+`278801348`. In practice the Phase 17 per-sample phase-shift search absorbs the
+offset, so this now mainly affects the interpretability of plotted phases. The
+study script itself is **not present** in the working tree.
+
+---
+
 ## Current File Inventory
 
 ### Core simulation / inference
 | File                          | Lines | Status | Description                                            |
 | ----------------------------- | ----- | ------ | ------------------------------------------------------ |
-| `xrb_lightcurve.py`           | 1790  | active | Forward model: profiles, Numba LOS, `simulate_lightcurve`, surface-density helpers. |
-| `mcmc_lightcurve_fit.py`      | 3090  | active | emcee/zeus MCMC with grid + direct paths, ArviZ, wind-shape fitting. |
+| `xrb_lightcurve.py`           | 2115  | active | Forward model: profiles, Numba GL LOS kernels, `simulate_lightcurve`, physical back-calculation helpers. |
+| `mcmc_lightcurve_fit.py`      | 4092  | active | emcee/zeus MCMC: `ParamSpec` (phys/reparam/kepler), freeze, wind-shape, `f_scatter`, phase-shift search, BIC, ArviZ, replot. Direct evaluator only. |
+| `chandra_phase_analysis.py`   | 1463  | active | Data loading, phase folding, fixed + constant-SNR binning, smoothing/residual primitives, single-model χ² fit. |
 | `compute_flux_vs_nH.py`       |  934  | active | XSPEC table generator (flux vs nH).                    |
-| `chandra_phase_analysis.py`   | 1043  | active | Phase folding & χ² fitting against simulations.        |
-| `chandra_analysis_combined_flux.py` | 539 | active | Multi-obs combined-flux phase analysis.            |
 | `xspec_fit_mcmc.py`           |  702  | active | XSPEC-side MCMC for spectral fits.                     |
+| `chandra_analysis_combined_flux.py` | 539 | active | Pre-folded combined-flux phase analysis.           |
+| `plot_results.py`             |  272  | active | Standalone plotting of simulation CSVs.                |
+| `compute_count_to_flux_factor.py` | 147 | active | Count-rate → flux conversion factor.               |
+| `example_usage.py`            |   96  | active | Programmatic `simulate_lightcurve` examples.           |
 
 ### XSPEC / shell helpers
-`xspec_get_conversion_factors_tbabs.xcm`, `compare_absorption_models.xcm`,
-`compare_models.sh`, `get_xspec_nH.py`, `convert_fits_to_txt_heasoft.sh`.
+`compare_models.sh`, `convert_fits_to_txt_heasoft.sh`,
+`xspec_tbabs_fit_results.xcm`, `rkp_run_w_mcmc_cmds.sh` (command scrapbook —
+contains dead flags from earlier phases).
+
+*Missing from the working tree despite being referenced:*
+`compare_absorption_models.xcm` (invoked by `compare_models.sh`),
+`xspec_get_conversion_factors_tbabs.xcm`, `get_xspec_nH.py`,
+`utils/get_conversion_factors.sh`, `find_reference_epoch.py`.
 
 ### Utilities (`utils/`)
 `add_flux_simple.py`, `add_flux_to_lightcurves.py`, `convert_fits_to_txt.py`,
-`get_average_count_rates.py`, `get_conversion_factors.sh`, `test_flux_methods.py`.
+`get_average_count_rates.py`, `test_flux_methods.py`,
+`benchmark_mcmc_performance.py`.
 
 ### Notebooks
-`xrb_flux_nH_abs.ipynb`, `xrb_model_analysis.ipynb`.
+`xrb_toy_wind_models.ipynb` (active wind-profile exploration),
+`xrb_model_analysis.ipynb`, `xrb_model_analysis_single_15803.ipynb`,
+`xrb_flux_nH_abs.ipynb`.
 
 ### Documentation
-`README.md`, `MIGRATION_SUMMARY.md`, `FLUX_INTEGRATION_SUMMARY.md`,
-`FLUX_METHODS_QUICKREF.md`, `XSPEC_CONVERSION_GUIDE.md`,
-`FITS_CONVERSION_README.md`, `QUICK_START_FLUX_CONVERSION.md`,
-`CONVERSION_WORKFLOW.md`, `README_CONVERSION_TOOLS.md`,
-`changes_tracked.md` (this file).
+`PROJECT.md` (current-state reference),
+`changes_tracked.md` (this file),
+`mcmc_chi2_jitter_explanation.md`, `PERFORMANCE_VALIDATION_REPORT.md`,
+`FLUX_INTEGRATION_SUMMARY.md`, `FLUX_METHODS_QUICKREF.md`,
+`XSPEC_CONVERSION_GUIDE.md`, `FITS_CONVERSION_README.md`,
+`QUICK_START_FLUX_CONVERSION.md`, `CONVERSION_WORKFLOW.md`,
+`README_CONVERSION_TOOLS.md`.
+Reference PDFs: `Wind_Density.pdf` (profile equations),
+`stu2151.pdf` (Laycock et al. 2015 ephemeris).
+**Stale:** `README.md`, `MIGRATION_SUMMARY.md` — still describe the original
+R→Python port and removed API (`--lam2`, `flx2`/`fl2`, `nfl_*_av`/`_cv`,
+`pho_count_*`).
 
 ### Plans (`.cursor/plans/`)
-`unified_wind_model_77726ced.plan.md` (Phase 7),
-`mcmc_performance_and_statistics_8989cd39.plan.md` (Phase 8),
-`mcmc_convergence_improvements_c648afb3.plan.md` (Phase 9),
-`mcmc_wind_shape_params_8b9c89d2.plan.md` (Phase 10).
+`unified_wind_model_77726ced` (Phase 7),
+`mcmc_performance_and_statistics_8989cd39` (Phase 8),
+`mcmc_convergence_improvements_c648afb3` (Phase 9),
+`mcmc_wind_shape_params_8b9c89d2` (Phase 10),
+`flux_t_error_and_unbinned_mcmc_1bf81aa9` (Phase 12),
+`wind_normalization_constants_76f1ef51` (Phase 13),
+`mcmc_speed_memory_optimization_68fc497a` (Phase 15),
+`freeze_params_and_kepler_3368d554` (Phase 16),
+`adaptive_constant-snr_binning_249c8cba` (Phase 18),
+`gaussian_phase_smoothing_reference_d1a46172` (Phase 19),
+`reference_epoch_recalibration_ae1cf98a` (side investigation).
 
 ### Legacy (preserved)
 `legacy_r_code/` (`new11.R`, `grid4.R`, `wind_los2.R`, `density_fnc.R`),
@@ -392,56 +988,92 @@ forcing a slow path.
 
 ## Current Status & Quick Commands
 
+See [PROJECT.md](PROJECT.md) for the full current-state reference (module-level
+API, data layout, outputs, and known rough edges). Summary:
+
 **Environment:** `henv` conda env (heasoft/XSPEC + python deps including
-`numba`, `emcee`, `zeus-mcmc`, `arviz`, `corner`, `scipy>=1.12`).
+`numba`, `emcee`, `zeus-mcmc`, `arviz`, `corner`, `astropy`, `scipy>=1.12`).
+`requirements.txt` is incomplete — it predates the numba/arviz/zeus additions.
 
 **Working spectral model:** TBabs × powerlaw, nH = 0.75×10²² cm⁻²,
 Γ = 1.86, χ²_red = 1.52.
 
-**Default forward model:** `smooth_pl` wind with `Rb=5, p=4, Delta=2`,
-single `nfl_{band}` flux column.
+**Default forward model:** `smooth_pl` wind, single `nfl_{band}` flux column,
+Gauss-Legendre mega-kernel (~60 ms per light curve). Note `Rb=5, p=4` throughout,
+but `Delta` defaults to `1.0` on the `xrb_lightcurve.py` CLI and `2.0` in
+`default_wind_params` / `WIND_SHAPE_FIXED`.
+
+**MCMC defaults:** `phys` mode (`d1, d2, r, R, i0`), `chi2` likelihood,
+`emcee`, 50 fixed-width phase bins, per-sample phase-shift alignment **on**,
+direct evaluator (no grid path exists).
 
 ```bash
-# Simulate (default smooth_pl wind, XSPEC-driven flux)
-python xrb_lightcurve.py --flux_method interpolate \
-    --flux_csv data_flux_vs_nH.csv --wind-model smooth_pl --Rb 5 --p 4
-
 # Build/refresh the XSPEC flux-vs-nH table
-python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec \
-    --out_csv data_flux_vs_nH.csv
+python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec --model tbabs \
+    --bands broad soft medium hard --out_csv flux_vs_nH_tbabs_broad.csv
 
 # FITS pipeline
 ./convert_fits_to_txt_heasoft.sh
 python utils/add_flux_simple.py \
-    data/IC_10_X1_LC/Broad_converted/ data/IC_10_X1_LC/Broad_with_flux/ 9.1e-12
+    data/IC_10_X1_LC/Broad_converted/ data/IC_10_X1_LC/Broad_with_flux/ 1.500509e-11
 
-# Phase analysis (CIAO format) + simulation fit
+# Simulate one light curve
+python xrb_lightcurve.py --flux_method interpolate \
+    --flux_csv flux_vs_nH_tbabs_broad.csv \
+    --wind-model smooth_pl --Rb 5 --p 4 --Delta 1 \
+    --i0 12.0 --lam 0.572385 --output sim_broad.csv
+
+# Single-model χ² fit + smoothed overlay + residual panel
 python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \
-    --fit --sim-file xrb_lightcurve_output.csv --rescale --output fit.png
+    --obs-column flux_t --time-column t_raw \
+    --fit --sim-file sim_broad.csv --rescale --smooth \
+    --n-phase-bins 100 --output fit_broad.png
 
-# MCMC: geometry-only with precomputed grid (smooth_pl)
-python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \
-    --data-dir data/IC_10_X1_LC_CIAO --wind-model smooth_pl \
-    --likelihood jitter --reparam --save-grid grids/broad_smooth.npz \
-    --output-dir mcmc_results/broad_smooth
+# MCMC: geometry only, reparameterized, adaptive constant-SNR bins
+python mcmc_lightcurve_fit.py --band broad \
+    --flux-csv flux_vs_nH_tbabs_broad.csv --data-dir data/IC_10_X1_LC_CIAO \
+    --obs-column flux_t --time-column t_raw \
+    --wind-model smooth_pl --reparam --likelihood chi2 \
+    --counts-per-bin 100 --sampler zeus --dth 4.0 \
+    --n-walkers 24 --n-steps 20000 --n-burn 2000 \
+    --compute-bic --smooth --output-dir mcmc_results/broad/smooth_pl/geom
 
-# MCMC: shape-fit with N-D grid (Phase 11 — fast for long chains)
-python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \
-    --data-dir data/IC_10_X1_LC_CIAO --wind-model smooth_pl \
-    --fit-wind-shape --likelihood jitter \
-    --grid-points 8 --shape-grid-points 5 \
-    --save-grid grids/broad_smooth_shape.npz \
-    --prior-Rb 5,3,1,30 --prior-p 4,1,2,8 \
-    --output-dir mcmc_results/broad_smooth_shape
+# MCMC: Kepler masses + wind shape + free scattered-flux floor
+python mcmc_lightcurve_fit.py --band broad \
+    --flux-csv flux_vs_nH_tbabs_broad.csv --data-dir data/IC_10_X1_LC_CIAO \
+    --obs-column flux_t --time-column t_raw \
+    --wind-model smooth_pl --fit-wind-shape --kepler --fit-scatter \
+    --likelihood jitter --counts-per-bin 100 \
+    --sampler zeus --n-walkers 24 --n-steps 21000 --n-burn 2000 \
+    --n-threads 4 --dth 4.0 \
+    --prior-MX 30,10,1,100 --prior-MRH 20,10,1,100 \
+    --prior-Rb 6,3,3,80 --prior-p 4,2,2,8 \
+    --compute-bic --output-dir mcmc_results/broad/smooth_pl/kepler_shape
 
-# MCMC: shape-fit without grid (quick debug / short chains only)
-python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \
-    --data-dir data/IC_10_X1_LC_CIAO --wind-model smooth_pl \
-    --fit-wind-shape --no-grid --n-steps 200 \
-    --output-dir mcmc_results/broad_smooth_shape_quick
+# MCMC: raw unbinned 100s data (pair with jitter)
+python mcmc_lightcurve_fit.py --band soft \
+    --flux-csv flux_vs_nH_tbabs_soft.csv --data-dir data/IC_10_X1_LC_CIAO \
+    --obs-column flux_t --time-column t_raw \
+    --no-phase-bin --likelihood jitter --output-dir mcmc_results/soft/raw_jitter
+
+# Freeze parameters out of the chain
+python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
+    --reparam --freeze q=0.5,Rb=6.0 --n-steps 2000 \
+    --output-dir mcmc_results/broad/frozen
+
+# Re-plot / recompute BIC from saved results (pass the same data/binning flags)
+python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
+    --data-dir data/IC_10_X1_LC_CIAO --obs-column flux_t --time-column t_raw \
+    --wind-model smooth_pl --counts-per-bin 100 \
+    --replot --compute-bic --output-dir mcmc_results/broad/smooth_pl/geom
 ```
+
+**Uncommitted work in progress** (branch `add_generic_wind`): Phase 19 —
+Gaussian smoothing, `f_scatter`, and residual panels — is implemented in
+`chandra_phase_analysis.py`, `mcmc_lightcurve_fit.py`, `xrb_lightcurve.py`, and
+`xrb_toy_wind_models.ipynb` but not yet committed.
 
 ---
 
-**Last Updated:** April 8, 2026  
+**Last Updated:** August 12, 2026  
 **Maintainer:** R. Panchal

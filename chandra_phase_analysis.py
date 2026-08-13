@@ -37,13 +37,18 @@ $ python chandra_phase_analysis.py --data-dir data --fit --sim-file simulation.c
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
     --sim-column nfl_broad nfl_soft --output fit.png
 
-# Fit with specific observation column, without rescaling:
+# Fit with specific observation column, phase shift held at 0:
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
     --obs-column FLUX --sim-column nfl_broad --output fit.png
 
-# Fit with rescaling enabled:
+# Fit the phase shift as well (flux normalization is never rescaled):
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
-    --obs-column NET_RATE --sim-column nfl_broad --rescale --output fit.png
+    --obs-column NET_RATE --sim-column nfl_broad --fit-phase-shift --output fit.png
+
+# Adaptive constant-counts binning (equal Poisson weight per point):
+$ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
+    --obs-column flux_t --time-column t_raw --counts-per-bin 100 \\
+    --fit --sim-file sim.csv --fit-phase-shift --output fit.png
 
 # Load CIAO format data (time in second column, flux as ECF):
 $ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
@@ -60,12 +65,13 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import warnings
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
+from scipy.optimize import minimize_scalar
 
 # -----------------------------------------------------------------------------
 # Constants adopted from the R script (seconds)
@@ -195,7 +201,14 @@ def _derive_err_from_rate_err(df: pd.DataFrame, obs_col: str) -> Optional[pd.Ser
     return pd.Series(derived, index=df.index, dtype=float)
 
 
-def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None) -> pd.DataFrame:
+def read_observation(
+    file_path: str,
+    label: str,
+    obs_column: str = "rate",
+    obs_error_column: Optional[str] = None,
+    time_column: Optional[str] = None,
+    counts_column: Optional[str] = "counts",
+) -> pd.DataFrame:
     """Read a single Chandra observation text file.
 
     The files can be whitespace-delimited with or without headers.
@@ -220,6 +233,9 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
         (e.g., "ERR_RATE" for "NET_RATE", "FLUX_ERR" for "FLUX", "rate_err" for CIAO).
     time_column : str, optional
         Name of column containing timestamps (e.g., "TIME", "time", "t_raw"). If None, will auto-detect.
+    counts_column : str, optional
+        Name of column containing counts. If present in the file, it is passed through
+        to the output as ``counts``.
     Returns
     -------
     DataFrame with columns: time, phase, obs, and the specified observable column renamed to "rate"
@@ -363,6 +379,17 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
                         derived = _derive_err_from_rate_err(df, actual_obs_column)
                         if derived is not None:
                             result_df['error'] = derived
+
+                    if counts_column:
+                        actual_counts_column = None
+                        for col in df.columns:
+                            if col.upper() == counts_column.upper():
+                                actual_counts_column = col
+                                break
+                        if actual_counts_column:
+                            result_df['counts'] = pd.to_numeric(
+                                df[actual_counts_column], errors='coerce'
+                            )
                     
                     # Always compute phase from timestamps and current ephemeris.
                     result_df['phase'] = frac((result_df['time'] - REF_EPOCH) / ORBITAL_PERIOD)
@@ -391,7 +418,13 @@ def read_observation(file_path: str, label: str, obs_column: str = "rate", obs_e
 # Data loading helpers
 # -----------------------------------------------------------------------------
 
-def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optional[str] = None, time_column: Optional[str] = None) -> pd.DataFrame:
+def load_data(
+    data_dir: str,
+    obs_column: str = "rate",
+    obs_error_column: Optional[str] = None,
+    time_column: Optional[str] = None,
+    counts_column: Optional[str] = "counts",
+) -> pd.DataFrame:
     """Load observational data from *data_dir*.
 
     Parameters
@@ -404,6 +437,9 @@ def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optiona
         Name of column to use for errors. If None, will auto-detect based on obs_column.
     time_column : str, optional
         Name of column containing timestamps. If None, will auto-detect (looks for 'time', 't_raw').
+    counts_column : str, optional
+        Name of column containing counts. If present, propagated into the
+        combined output as ``counts``.
     Returns
     -------
     DataFrame with columns: time, rate (containing the specified observable), error (optional), phase, obs
@@ -418,7 +454,17 @@ def load_data(data_dir: str, obs_column: str = "rate", obs_error_column: Optiona
         )
 
     print(f"Loading {len(files)} observation file(s) from {data_dir}")
-    dfs = [read_observation(fp, os.path.basename(fp), obs_column, obs_error_column, time_column) for fp in files]
+    dfs = [
+        read_observation(
+            fp,
+            os.path.basename(fp),
+            obs_column,
+            obs_error_column,
+            time_column,
+            counts_column=counts_column,
+        )
+        for fp in files
+    ]
     return pd.concat(dfs, ignore_index=True)
 
 
@@ -525,12 +571,403 @@ def phase_bin_data(
     return result
 
 
+def phase_bin_data_snr(
+    df: pd.DataFrame,
+    counts_per_bin: int = 100,
+    counts_column: str = 'counts',
+    rate_column: str = 'rate',
+    error_column: str = 'error',
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Adaptive phase binning with approximately constant counts per bin.
+
+    Points are sorted by phase and grouped greedily until each bin reaches
+    ``counts_per_bin`` total counts, yielding variable phase-width bins.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Observed data with at least ``phase``, *rate_column*, and *counts_column*.
+    counts_per_bin : int
+        Target counts per bin.
+    counts_column : str
+        Name of column containing counts.
+    rate_column : str
+        Name of column containing flux/rate values.
+    error_column : str
+        Name of column containing error values.
+    verbose : bool
+        Print summary of the binning operation.
+
+    Returns
+    -------
+    DataFrame
+        Columns: phase, rate, error, n_points, total_counts, phase_lo, phase_hi, width
+    """
+    if counts_per_bin <= 0:
+        raise ValueError("counts_per_bin must be > 0")
+    if counts_column not in df.columns:
+        raise ValueError(f"counts column '{counts_column}' not found in DataFrame")
+    if rate_column not in df.columns:
+        raise ValueError(f"rate column '{rate_column}' not found in DataFrame")
+
+    work = df.copy()
+    work = work[np.isfinite(work['phase']) & np.isfinite(work[rate_column])].copy()
+    if work.empty:
+        return pd.DataFrame(
+            columns=['phase', 'rate', 'error', 'n_points', 'total_counts', 'phase_lo', 'phase_hi', 'width']
+        )
+
+    work[counts_column] = pd.to_numeric(work[counts_column], errors='coerce').fillna(0.0)
+    work[counts_column] = np.where(work[counts_column] > 0.0, work[counts_column], 0.0)
+    work = work.sort_values('phase').reset_index(drop=True)
+
+    target = float(counts_per_bin)
+    bins: List[List[int]] = []
+    current: List[int] = []
+    current_counts = 0.0
+    counts_vals = work[counts_column].to_numpy(dtype=float)
+
+    for i, c in enumerate(counts_vals):
+        current.append(i)
+        current_counts += c
+        if current_counts >= target:
+            bins.append(current)
+            current = []
+            current_counts = 0.0
+
+    if current:
+        bins.append(current)
+
+    if len(bins) >= 2:
+        tail_counts = float(np.sum(counts_vals[bins[-1]]))
+        if tail_counts < target:
+            bins[-2].extend(bins[-1])
+            bins.pop()
+
+    binned_data = []
+    for indices in bins:
+        bin_df = work.iloc[indices]
+        rate_vals = bin_df[rate_column].to_numpy(dtype=float)
+        err_vals = (
+            bin_df[error_column].to_numpy(dtype=float)
+            if (error_column in bin_df.columns)
+            else np.full(len(bin_df), np.nan, dtype=float)
+        )
+        has_errors = np.any(np.isfinite(err_vals))
+
+        if has_errors:
+            valid_err = err_vals[(err_vals > 0) & np.isfinite(err_vals)]
+            if len(valid_err) > 0:
+                median_err = float(np.median(valid_err))
+                err_vals = np.where(
+                    (err_vals <= 0) | ~np.isfinite(err_vals),
+                    median_err,
+                    err_vals,
+                )
+            else:
+                fallback = np.std(rate_vals) if len(rate_vals) > 1 else np.abs(rate_vals[0]) * 0.1
+                err_vals = np.full_like(rate_vals, max(float(fallback), np.finfo(float).eps))
+            weights = 1.0 / err_vals ** 2
+            mean_rate = float(np.average(rate_vals, weights=weights))
+            mean_err = float(np.sqrt(1.0 / np.sum(weights)))
+        else:
+            mean_rate = float(np.mean(rate_vals))
+            mean_err = float(np.std(rate_vals) / np.sqrt(len(rate_vals))) if len(rate_vals) > 1 else 0.0
+
+        phase_vals = bin_df['phase'].to_numpy(dtype=float)
+        bin_counts = np.maximum(bin_df[counts_column].to_numpy(dtype=float), 0.0)
+        total_counts = float(np.sum(bin_counts))
+        if total_counts > 0:
+            phase_center = float(np.average(phase_vals, weights=bin_counts))
+        else:
+            phase_center = float(np.mean(phase_vals))
+
+        phase_lo = float(np.min(phase_vals))
+        phase_hi = float(np.max(phase_vals))
+        width = float(max(phase_hi - phase_lo, 0.0))
+
+        binned_data.append(
+            {
+                'phase': phase_center,
+                'rate': mean_rate,
+                'error': mean_err,
+                'n_points': int(len(bin_df)),
+                'total_counts': total_counts,
+                'phase_lo': phase_lo,
+                'phase_hi': phase_hi,
+                'width': width,
+            }
+        )
+
+    result = pd.DataFrame(binned_data)
+    if 'obs' in work.columns:
+        result['obs'] = 'binned'
+
+    if verbose:
+        avg_counts = float(np.mean(result['total_counts'])) if len(result) > 0 else 0.0
+        print(
+            f"Adaptive phase binning: {len(work)} points -> {len(result)} bins "
+            f"(target {counts_per_bin} counts/bin, avg {avg_counts:.1f})"
+        )
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Smoothing and residual helpers
+# -----------------------------------------------------------------------------
+
+def smooth_lightcurve(
+    phase: np.ndarray,
+    flux: np.ndarray,
+    flux_err: Optional[np.ndarray] = None,
+    sigma: float = 0.01,
+    eval_phase: Optional[np.ndarray] = None,
+    n_eval: int = 300,
+    n_mc: int = 2000,
+    random_state: Optional[int] = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Periodic Gaussian-kernel smoothing with optional MC uncertainty band."""
+    phase = np.asarray(phase, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+    if phase.shape != flux.shape:
+        raise ValueError("phase and flux must have identical shapes.")
+    if sigma <= 0:
+        raise ValueError("sigma must be > 0.")
+    if n_eval <= 0:
+        raise ValueError("n_eval must be > 0.")
+    if n_mc < 0:
+        raise ValueError("n_mc must be >= 0.")
+
+    valid = np.isfinite(phase) & np.isfinite(flux)
+    if flux_err is not None:
+        flux_err = np.asarray(flux_err, dtype=float)
+        if flux_err.shape != flux.shape:
+            raise ValueError("flux_err must match phase/flux shape.")
+        valid &= np.isfinite(flux_err)
+        flux_err = np.where(flux_err > 0.0, flux_err, np.nan)
+
+    phase = np.mod(phase[valid], 1.0)
+    flux = flux[valid]
+    if flux_err is not None:
+        flux_err = flux_err[valid]
+
+    if phase.size == 0:
+        return pd.DataFrame(
+            {"phase": np.array([]), "flux_smooth": np.array([]), "flux_smooth_err": np.array([])}
+        )
+
+    if eval_phase is None:
+        eval_phase = np.linspace(0.0, 1.0, int(n_eval), endpoint=False, dtype=float)
+    else:
+        eval_phase = np.mod(np.asarray(eval_phase, dtype=float), 1.0)
+
+    d = np.abs(np.mod(phase[None, :] - eval_phase[:, None] + 0.5, 1.0) - 0.5)
+    w = np.exp(-0.5 * (d / float(sigma)) ** 2)
+    wsum = w.sum(axis=1)
+    flux_smooth = np.full(eval_phase.shape, np.nan, dtype=float)
+    good = wsum > 0.0
+    if np.any(good):
+        flux_smooth[good] = (w[good] @ flux) / wsum[good]
+
+    flux_smooth_err = np.full(eval_phase.shape, np.nan, dtype=float)
+    if flux_err is not None and n_mc > 0:
+        mc_valid = np.isfinite(flux_err)
+        if np.any(mc_valid):
+            rng = np.random.default_rng(random_state)
+            perturbed = (
+                flux[mc_valid][None, :]
+                + flux_err[mc_valid][None, :] * rng.standard_normal((int(n_mc), int(np.sum(mc_valid))))
+            )
+            w_mc = w[:, mc_valid]
+            wsum_mc = w_mc.sum(axis=1)
+            good_mc = wsum_mc > 0.0
+            if np.any(good_mc):
+                smoothed_mc = (perturbed @ w_mc[good_mc].T) / wsum_mc[good_mc][None, :]
+                flux_smooth_err[good_mc] = smoothed_mc.std(axis=0)
+
+    if verbose:
+        print(
+            f"Smoothing: {phase.size} points, sigma={sigma:.4f}, "
+            f"eval={eval_phase.size}, n_mc={int(n_mc)}"
+        )
+
+    return pd.DataFrame(
+        {
+            "phase": eval_phase,
+            "flux_smooth": flux_smooth,
+            "flux_smooth_err": flux_smooth_err,
+        }
+    )
+
+
+def estimate_scattered_flux(
+    phase: np.ndarray,
+    flux: np.ndarray,
+    window: tuple[float, float] = (0.4, 0.6),
+) -> float:
+    """Estimate eclipse-floor flux using the mean value in a phase window."""
+    lo, hi = float(window[0]), float(window[1])
+    if not (0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0 and lo <= hi):
+        raise ValueError("window must satisfy 0 <= lo <= hi <= 1.")
+    phase = np.mod(np.asarray(phase, dtype=float), 1.0)
+    flux = np.asarray(flux, dtype=float)
+    valid = np.isfinite(phase) & np.isfinite(flux)
+    if not np.any(valid):
+        return 0.0
+    phase = phase[valid]
+    flux = flux[valid]
+    mask = (phase >= lo) & (phase <= hi)
+    if np.any(mask):
+        val = float(np.nanmean(flux[mask]))
+    else:
+        val = float(np.nanmedian(flux)) * 0.1
+    return max(val, 0.0) if np.isfinite(val) else 0.0
+
+
+def add_residual_panel(
+    ax_res: plt.Axes,
+    phase: np.ndarray,
+    obs: np.ndarray,
+    model: np.ndarray,
+    err: np.ndarray,
+    xerr: Optional[np.ndarray] = None,
+) -> None:
+    """Draw normalized residuals (O-M)/sigma with reference lines."""
+    denom = np.where(np.asarray(err, dtype=float) > 0.0, np.asarray(err, dtype=float), np.nan)
+    resid = (np.asarray(obs, dtype=float) - np.asarray(model, dtype=float)) / denom
+    ax_res.errorbar(
+        np.asarray(phase, dtype=float),
+        resid,
+        xerr=xerr,
+        fmt='o',
+        markersize=4,
+        alpha=0.8,
+        color='C3',
+        capsize=2,
+        elinewidth=1,
+    )
+    ax_res.axhline(0.0, color='k', linewidth=1.0)
+    ax_res.axhline(1.0, color='gray', linestyle='--', linewidth=0.8)
+    ax_res.axhline(-1.0, color='gray', linestyle='--', linewidth=0.8)
+    ax_res.set_ylabel(r'$(O-M)/\sigma$')
+    ax_res.set_xlabel("Orbital phase")
+    ax_res.grid(alpha=0.3)
+
+
 # -----------------------------------------------------------------------------
 # Plotting
 # -----------------------------------------------------------------------------
 
-def fit_simulation(obs_df: pd.DataFrame, sim_df: pd.DataFrame, sim_column: str = "fl", rescale: bool = False) -> tuple[float, float, float]:
+def _prepare_model_interpolator(
+    sim_df: pd.DataFrame, sim_column: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build wrap-around interpolation arrays for a simulation light curve.
+
+    Returns ``(phase_wrap, flux_wrap)`` covering [0, 2) in phase with strictly
+    increasing x, so ``np.interp`` handles the periodic boundary correctly.
+    """
+    if "phase" in sim_df.columns:
+        sim_phase = np.mod(sim_df["phase"].to_numpy(dtype=float), 1.0)
+    elif "deg" in sim_df.columns:
+        sim_phase = np.mod(sim_df["deg"].to_numpy(dtype=float) % 360.0, 360.0) / 360.0
+    else:
+        raise ValueError("Simulation file must contain 'phase' or 'deg' column.")
+
+    if sim_column not in sim_df.columns:
+        raise KeyError(f"Column '{sim_column}' not found in simulation DataFrame.")
+    sim_flux = sim_df[sim_column].to_numpy(dtype=float)
+
+    order = np.argsort(sim_phase)
+    p = sim_phase[order]
+    f = sim_flux[order]
+    phase_wrap = np.concatenate([p, p + 1.0])
+    flux_wrap = np.concatenate([f, f])
+
+    # Strictly increasing x only, to avoid np.interp ambiguity at duplicates.
+    keep = np.concatenate(([True], np.diff(phase_wrap) > 0))
+    return phase_wrap[keep], flux_wrap[keep]
+
+
+def _model_from_wrap(
+    phase_wrap: np.ndarray,
+    flux_wrap: np.ndarray,
+    phases,
+    shift=0.0,
+    scatter: float = 0.0,
+) -> np.ndarray:
+    """Evaluate a prepared model at *phases* for a given shift and scatter.
+
+    This is the single definition of the model used everywhere: the χ² in
+    :func:`fit_simulation`, the overlay curve in :func:`plot_phase`, and the
+    residual panel all route through it, so they cannot silently disagree.
+    *shift* may be an array (broadcast against *phases*) to evaluate many trial
+    shifts at once.
+    """
+    ph = np.mod(
+        np.asarray(phases, dtype=float) - np.asarray(shift, dtype=float), 1.0
+    )
+    out = np.interp(ph.ravel(), phase_wrap, flux_wrap).reshape(ph.shape)
+    return out + float(scatter)
+
+
+def evaluate_model_at_phases(
+    sim_df: pd.DataFrame,
+    sim_column: str,
+    phases,
+    shift: float = 0.0,
+    scatter: float = 0.0,
+) -> np.ndarray:
+    """Model flux at *phases* for a given phase shift and additive scatter.
+
+    Convenience wrapper over :func:`_prepare_model_interpolator` +
+    :func:`_model_from_wrap` for callers that only need a single evaluation.
+    """
+    phase_wrap, flux_wrap = _prepare_model_interpolator(sim_df, sim_column)
+    return _model_from_wrap(phase_wrap, flux_wrap, phases, shift, scatter)
+
+
+def _obs_errors(
+    obs_df: pd.DataFrame,
+    rate_column: str = "rate",
+    error_column: str = "error",
+) -> np.ndarray:
+    """Observation uncertainties, with the χ²-safety guards applied.
+
+    Uses the provided errors when available, otherwise sqrt(|rate|); zero,
+    negative and non-finite values are floored so they cannot blow up χ².
+    Shared by :func:`fit_simulation` and :func:`plot_phase` so both weight the
+    data identically.
+    """
+    rate = obs_df[rate_column].to_numpy(dtype=float)
+    if error_column in obs_df.columns and not obs_df[error_column].isnull().all():
+        err = obs_df[error_column].to_numpy(dtype=float)
+    else:
+        err = np.sqrt(np.abs(rate))
+    return np.where((err <= 0) | ~np.isfinite(err), 1e-3, err)
+
+
+def fit_simulation(
+    obs_df: pd.DataFrame,
+    sim_df: pd.DataFrame,
+    sim_column: str = "fl",
+    fit_phase_shift: bool = False,
+    scatter: float = 0.0,
+    n_shift_grid: int = 1000,
+) -> tuple[float, float]:
     """Fit simulation light-curve to observations via chi-square minimization.
+
+    Only the **phase shift** (x-direction) is fitted. There is deliberately no
+    multiplicative flux scale: the model's absolute normalization is already
+    fixed by ``lam`` (the orbit-averaged nH from the spectral fit) together with
+    the XSPEC ``flux vs nH`` table, so a free y-scale would silently absorb an
+    error in that normalization instead of exposing it. The only y-direction
+    freedom is the *additive* ``scatter`` floor, which is supplied by the caller
+    (measured at mid-eclipse) rather than fitted here. This matches
+    ``mcmc_lightcurve_fit.py``, which likewise fits a per-sample phase shift and
+    an additive ``f_scatter`` but no multiplicative scale.
 
     Parameters
     ----------
@@ -540,87 +977,89 @@ def fit_simulation(obs_df: pd.DataFrame, sim_df: pd.DataFrame, sim_column: str =
         Simulation results. Must contain columns ``phase`` (or ``deg``) and *sim_column*.
     sim_column : str, default ``"fl"``
         Column in *sim_df* to use as the model flux.
-    rescale : bool, default False
-        If True, optimize phase shift and scale factor to minimize chi-square.
-        If False, compute chi-square with no shift (shift=0) and no scaling (scale=1).
+    fit_phase_shift : bool, default False
+        If True, scan the phase shift that minimizes chi-square.
+        If False, evaluate chi-square at shift = 0.
+    scatter : float, default 0.0
+        Constant additive scattered-flux floor added to the model. Added *after*
+        interpolation and never scaled.
+    n_shift_grid : int, default 1000
+        Number of trial shifts in the coarse scan over [0, 1). The scan is
+        followed by a bounded local refinement, so this only needs to be fine
+        enough to land in the correct basin.
 
     Returns
     -------
-    (phase_shift, scale_factor, reduced_chi2)
-        Best-fit phase shift (0–1), multiplicative scale factor, and reduced chi-squared value.
-        If rescale=False, returns (0.0, 1.0, reduced_chi2).
+    (phase_shift, reduced_chi2)
+        Best-fit phase shift (0–1) and reduced chi-squared value.
+        If *fit_phase_shift* is False, returns ``(0.0, reduced_chi2)``.
     """
     # Prepare observation arrays
     phase_obs = obs_df["phase"].to_numpy()
-    rate_obs = obs_df["rate"].to_numpy()
+    rate_obs = obs_df["rate"].to_numpy(dtype=float)
+    err_obs = _obs_errors(obs_df)
 
-    # Use provided statistical errors when available; otherwise adopt sqrt(counts).
-    if "error" in obs_df.columns and not obs_df["error"].isnull().all():
-        err_obs = obs_df["error"].to_numpy()
-    else:
-        err_obs = np.sqrt(np.abs(rate_obs))
+    # Prepared once; every model evaluation below goes through _model_from_wrap
+    # so the χ² here and the curve drawn by plot_phase are the same function.
+    phase_wrap, flux_wrap = _prepare_model_interpolator(sim_df, sim_column)
+    scatter = float(scatter)
 
-    # Guard against zero or negative uncertainties (would blow up χ²)
-    err_obs = np.where(err_obs <= 0, 1e-3, err_obs)
+    def chi2(shift) -> float:
+        model = _model_from_wrap(phase_wrap, flux_wrap, phase_obs, shift, scatter)
+        return float(np.sum(((rate_obs - model) / err_obs) ** 2))
 
-    # Prepare simulation arrays
-    if "phase" not in sim_df.columns:
-        if "deg" in sim_df.columns:
-            sim_df["phase"] = (sim_df["deg"] % 360) / 360.0
-        else:
-            raise ValueError("Simulation file must contain 'phase' or 'deg' column.")
+    if fit_phase_shift:
+        # The phase shift is periodic and the eclipse profile makes chi2(shift)
+        # strongly multi-modal, so a local optimizer started at shift=0 would
+        # routinely settle in the wrong basin. Scan a coarse grid over the full
+        # period first, then refine locally around the best node. This mirrors
+        # the two-stage search in mcmc_lightcurve_fit._apply_best_phase_shift.
+        n_grid = max(3, int(n_shift_grid))
+        shift_grid = np.linspace(0.0, 1.0, n_grid, endpoint=False)
 
-    sim_phase = np.mod(sim_df["phase"].to_numpy(), 1.0)
-    sim_flux = sim_df[sim_column].to_numpy()
-
-    # Ensure ascending order for interpolation and duplicate first point +1 for wrap-around
-    order = np.argsort(sim_phase)
-    sim_phase_sorted = sim_phase[order]
-    sim_flux_sorted = sim_flux[order]
-    sim_phase_wrap = np.concatenate([sim_phase_sorted, sim_phase_sorted + 1])
-    sim_flux_wrap  = np.concatenate([sim_flux_sorted,  sim_flux_sorted])
-
-    # Keep only strictly increasing x-values to avoid interp warnings
-    uniq_idx = np.concatenate(([True], np.diff(sim_phase_wrap) > 0))
-    sim_phase_wrap = sim_phase_wrap[uniq_idx]
-    sim_flux_wrap  = sim_flux_wrap[uniq_idx]
-
-    # Chi-square function
-    def chi2(params: np.ndarray) -> float:
-        shift, scale = params
-        model = np.interp(
-            (phase_obs - shift) % 1.0,
-            sim_phase_wrap,
-            sim_flux_wrap,
-        ) * scale
-        return np.sum(((rate_obs - model) / err_obs) ** 2)
-
-    if rescale:
-        # Perform optimization to find best-fit shift and scale
-        # Initial guess: no shift, scale = ratio of means
-        mean_sim = np.mean(sim_flux_sorted)
-        initial_scale = (np.mean(rate_obs) / mean_sim) if mean_sim > 0 else 1.0
-        res = minimize(chi2, x0=[0.0, initial_scale], bounds=[(0, 1), (0, None)], method="Nelder-Mead")
-
-        if not res.success:
-            print("⚠️  Optimization did not converge; results may be unreliable.")
-
-        best_shift, best_scale = res.x % np.array([1.0, np.inf])
-        reduced_chi2 = res.fun / max(len(rate_obs) - 2, 1)
-        print(
-            f"Best-fit parameters:\n  Phase shift = {best_shift:.5f}\n  Scale factor = {best_scale:.5f}\n  Reduced χ² = {reduced_chi2:.3f}"
+        # Vectorized coarse scan: one interp over all (shift, obs_phase) pairs.
+        models = _model_from_wrap(
+            phase_wrap, flux_wrap, phase_obs[None, :], shift_grid[:, None], scatter
         )
-        return float(best_shift), float(best_scale), float(reduced_chi2)
-    else:
-        # No optimization: compute chi-square with no shift and no scaling
-        best_shift = 0.0
-        best_scale = 1.0
-        chi2_value = chi2(np.array([best_shift, best_scale]))
-        reduced_chi2 = chi2_value / max(len(rate_obs) - 2, 1)
-        print(
-            f"Chi-square (no rescaling):\n  Phase shift = {best_shift:.5f} (fixed)\n  Scale factor = {best_scale:.5f} (fixed)\n  Reduced χ² = {reduced_chi2:.3f}"
+        chi2_grid = np.sum(
+            ((rate_obs[None, :] - models) / err_obs[None, :]) ** 2, axis=1
         )
-        return float(best_shift), float(best_scale), float(reduced_chi2)
+        best_idx = int(np.argmin(chi2_grid))
+        best_shift = float(shift_grid[best_idx])
+        best_chi2 = float(chi2_grid[best_idx])
+
+        # Bounded local refinement within one coarse step of the best node.
+        step = 1.0 / n_grid
+        refined = minimize_scalar(
+            chi2,
+            bounds=(best_shift - step, best_shift + step),
+            method="bounded",
+        )
+        if refined.success and float(refined.fun) < best_chi2:
+            best_shift = float(refined.x) % 1.0
+            best_chi2 = float(refined.fun)
+
+        n_free = 1
+        reduced_chi2 = best_chi2 / max(len(rate_obs) - n_free, 1)
+        print(
+            f"Best-fit parameters (phase shift only, no flux rescaling):\n"
+            f"  Phase shift = {best_shift:.5f}\n"
+            f"  Scattered flux = {scatter:.6g} (fixed, additive)\n"
+            f"  Reduced χ² = {reduced_chi2:.3f}  (dof = {max(len(rate_obs) - n_free, 1)})"
+        )
+        return float(best_shift), float(reduced_chi2)
+
+    # No optimization: evaluate chi-square at zero shift.
+    best_shift = 0.0
+    n_free = 0
+    reduced_chi2 = chi2(best_shift) / max(len(rate_obs) - n_free, 1)
+    print(
+        f"Chi-square (no phase-shift fit, no flux rescaling):\n"
+        f"  Phase shift = {best_shift:.5f} (fixed)\n"
+        f"  Scattered flux = {scatter:.6g} (fixed, additive)\n"
+        f"  Reduced χ² = {reduced_chi2:.3f}  (dof = {max(len(rate_obs) - n_free, 1)})"
+    )
+    return float(best_shift), float(reduced_chi2)
 
 
 def plot_phase(
@@ -628,16 +1067,22 @@ def plot_phase(
     output_path: str | None,
     sim_df: pd.DataFrame | None = None,
     shift: float | None = None,
-    scale: float | None = None,
     sim_column: str = "fl",
     chi2: float | None = None,
     ax: plt.Axes | None = None,
-    rescaled: bool = False,
+    shift_fitted: bool = False,
     obs_column_name: str = "rate",
     is_binned: bool = False,
+    smooth_df: Optional[pd.DataFrame] = None,
+    scatter: float = 0.0,
 ) -> None:
     """Scatter plot with optional best-fit simulation overlay.
-    
+
+    The model overlay is drawn at its native flux normalization (set by ``lam``
+    and the XSPEC flux-vs-nH table); the only y-direction adjustment is the
+    additive *scatter* floor. There is no multiplicative scale factor — see
+    :func:`fit_simulation`.
+
     Parameters
     ----------
     df : DataFrame
@@ -648,24 +1093,36 @@ def plot_phase(
         Simulation data.
     shift : float, optional
         Phase shift for simulation overlay.
-    scale : float, optional
-        Scale factor for simulation overlay.
     sim_column : str, default ``"fl"``
         Column name in simulation to use.
     chi2 : float, optional
         Reduced chi-squared value to annotate on plot.
     ax : Axes, optional
         Matplotlib axes to plot on. If None, creates a new figure.
-    rescaled : bool, default False
-        Whether the model was rescaled (optimized) or not.
+    shift_fitted : bool, default False
+        Whether the phase shift was optimized (True) or held at 0 (False).
+        Only affects the title annotation.
     obs_column_name : str, default "rate"
         Name of the observable column being plotted (for labeling).
     is_binned : bool, default False
         Whether the data has been phase-binned. If True, plots with error bars.
+    scatter : float, default 0.0
+        Constant additive scattered-flux floor added to the model overlay.
     """
+    has_model = sim_df is not None and shift is not None
+    owns_figure = ax is None
+    ax_res: Optional[plt.Axes] = None
     if ax is None:
-        plt.figure(figsize=(10, 6))
-        ax = plt.gca()
+        if has_model:
+            fig, (ax, ax_res) = plt.subplots(
+                2,
+                1,
+                figsize=(10, 8),
+                sharex=True,
+                gridspec_kw={'height_ratios': [3, 1]},
+            )
+        else:
+            fig, ax = plt.subplots(figsize=(10, 6))
 
     # Check if we have error data
     has_errors = 'error' in df.columns and not df['error'].isna().all()
@@ -682,47 +1139,113 @@ def plot_phase(
             # Scatter plot for unbinned data
             ax.scatter(group["phase"], group["rate"], s=12, alpha=0.7, label=label)
 
-    if sim_df is not None and shift is not None and scale is not None:
-        # Prepare simulation curve for overlay
-        if "phase" not in sim_df.columns and "deg" in sim_df.columns:
-            sim_df = sim_df.copy()
-            sim_df["phase"] = (sim_df["deg"] % 360) / 360.0
-        sim_phase = np.mod(sim_df["phase"].to_numpy(), 1.0)
-        sim_flux = sim_df[sim_column].to_numpy() * scale
-
-        # Sort and shift
-        sort_idx = np.argsort(sim_phase)
-        phase_sorted = sim_phase[sort_idx]
-        flux_sorted  = sim_flux[sort_idx]
-        phase_overlay = (phase_sorted + shift) % 1.0
-
-        # Resort after modulo so the line is drawn strictly within 0–1
-        re_sort = np.argsort(phase_overlay)
-        phase_overlay = phase_overlay[re_sort]
-        flux_overlay  = flux_sorted[re_sort]
-
+    model_wrap = None
+    if has_model:
+        # Overlay and residuals both come from the same evaluator used by
+        # fit_simulation's χ², so the drawn curve, the residual panel and the
+        # displayed χ² are guaranteed to describe the same model.
+        model_wrap = _prepare_model_interpolator(sim_df, sim_column)
+        phase_overlay = np.linspace(0.0, 1.0, 721)
+        flux_overlay = _model_from_wrap(
+            *model_wrap, phase_overlay, shift, scatter
+        )
         ax.plot(phase_overlay, flux_overlay, "k-", linewidth=2, label="Best-fit model")
 
-    ax.set_xlabel("Orbital phase")
+    if smooth_df is not None and len(smooth_df) > 0:
+        sphase = np.mod(smooth_df["phase"].to_numpy(dtype=float), 1.0)
+        sflux = smooth_df["flux_smooth"].to_numpy(dtype=float)
+        serr = smooth_df["flux_smooth_err"].to_numpy(dtype=float)
+        order = np.argsort(sphase)
+        sphase = sphase[order]
+        sflux = sflux[order]
+        serr = serr[order]
+        ax.plot(
+            sphase,
+            sflux,
+            '--',
+            color='green',
+            linewidth=1.5,
+            label='Gaussian-smoothed data',
+            zorder=7,
+        )
+        if np.any(np.isfinite(serr)):
+            ax.fill_between(
+                sphase,
+                sflux - serr,
+                sflux + serr,
+                color='green',
+                alpha=0.2,
+                label='Smoothed 1σ (MC)',
+                zorder=3,
+            )
+
     ylabel = obs_column_name.replace("_", " ").title() if obs_column_name != "rate" else "Count rate / Flux"
     ax.set_ylabel(ylabel)
     
     # Set title with chi-squared annotation if provided
     if chi2 is not None:
-        rescale_label = " (rescaled)" if rescaled else " (no rescaling)"
-        ax.set_title(f"{sim_column}\nReduced χ² = {chi2:.3f}{rescale_label}")
+        if shift_fitted:
+            shift_label = f" (phase shift = {shift:.4f}, fitted)"
+        else:
+            shift_label = " (phase shift = 0, fixed)"
+        ax.set_title(f"{sim_column}\nReduced χ² = {chi2:.3f}{shift_label}")
     else:
         ax.set_title("Chandra Light-curve Observations")
     
     ax.grid(alpha=0.3)
     ax.legend(loc="upper right", fontsize="small")
 
-    if ax is None or output_path:
+    if has_model and model_wrap is not None:
+        obs_phase = np.mod(df["phase"].to_numpy(dtype=float), 1.0)
+        obs_rate = df["rate"].to_numpy(dtype=float)
+        obs_err = _obs_errors(df)
+        # Same shift and scatter as the overlay above, so residuals match the curve.
+        obs_model = _model_from_wrap(*model_wrap, obs_phase, shift, scatter)
+
+        # Self-check: the χ² we display must be the χ² of the model we drew.
+        # This catches a `scatter` or `shift` that disagrees with the
+        # fit_simulation call, which would otherwise show a correct-looking
+        # number over the wrong curve.
+        if chi2 is not None and np.isfinite(chi2):
+            n_free = 1 if shift_fitted else 0
+            recomputed = float(
+                np.sum(((obs_rate - obs_model) / obs_err) ** 2)
+                / max(len(obs_rate) - n_free, 1)
+            )
+            if np.isfinite(recomputed) and abs(recomputed - chi2) > 0.01 * max(
+                abs(chi2), 1e-300
+            ):
+                warnings.warn(
+                    f"plot_phase: displayed reduced chi2 ({chi2:.4g}) does not match "
+                    f"the plotted model ({recomputed:.4g}). The `shift`/`scatter` "
+                    f"passed here probably differ from the fit_simulation call "
+                    f"(scatter={scatter!r}, shift={shift!r}).",
+                    stacklevel=2,
+                )
+
+        if ax_res is not None and has_errors:
+            xerr = None
+            if is_binned and "width" in df.columns:
+                width = np.asarray(df["width"].to_numpy(dtype=float), dtype=float)
+                if width.shape == obs_phase.shape:
+                    xerr = 0.5 * np.clip(width, 0.0, np.inf)
+            add_residual_panel(ax_res, obs_phase, obs_rate, obs_model, obs_err, xerr=xerr)
+        else:
+            ax.set_xlabel("Orbital phase")
+    else:
+        ax.set_xlabel("Orbital phase")
+
+    if owns_figure and output_path:
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches="tight")
+        print(f"Plot saved to {output_path}")
+    elif owns_figure:
+        plt.tight_layout()
+        plt.show()
+    elif output_path:
         if output_path:
             plt.savefig(output_path, dpi=300, bbox_inches="tight")
             print(f"Plot saved to {output_path}")
-        else:
-            plt.show()
 
 
 def plot_multi_column_fits(
@@ -730,13 +1253,15 @@ def plot_multi_column_fits(
     output_path: str | None,
     sim_df: pd.DataFrame,
     sim_columns: List[str],
-    fit_results: List[tuple[float, float, float]],
-    rescaled: bool = False,
+    fit_results: List[tuple[float, float]],
+    shift_fitted: bool = False,
     obs_column_name: str = "rate",
     is_binned: bool = False,
+    smooth_df: Optional[pd.DataFrame] = None,
+    scatter: float = 0.0,
 ) -> None:
     """Plot multiple fitted simulation columns in a grid layout.
-    
+
     Parameters
     ----------
     df : DataFrame
@@ -748,13 +1273,15 @@ def plot_multi_column_fits(
     sim_columns : list of str
         List of column names to plot.
     fit_results : list of tuples
-        List of (shift, scale, chi2) tuples for each column.
-    rescaled : bool, default False
-        Whether the models were rescaled (optimized) or not.
+        List of ``(shift, chi2)`` tuples for each column.
+    shift_fitted : bool, default False
+        Whether the phase shifts were optimized or held at 0.
     obs_column_name : str, default "rate"
         Name of the observable column being plotted (for labeling).
     is_binned : bool, default False
         Whether the data has been phase-binned.
+    scatter : float, default 0.0
+        Constant additive scattered-flux floor added to each model overlay.
     """
     n_cols = len(sim_columns)
     
@@ -769,9 +1296,12 @@ def plot_multi_column_fits(
         axes = np.array([axes])
     axes = axes.flatten()
     
-    for i, (col, (shift, scale, chi2)) in enumerate(zip(sim_columns, fit_results)):
+    for i, (col, (shift, chi2)) in enumerate(zip(sim_columns, fit_results)):
         ax = axes[i]
-        plot_phase(df, None, sim_df, shift, scale, col, chi2, ax, rescaled, obs_column_name, is_binned)
+        plot_phase(
+            df, None, sim_df, shift, col, chi2, ax, shift_fitted,
+            obs_column_name, is_binned, smooth_df=smooth_df, scatter=scatter,
+        )
     
     # Hide unused subplots
     for i in range(n_cols, len(axes)):
@@ -851,34 +1381,98 @@ def main() -> None:
         help="Perform χ² minimization to fit simulation to observations.",
     )
     parser.add_argument(
+        "--fit-phase-shift",
         "--rescale",
+        dest="fit_phase_shift",
         action="store_true",
-        help="Optimize phase shift and flux scale to minimize χ². "
-             "By default, chi-square is computed without rescaling (shift=0, scale=1).",
+        help="Optimize the model phase shift to minimize χ². By default the "
+             "shift is held at 0. Flux is never rescaled: the model's absolute "
+             "normalization comes from --lam and the XSPEC flux-vs-nH table, and "
+             "the only y-direction freedom is the additive --scatter floor. "
+             "(--rescale is accepted as a deprecated alias.)",
     )
     
-    # Phase binning options
+    # Phase binning options. As in mcmc_lightcurve_fit.py, the mode is selected
+    # by which argument is present rather than by a separate --bin-mode flag.
     parser.add_argument(
         "--n-phase-bins",
         type=int,
-        default=50,
-        help="Number of phase bins for binning the data (default: 50). "
-             "Binning reduces scatter by averaging data within each phase bin.",
+        default=None,
+        help="Use fixed-width phase binning with this many bins (variable counts "
+             "per bin). Mutually exclusive with --counts-per-bin. If neither "
+             "binning option is given, defaults to 50 fixed-width bins.",
+    )
+    parser.add_argument(
+        "--counts-per-bin",
+        type=int,
+        default=None,
+        help="Use adaptive phase binning with approximately constant counts per "
+             "bin (variable phase width), giving every binned point equal "
+             "Poisson weight. Requires a 'counts' column in the data. Mutually "
+             "exclusive with --n-phase-bins. Recommended value: 100.",
     )
     parser.add_argument(
         "--no-phase-bin",
         action="store_true",
-        help="Disable phase binning and use raw data points instead.",
+        help="Disable phase binning and use raw data points instead. Takes "
+             "precedence over both binning options.",
     )
     parser.add_argument(
         "--min-points-per-bin",
         type=int,
         default=3,
         help="Minimum number of data points required per bin (default: 3). "
-             "Bins with fewer points are excluded.",
+             "Bins with fewer points are excluded. Fixed-width binning only.",
+    )
+    parser.add_argument(
+        "--smooth",
+        action="store_true",
+        help="Overlay a Gaussian-smoothed reference curve of the observed data.",
+    )
+    parser.add_argument(
+        "--smooth-sigma",
+        type=float,
+        default=0.01,
+        help="Gaussian kernel width in phase units for smoothing.",
+    )
+    parser.add_argument(
+        "--smooth-n-mc",
+        type=int,
+        default=2000,
+        help="Number of Monte Carlo perturbations for smoothing uncertainty (0 disables band).",
+    )
+    parser.add_argument(
+        "--smooth-seed",
+        type=int,
+        default=None,
+        help="RNG seed for smoothing Monte Carlo perturbations.",
+    )
+    parser.add_argument(
+        "--scatter",
+        type=float,
+        default=None,
+        help="Constant additive scattered flux term. If omitted during --fit, it is estimated from eclipse phase.",
+    )
+    parser.add_argument(
+        "--scatter-eclipse-phase",
+        nargs=2,
+        type=float,
+        default=(0.4, 0.6),
+        metavar=("PHASE_MIN", "PHASE_MAX"),
+        help="Phase window used to estimate scattered flux when --scatter is not provided.",
     )
 
     args = parser.parse_args()
+
+    if args.n_phase_bins is not None and args.counts_per_bin is not None:
+        parser.error(
+            "Specify either --n-phase-bins (fixed-width) or --counts-per-bin "
+            "(constant-SNR), not both."
+        )
+    if args.n_phase_bins is not None and args.n_phase_bins <= 0:
+        parser.error("--n-phase-bins must be > 0.")
+    if args.counts_per_bin is not None and args.counts_per_bin <= 0:
+        parser.error("--counts-per-bin must be > 0.")
 
     # Determine observation column to use
     obs_column = args.obs_column if args.obs_column else "rate"
@@ -914,23 +1508,63 @@ def main() -> None:
     else:
         print(f"Using data column: '{obs_column}' (no error column found)")
     
-    # Apply phase binning if requested
+    # Apply phase binning if requested. Mode is chosen by argument presence:
+    # --no-phase-bin > --counts-per-bin > --n-phase-bins > 50 fixed-width bins.
     is_binned = False
     if not args.no_phase_bin:
-        df = phase_bin_data(
-            df,
-            n_bins=args.n_phase_bins,
-            min_points_per_bin=args.min_points_per_bin,
-            rate_column='rate',
-            error_column='error',
-            verbose=True
-        )
+        if args.counts_per_bin is not None:
+            if 'counts' not in df.columns:
+                parser.error(
+                    "--counts-per-bin requires a 'counts' column in the input "
+                    "files (present in CIAO-format light curves). Use "
+                    "--n-phase-bins for fixed-width binning instead."
+                )
+            df = phase_bin_data_snr(
+                df,
+                counts_per_bin=args.counts_per_bin,
+                counts_column='counts',
+                rate_column='rate',
+                error_column='error',
+                verbose=True,
+            )
+        else:
+            df = phase_bin_data(
+                df,
+                n_bins=(args.n_phase_bins or 50),
+                min_points_per_bin=args.min_points_per_bin,
+                rate_column='rate',
+                error_column='error',
+                verbose=True
+            )
         is_binned = True
 
     if args.fit:
         if not args.sim_file:
             parser.error("--fit requires --sim-file to be specified.")
         
+        if args.scatter is not None:
+            scatter_value = float(args.scatter)
+            print(f"Using fixed scattered flux: {scatter_value:.6g}")
+        else:
+            scatter_value = estimate_scattered_flux(
+                df["phase"].to_numpy(dtype=float),
+                df["rate"].to_numpy(dtype=float),
+                window=(float(args.scatter_eclipse_phase[0]), float(args.scatter_eclipse_phase[1])),
+            )
+            print(f"Estimated scattered flux from eclipse window: {scatter_value:.6g}")
+
+        smooth_df = None
+        if args.smooth:
+            smooth_df = smooth_lightcurve(
+                df["phase"].to_numpy(dtype=float),
+                df["rate"].to_numpy(dtype=float),
+                df["error"].to_numpy(dtype=float) if "error" in df.columns else None,
+                sigma=float(args.smooth_sigma),
+                n_mc=int(args.smooth_n_mc),
+                random_state=args.smooth_seed,
+                verbose=True,
+            )
+
         print(f"Loading simulation file: {args.sim_file}")
         sim_df = pd.read_csv(args.sim_file)
         
@@ -954,25 +1588,52 @@ def main() -> None:
             print(f"Fitting column: {col}")
             print('='*60)
             try:
-                shift, scale, chi2 = fit_simulation(df, sim_df, col, rescale=args.rescale)
-                fit_results.append((shift, scale, chi2))
+                shift, chi2 = fit_simulation(
+                    df, sim_df, col,
+                    fit_phase_shift=args.fit_phase_shift,
+                    scatter=scatter_value,
+                )
+                fit_results.append((shift, chi2))
             except Exception as e:
                 print(f"⚠️  Failed to fit column '{col}': {e}")
                 # Add dummy values so we can still plot other columns
-                fit_results.append((0.0, 1.0, float('nan')))
-        
+                fit_results.append((0.0, float('nan')))
+
         # Plot based on number of columns
         if len(sim_columns) == 1:
             # Single column: use original plot
-            shift, scale, chi2 = fit_results[0]
-            plot_phase(df, args.output, sim_df, shift, scale, sim_columns[0], chi2, 
-                      rescaled=args.rescale, obs_column_name=obs_column, is_binned=is_binned)
+            shift, chi2 = fit_results[0]
+            plot_phase(
+                df, args.output, sim_df, shift, sim_columns[0], chi2,
+                shift_fitted=args.fit_phase_shift, obs_column_name=obs_column,
+                is_binned=is_binned, smooth_df=smooth_df, scatter=scatter_value,
+            )
         else:
             # Multiple columns: use grid plot
-            plot_multi_column_fits(df, args.output, sim_df, sim_columns, fit_results, 
-                                  rescaled=args.rescale, obs_column_name=obs_column, is_binned=is_binned)
+            plot_multi_column_fits(
+                df, args.output, sim_df, sim_columns, fit_results,
+                shift_fitted=args.fit_phase_shift, obs_column_name=obs_column,
+                is_binned=is_binned, smooth_df=smooth_df, scatter=scatter_value,
+            )
     else:
-        plot_phase(df, args.output, obs_column_name=obs_column, is_binned=is_binned)
+        smooth_df = None
+        if args.smooth:
+            smooth_df = smooth_lightcurve(
+                df["phase"].to_numpy(dtype=float),
+                df["rate"].to_numpy(dtype=float),
+                df["error"].to_numpy(dtype=float) if "error" in df.columns else None,
+                sigma=float(args.smooth_sigma),
+                n_mc=int(args.smooth_n_mc),
+                random_state=args.smooth_seed,
+                verbose=True,
+            )
+        plot_phase(
+            df,
+            args.output,
+            obs_column_name=obs_column,
+            is_binned=is_binned,
+            smooth_df=smooth_df,
+        )
 
 
 if __name__ == "__main__":
