@@ -30,9 +30,12 @@ fitting, and inference stack since the original R port.
 21. [Phase 20 — Remove Multiplicative Flux Scale from the Single-Model χ² Fit](#phase-20--remove-multiplicative-flux-scale-from-the-single-model-χ-fit)
 22. [Phase 21 — MCMC Scatter-Path Audit](#phase-21--mcmc-scatter-path-audit)
 23. [Phase 22 — Adaptive Binning in the Single-Model CLI](#phase-22--adaptive-binning-in-the-single-model-cli)
-24. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
-25. [Current File Inventory](#current-file-inventory)
-26. [Current Status & Quick Commands](#current-status--quick-commands)
+24. [Phase 23 — `utils/` Extraction and a Single Plotting Routine](#phase-23--utils-extraction-and-a-single-plotting-routine)
+25. [Phase 24 — Run-Config Persistence and a Replot-Mode Fix](#phase-24--run-config-persistence-and-a-replot-mode-fix)
+26. [Phase 25 — MCMC Script Slimming](#phase-25--mcmc-script-slimming)
+27. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
+28. [Current File Inventory](#current-file-inventory)
+29. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -893,6 +896,318 @@ the noisy narrow eclipse-trough bins merge.
 
 ---
 
+## Phase 23 — `utils/` Extraction and a Single Plotting Routine
+
+`chandra_phase_analysis.py`, `mcmc_lightcurve_fit.py`, new `utils/utils.py`,
+`utils/plot_utils.py`, `utils/__init__.py`. **Status: uncommitted** on branch
+`add_generic_wind`.
+
+Both analysis scripts carried their own plotting functions, and
+`mcmc_lightcurve_fit.py` imported its data-layer helpers *from*
+`chandra_phase_analysis.py` — so the CLI script was simultaneously a library and
+a front end, and `mcmc` depended on it for reasons unrelated to Chandra data.
+Everything shared now lives in a `utils` package and neither script imports the
+other.
+
+### New layout
+
+| Module | Contents |
+| ------ | -------- |
+| `utils/utils.py` (1071 lines) | `REF_EPOCH`, `ORBITAL_PERIOD`, `frac`, `fmt_val`, `band_label_from_column`, `detect_flux_columns`, `validate_sim_columns`, `read_observation`, `load_data`, `phase_bin_data`, `phase_bin_data_snr`, `smooth_lightcurve`, `estimate_scattered_flux`, `prepare_model_interpolator`, `model_from_wrap`, `evaluate_model_at_phases`, `interp_periodic_phases`, `obs_errors`, `fit_simulation`. numpy/pandas/scipy only. |
+| `utils/plot_utils.py` (597 lines) | `plot_lightcurve_fit` (the one drawing routine), `plot_phase`, `plot_multi_column_fits`, `plot_corner`, `plot_trace`, `add_residual_panel`, `build_fit_title`, `format_reduced_chi2`, `half_widths`. |
+
+`chandra_phase_analysis.py` drops from 1639 to 457 lines and is now only the
+argparse CLI plus an `__all__` re-export block, so `from chandra_phase_analysis
+import *` — the notebooks' import style — is unchanged.
+`mcmc_lightcurve_fit.py` drops from 4124 to 3952 lines.
+
+### One plotting function
+
+`plot_lightcurve_fit` is the drawing code that used to be inlined in
+`mcmc_lightcurve_fit.plot_best_fit`, generalized so both paths reach it. It
+draws only what it is handed — observed arrays, an already-shifted overlay
+curve, and the model evaluated at the observed phases — which is what makes it
+usable from both:
+
+- `plot_best_fit` still owns the MCMC-specific work (MAP-vs-median point
+  estimate, `_evaluate_model`, `_apply_best_phase_shift`) and then delegates.
+- `plot_phase` is now a thin adapter: interpolate `sim_df` at the given `shift`
+  and additive `scatter`, then delegate. Its displayed-χ² self-check warning
+  (Phase 20) moved with it.
+
+Feature parity required generalizing three things: an optional `obs_group`
+array (so Chandra's per-observation series still get their own colors and
+legend entries), an `ax`/`ax_res` pair (so `plot_multi_column_fits` can still
+draw into a grid cell, residual-panel-free), and a `title` escape hatch for the
+no-model data plot. Two incidental fixes fell out: a model overlay with no error
+column no longer produces an empty residual panel, and `--counts-per-bin` widths
+reach the x-error bars through one code path instead of two.
+
+### Removed from the figure
+
+Per request, `plot_best_fit`'s wheat-colored annotation box is gone. The title
+is now only the energy band and χ²/dof:
+
+```
+SOFT band  —  χ²/dof = 13.018
+```
+
+The information it carried is not lost — point estimate, `phase_shift`, `f`,
+`chi2_eff/dof` and `f_scatter` are printed to stdout next to the existing
+parameter table, which is also written to the run summary. `plot_phase` titles
+gained the band label the same way: `nfl_soft -> "SOFT band"` via
+`band_label_from_column`, so grid panels remain identifiable.
+
+### Deduplicated
+
+- `_interp_periodic_phases` (mcmc) and `_model_from_wrap` (chandra) were two
+  spellings of periodic model interpolation; both now live in `utils.utils` as
+  `interp_periodic_phases` / `model_from_wrap`, documented as the array-in and
+  prepared-interpolator forms of the same operation.
+- `plot_corner`, `plot_trace`, `add_residual_panel`, `fmt_val` moved out of
+  `mcmc_lightcurve_fit.py` verbatim.
+- `mcmc_lightcurve_fit.py` no longer imports `matplotlib.pyplot` or `corner` at
+  all — all figure work is behind `utils.plot_utils`.
+
+### Verification (conda env `henv`, Python 3.13.5 / numpy 2.2.6)
+
+- `py_compile` on all five files; `import` of both scripts; star-import exports
+  23 names with nothing missing.
+- Chandra CLI, four modes on ObsID soft data: adaptive bins + fitted shift +
+  smoothing (χ²/dof 30.605, no self-check warning), 3-column grid (98.007 /
+  15.071 / 46.100, one title per band), fixed-width no-fit plot, raw unbinned
+  fit.
+- MCMC: 24 walkers × 60 steps with `--fit-scatter --smooth` produced χ²/dof
+  13.0179; `--replot` from the saved chain reproduced 13.0179 exactly.
+- Consistency suite, 15 assertions: across `phys` / `phys, shift fixed` /
+  `phys + f_scatter`, the χ²/dof `plot_best_fit` reports equals the χ² of the
+  arrays it hands the plotter to `rtol=1e-12`, and the drawn overlay
+  reinterpolated onto the observed phases matches the residual basis to
+  ≤5.0e-4 relative (the Phase 20 regression would blow this up by orders of
+  magnitude). `fit_simulation` recovers an injected `shift=0.30` to 5 decimals
+  with χ²/dof = 0; the self-check guard stays silent when `shift`/`scatter`
+  agree and fires when `scatter` is wrong.
+- All five call forms the notebooks use for `plot_phase` /
+  `plot_multi_column_fits` run against real data with no self-check warnings.
+  (End-to-end `nbconvert` execution still stops at the notebooks' `import
+  xspec` cell — a pre-existing `henv` limitation, unrelated to this change.)
+
+Not migrated: `chandra_analysis_combined_flux.py` keeps its own older copies of
+`fit_simulation` / `plot_phase` / `plot_multi_column_fits` and still fits a
+multiplicative flux scale. See [Known rough edges](PROJECT.md#known-rough-edges).
+
+---
+
+## Phase 24 — Run-Config Persistence and a Replot-Mode Fix
+
+`mcmc_lightcurve_fit.py`. **Status: uncommitted** on branch `add_generic_wind`.
+
+### Bug: `--replot` could not read a kepler- or reparam-mode chain
+
+`load_existing_results` validated the samples CSV against
+`REPARAM_PARAM_NAMES if reparam else PARAM_NAMES` — the `kepler` argument it
+accepted was never used. Replotting a `--kepler` run therefore failed with
+
+```
+Error: Samples file missing required geometry columns: ['d1', 'd2']
+```
+
+even though the file correctly held `M_X, M_RH, r, R, i0, ...`. Fixed to select
+the geometry block by mode, and two related gaps closed:
+
+- Frozen parameters are not sampled and so are legitimately absent from the CSV;
+  they are now excluded from the required set (`--freeze R=2.0` runs were
+  unreplottable for the same reason).
+- The error now lists the columns actually present and, when they match another
+  parameterization, names the flag to use.
+
+### Feature: the CLI of every fit is saved and restored
+
+`--replot` previously recovered only `mode`, frozen values, `orbital_period_s`
+and `likelihood` from the chain `.npz`. Everything else fell back to argparse
+defaults — including `--data-dir`, `--obs-column`, `--time-column`,
+`--counts-per-bin`/`--n-phase-bins`, `--lam`, `--dth`, `--d2h` and all
+`--prior-*`. Those options determine the *observed arrays*, so a replot that
+missed them reported a χ²/dof for a dataset the posterior had never seen. On the
+existing `broad` kepler run, replotting with default `--lam`/`--flux-csv` gave
+χ²/dof = 0.916 against the true 1.064.
+
+Every fit now writes `<band>_<wind_model>_run_config.json` into `--output-dir`:
+
+```json
+{
+  "created": "2026-08-26T16:53:02-0400",
+  "command": "mcmc_lightcurve_fit.py --band broad --kepler ...",
+  "band": "broad",
+  "wind_model": "smooth_pl",
+  "args": { "...": "every argparse dest" }
+}
+```
+
+It is written *before* sampling starts, so it survives an interrupted run. On
+`--replot`, `apply_saved_run_config` fills in every option the user did not type:
+
+- **Explicit flags always win.** Which options were typed is determined by
+  scanning `sys.argv` against the parser's option strings (including
+  unambiguous prefixes), not by comparing against defaults — a user who
+  explicitly passes the default value still overrides the saved config.
+- `replot` and `output_dir` are never restored: the first would cancel the
+  replot (a saved fit always recorded `replot=False`), and the second is defined
+  by where the config was found.
+- `--band` and `--flux-csv` changed from `required=True` to being validated
+  after the restore, so `--replot` alone is a complete command. They are still
+  required for a real fit.
+- Ambiguity is handled: with several configs in one directory, ones differing
+  only by `band` (the `--band all` case) restore identically and the first is
+  used; genuinely different configs produce an error listing them.
+- Self-healing: a `--replot` that finds no config writes one from the options it
+  just used, so pre-existing result directories become self-sufficient after one
+  full-CLI replot.
+
+As an independent backstop, `replot_from_existing` now compares the observed
+point count against `n_obs` in the chain metadata and warns on a mismatch.
+`n_obs` is also now stored unconditionally rather than only when `--compute-bic`
+ran, so the check works for every run.
+
+### Verification (conda env `henv`)
+
+- The existing `mcmc_results/broad_smooth_pl` kepler + wind-shape + `f_scatter`
+  run replots without error. With the original CLI it reproduces the saved
+  numbers exactly: χ²/dof **1.06423** (summary recorded 1.064) and BIC
+  **195.673** (`logL_hat=-77.689, k=8, n=154`).
+- A second `--replot --output-dir mcmc_results` with **no other arguments**
+  reproduces the same 1.06423 / 195.673 from the auto-written config.
+- Fresh 24×40-step soft fit: config written, then bare `--replot` round-tripped
+  χ²/dof = 13.2843 identically.
+- `--replot --lam 0.9` reports `kept from the command line: --lam`, confirming
+  precedence.
+- Mismatch guard fires as intended: forcing `--counts-per-bin 300` on the broad
+  run warns "Replot is using 53 observed points but the saved fit used 154".
+- `--band`/`--flux-csv` still error out when missing on a non-replot run.
+
+---
+
+## Phase 25 — MCMC Script Slimming
+
+`mcmc_lightcurve_fit.py`, `utils/utils.py`. **Status: uncommitted** on branch
+`add_generic_wind`. Behaviour-preserving throughout — every regression number
+below is bit-identical to the pre-cleanup run.
+
+`mcmc_lightcurve_fit.py`: **4246 -> 3553 lines (-693, -16%)**.
+
+### Moved into `utils/utils.py` (generic, not MCMC-specific)
+
+| Moved | Lines |
+| ----- | ----- |
+| `resolve_band_directory`, `load_observed_lightcurves` | 90 |
+| `build_phase_shift_terms`, `apply_best_phase_shift` + the `DEFAULT_PHASE_SHIFT_*` constants | 95 |
+| run-config persistence: `save_run_config`, `find_run_configs`, `apply_saved_run_config`, `_explicit_cli_dests`, `_jsonable`, `run_config_path` | 165 |
+| `save_samples_csv_chunked` | 23 |
+
+The phase-shift search now sits next to `fit_simulation`, which runs the same
+coarse-scan-then-refine algorithm on a tabulated model — both spellings of the
+idea are in one place. `utils/utils.py` gained a stdlib-only dependency
+footprint (`argparse`, `csv`, `json`, `shlex`, `time`) and stays free of any
+import from either analysis script.
+
+### Deleted by making the shared binners honest
+
+`phase_bin_data` / `phase_bin_data_snr` hardcoded `rate`/`error` as their output
+column names, so the MCMC script carried two 25-50 line wrappers that renamed
+`flux`/`flux_err` in and back out again. The binners now name their value
+columns after the `rate_column`/`error_column` arguments they were given, so the
+MCMC path calls them directly:
+
+```python
+bin_cols = dict(rate_column='flux', error_column='flux_err')
+obs_df = phase_bin_data_snr(obs_df, counts_per_bin=..., **bin_cols)
+```
+
+`chandra_phase_analysis` passes `rate`/`error` and is unaffected. **-73 lines.**
+
+### Deduplicated
+
+- **Likelihood front half.** `log_likelihood_chi2` and `log_likelihood_jitter`
+  shared ~23 lines of identical model-evaluation + phase-shift-alignment
+  preamble. Extracted as `_aligned_model_flux`; each likelihood is now its own
+  formula plus a call. `f = exp(log_f)` moved after the alignment (it does not
+  depend on the model, so the result is unchanged).
+- **CLI plumbing.** `_phase_shift_opts(args)` replaces 8 copies of the same
+  three-line `fit_phase_shift=` / `phase_shift_grid_size=` /
+  `phase_shift_eval_points=` `getattr` triple. `_smooth_plot_kwargs(smoothed,
+  args)` replaces two 13-line blocks of `smoothed[...] if smoothed is not None
+  else None`.
+- **`--prior-*` definitions.** Nine near-identical 8-line `add_argument` calls
+  became a table-driven loop reading defaults straight from `DEFAULT_PRIORS` /
+  `REPARAM_PRIORS` / `KEPLER_PRIORS`, so the help text cannot drift from the
+  values actually used. It already had: `--prior-r` advertised
+  `max=0.01` while the code used `0.1`. **-50 lines, one stale-help bug fixed.**
+- **Prior parsing.** The geometry and wind-shape override loops were the same
+  20 lines twice; now one `_parse_prior_overrides(parser, args, names)`.
+- **`replot_from_existing`** opened `*_chain.npz` twice, in two separate
+  try/except blocks, to read `mode`/`frozen`/`n_obs` and then `likelihood`.
+  Merged into one read.
+- **Label construction.** The 17-line "name -> corner label" `if/elif` chain in
+  the replot path became `_labels_for_names(names, mode)`, built on the existing
+  `get_mode_name_label`.
+- `_default_priors(reparam, kepler)` replaces three copies of the
+  `if kepler / elif reparam / else` prior-selection block (and upgrades two of
+  them from `.copy()` to `deepcopy`, so a prior override can no longer reach the
+  module-level dict).
+- `_maybe_save_chi2(...)` replaces two 15-line `--save-chi2` blocks.
+
+### Dead code removed
+
+- `compute_pointwise_loglik` (84 lines) — the per-observation log-likelihood
+  matrix that WAIC/LOO consumed. Traced before removing: it was added *with* its
+  caller in `b867ff1` and called for six commits from inside
+  `run_arviz_diagnostics`, gated on `--compute-waic`, feeding
+  `log_lik_dict = {"obs": ll[np.newaxis, :, :]}` into `_build_inference_data`
+  and thence `az.waic` / `az.loo`. Phase 15 (`7116302`) deleted that call when
+  BIC replaced WAIC/LOO — `L̂` from the run's own likelihood at the max-log-prob
+  sample needs no pointwise terms — leaving `--compute-waic` as a shim; Phase 18
+  (`b376585`) deleted the flag and shim outright. Unreachable ever since, with
+  the only remaining trace being `_build_inference_data`'s optional
+  `log_lik_dict` parameter, whose sole caller passes `None`. Note it was
+  *maintained* dead code (it picked up the Phase 17 phase-shift alignment and
+  lost its `studentt` branch with Phase 18), so it is a working starting point
+  if LOO is ever wanted back: `git show 19dc637:mcmc_lightcurve_fit.py`.
+- `_to_physical` — a "backward-compatible wrapper for legacy callers" with no
+  callers anywhere in the repo.
+- A dead `import gzip` inside `compute_chi2_for_samples` (the gzip write goes
+  through `to_csv(compression='gzip')`), and now-unused module imports
+  (`csv`, `json`, `shlex`, `sys`, `glob`, `pickle`).
+
+### Comments trimmed
+
+Thirteen multi-line rationale comments (7-10 lines each) cut to 1-3 lines,
+keeping the *why* and dropping the retold debugging narrative — e.g. the
+walker-clip block went from eight lines to three while still naming the failure
+it prevents (`f_scatter` collapsing and aborting emcee on the condition number).
+**-37 lines.**
+
+### Verification (conda env `henv`) — all numbers unchanged
+
+- Bare `--replot --output-dir mcmc_results` on the real broad kepler +
+  wind-shape + `f_scatter` run: χ²/dof **1.06423**, BIC **195.673**
+  (`logL_hat=-77.689, k=8, n=154`) — identical to Phase 24.
+- Consistency suite: **18/18 pass**, including three `plot_best_fit`
+  configurations agreeing with the drawn arrays to `rtol=1e-12` at the same
+  values as before (1.117909384 / 1.118796619 / 1.392422282), and new checks
+  that the moved functions resolve to `utils.utils` and the binners preserve
+  column names.
+- Fresh fits round-trip through `--replot` exactly in every mode: `chi2` +
+  `f_scatter` (12.9794), `jitter` + `f_scatter` + `--save-chi2` +
+  `--compute-bic` (16.698, BIC -2011.323), `--reparam` (5.71919), `--kepler
+  --fit-wind-shape --freeze R=13.0` (9.82407).
+- Chandra CLI, all four modes: 30.605 / (98.007, 15.071, 46.100) / 40 bins /
+  3.129 — unchanged.
+- All five notebook `plot_phase` / `plot_multi_column_fits` call forms run with
+  no self-check warnings. ArviZ, corner and trace paths exercised.
+- No unused imports remain in any of the four files.
+
+---
+
 ## Side Investigation — Reference Epoch Recalibration
 
 Plan: `reference_epoch_recalibration_ae1cf98a.plan.md`.
@@ -924,8 +1239,10 @@ study script itself is **not present** in the working tree.
 | File                          | Lines | Status | Description                                            |
 | ----------------------------- | ----- | ------ | ------------------------------------------------------ |
 | `xrb_lightcurve.py`           | 2115  | active | Forward model: profiles, Numba GL LOS kernels, `simulate_lightcurve`, physical back-calculation helpers. |
-| `mcmc_lightcurve_fit.py`      | 4092  | active | emcee/zeus MCMC: `ParamSpec` (phys/reparam/kepler), freeze, wind-shape, `f_scatter`, phase-shift search, BIC, ArviZ, replot. Direct evaluator only. |
-| `chandra_phase_analysis.py`   | 1463  | active | Data loading, phase folding, fixed + constant-SNR binning, smoothing/residual primitives, single-model χ² fit. |
+| `mcmc_lightcurve_fit.py`      | 3553  | active | emcee/zeus MCMC: `ParamSpec` (phys/reparam/kepler), freeze, wind-shape, `f_scatter`, phase-shift search, BIC, ArviZ, replot. Direct evaluator only. |
+| `chandra_phase_analysis.py`   |  457  | active | CLI front end for the single-model χ² fit; re-exports the shared `utils/` API for the notebooks. |
+| `utils/utils.py`              | 1474  | active | Shared layer: ephemeris, loading, both binners, smoothing, periodic model interpolation + phase-shift search, `fit_simulation`, run-config persistence. |
+| `utils/plot_utils.py`         |  597  | active | All plotting, built on the single `plot_lightcurve_fit` drawing routine. |
 | `compute_flux_vs_nH.py`       |  934  | active | XSPEC table generator (flux vs nH).                    |
 | `xspec_fit_mcmc.py`           |  702  | active | XSPEC-side MCMC for spectral fits.                     |
 | `chandra_analysis_combined_flux.py` | 539 | active | Pre-folded combined-flux phase analysis.           |
@@ -944,7 +1261,10 @@ contains dead flags from earlier phases).
 `utils/get_conversion_factors.sh`, `find_reference_epoch.py`.
 
 ### Utilities (`utils/`)
-`add_flux_simple.py`, `add_flux_to_lightcurves.py`, `convert_fits_to_txt.py`,
+Now a package (`__init__.py`). `utils.py` and `plot_utils.py` are library code
+imported by both analysis scripts (see Core above). Standalone data-prep
+scripts, not part of the package API: `add_flux_simple.py`,
+`add_flux_to_lightcurves.py`, `convert_fits_to_txt.py`,
 `get_average_count_rates.py`, `test_flux_methods.py`,
 `benchmark_mcmc_performance.py`.
 
