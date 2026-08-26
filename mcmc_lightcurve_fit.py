@@ -108,19 +108,18 @@ from xrb_lightcurve import (
     simulate_lightcurve,
     WIND_MODEL_PARAM_KEYS,
     default_wind_params,
+    evaluate_g_profile,
 )
 from utils.utils import (
     DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     DEFAULT_PHASE_SHIFT_GRID_SIZE,
     ORBITAL_PERIOD,
-    REF_EPOCH,
     RUN_CONFIG_SUFFIX,
     apply_best_phase_shift as _apply_best_phase_shift,
     apply_saved_run_config,
     build_phase_shift_terms as _build_phase_shift_terms,
     estimate_scattered_flux,
     fmt_val as _fmt_val,
-    frac,
     interp_periodic_phases as _interp_periodic_phases,
     load_observed_lightcurves,
     phase_bin_data,
@@ -132,8 +131,11 @@ from utils.utils import (
 )
 from utils.plot_utils import (
     plot_corner,
+    plot_geometry_vs_phase,
     plot_lightcurve_fit,
+    plot_orbit_geometry,
     plot_trace,
+    plot_wind_profile,
 )
 
 
@@ -1735,6 +1737,39 @@ def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str
     print('='*60)
 
 
+def _point_estimate_theta(
+    stats: Dict,
+    param_names: List[str],
+    param_spec: Optional[ParamSpec] = None,
+    reparam: bool = False,
+) -> Tuple[np.ndarray, str]:
+    """Posterior point estimate in active-parameter order, plus its label.
+
+    Prefers the MAP point (one sample) over per-parameter medians: medians of
+    nonlinear combinations are not the combinations of medians, so a median
+    point would violate d1 + d2 = a and d1/(d1+d2) = q. The MAP point does not.
+    Frozen parameters are filled from *param_spec*.
+    """
+    use_map = all(
+        ('map' in stats[p]) for p in
+        (PARAM_NAMES if not reparam else ['r', 'R', 'i0', 'd1', 'd2'])
+        if p in stats
+    )
+    point_key = 'map' if use_map else 'median'
+
+    def value(name: str) -> float:
+        if name in stats and point_key in stats[name]:
+            return float(stats[name][point_key])
+        if param_spec is not None and name in param_spec.frozen:
+            return float(param_spec.frozen[name])
+        raise KeyError(
+            f"Missing '{name}' in statistics for best-fit plotting. "
+            f"If this parameter is frozen, pass param_spec with frozen values."
+        )
+
+    return np.array([value(n) for n in param_names], dtype=float), point_key
+
+
 def plot_best_fit(
     model,
     obs_phase: np.ndarray,
@@ -1794,32 +1829,9 @@ def plot_best_fit(
     if param_names is None:
         param_names = PARAM_NAMES
 
-    # Prefer the MAP point (one sample) over per-param medians: medians of
-    # nonlinear combinations are not the combinations of medians, so a median
-    # curve would violate d1 + d2 = a and d1/(d1+d2) = q. The MAP point does not.
-    use_map = all(
-        ('map' in stats[p]) for p in (PARAM_NAMES if not reparam else
-                                       ['r', 'R', 'i0', 'd1', 'd2'])
-        if p in stats
-    )
-    point_key = 'map' if use_map else 'median'
-
-    def _value_from_stats_or_frozen(name: str) -> float:
-        if name in stats and point_key in stats[name]:
-            return float(stats[name][point_key])
-        if param_spec is not None and name in param_spec.frozen:
-            return float(param_spec.frozen[name])
-        raise KeyError(
-            f"Missing '{name}' in statistics for best-fit plotting. "
-            f"If this parameter is frozen, pass param_spec with frozen values."
-        )
-
-    # Point-estimate theta in active-parameter order, evaluated through
-    # _evaluate_model — the same entry point the likelihood uses.
-    theta_best = np.array(
-        [_value_from_stats_or_frozen(name) for name in param_names],
-        dtype=float,
-    )
+    # Evaluated through _evaluate_model — the same entry point the likelihood uses.
+    theta_best, point_key = _point_estimate_theta(
+        stats, param_names, param_spec=param_spec, reparam=reparam)
 
     def _eval_at(phases: np.ndarray) -> np.ndarray:
         out = _evaluate_model(
@@ -1922,6 +1934,184 @@ def plot_best_fit(
     print(f"Best-fit plot saved to: {output_path}")
 
     return red_chi2
+
+
+def plot_geometry_diagnostics(
+    stats: Dict,
+    samples: np.ndarray,
+    band: str,
+    wind_model: str,
+    output_dir: str,
+    suffix: str,
+    param_names: List[str],
+    reparam: bool = False,
+    fit_wind_shape: bool = False,
+    param_spec: Optional[ParamSpec] = None,
+    sim_params: Optional[Dict] = None,
+    dth: float = 5.0,
+    flux_csv_path: Optional[str] = None,
+    n_profile_draws: int = 300,
+    verbose: bool = True,
+) -> Optional[Dict[str, str]]:
+    """Geometry figures for the posterior point estimate.
+
+    Three plots, each answering a question the light-curve fit alone does not:
+
+    1. ``*_geometry_orbit.png`` -- projected orbit against the companion disk,
+       plus a to-scale top-down view. The eclipse width constrains a
+       *combination* of (a, R, i0), so this is where an implausible but
+       well-fitting parameter set becomes obvious (e.g. a "companion" larger
+       than its own orbit, or a dip that is pure absorption with no geometric
+       eclipse at all).
+    2. ``*_geometry_phase.png`` -- projected separation against the R+/-r
+       eclipse thresholds, sky-plane components, N_H(phase) and the band flux.
+       Turns the eclipse from an emergent light-curve feature into a stated
+       geometric condition with visible margin.
+    3. ``*_wind_profile.png`` -- g(r) with a posterior credible band. The shape
+       parameters are only interpretable jointly (Rb and p trade off strongly),
+       so the constraint is much clearer on g(r) than in a corner plot. The
+       band of radii the line of sight actually probes is shaded: the profile
+       inside the minimum impact parameter is unconstrained by these data.
+
+    Returns a dict of the figures written, or None if the point estimate could
+    not be resolved / the simulation failed.
+    """
+    try:
+        theta_best, point_key = _point_estimate_theta(
+            stats, param_names, param_spec=param_spec, reparam=reparam)
+    except KeyError as e:
+        warnings.warn(f"Skipping geometry plots: {e}")
+        return None
+
+    d1, d2, r, R, i0 = _resolve_geom(
+        theta_best, reparam=reparam, active_names=param_names, param_spec=param_spec)
+    frozen = dict(param_spec.frozen) if param_spec is not None else {}
+    wind_params = _to_wind_params(
+        theta_best, param_names, wind_model, R,
+        fit_wind_shape=fit_wind_shape, frozen=frozen)
+    # Same additive floor the likelihood and plot_best_fit apply, so the flux
+    # panel here shows the curve that was actually fitted.
+    f_scatter = _resolve_scatter(theta_best, param_names, param_spec)
+
+    sim_params = sim_params or {}
+    if verbose:
+        shape_txt = ", ".join(f"{k}={v:.4g}" for k, v in sorted(wind_params.items()))
+        print(f"\nGeometry diagnostics at the {point_key} point estimate:")
+        print(f"  d1={d1:.4f}  d2={d2:.4f}  a={d1 + d2:.4f}  "
+              f"r={r:.6g}  R={R:.4f}  i0={i0:.4f} deg")
+        print(f"  wind_params: {shape_txt}")
+        if f_scatter:
+            print(f"  f_scatter:   {f_scatter:.6g} (additive floor)")
+
+    # One simulate_lightcurve call gives every geometry column we need.
+    try:
+        sim_df = simulate_lightcurve(
+            r=r, R=R, d1=d1, d2=d2, i0=i0,
+            gma0=sim_params.get('gma0', -90.0),
+            dth=dth,
+            d2h=sim_params.get('d2h', 6.0),
+            dz=sim_params.get('dz', 0.5),
+            flux_method="interpolate" if flux_csv_path else "legacy",
+            flux_csv_path=flux_csv_path,
+            lam=sim_params.get('lam', 0.589537),
+            wind_model=wind_model,
+            wind_params=wind_params,
+            scattered_flux=f_scatter,
+            verbose=False,
+        )
+    except Exception as e:
+        warnings.warn(f"Skipping geometry plots: simulate_lightcurve failed: {e}")
+        return None
+
+    written: Dict[str, str] = {}
+    band_label = band.upper()
+
+    orbit_path = os.path.join(output_dir, f"{suffix}_geometry_orbit.png")
+    try:
+        plot_orbit_geometry(sim_df, R=R, r=r, d1=d1, d2=d2, i0=i0,
+                            output_path=orbit_path, band=band_label,
+                            verbose=verbose)
+        written['orbit'] = orbit_path
+    except Exception as e:
+        warnings.warn(f"Orbit-geometry plot failed: {e}")
+
+    phase_path = os.path.join(output_dir, f"{suffix}_geometry_phase.png")
+    try:
+        plot_geometry_vs_phase(sim_df, R=R, r=r, band=band_label,
+                               flux_column=f"nfl_{band.lower()}",
+                               output_path=phase_path, verbose=verbose)
+        written['phase'] = phase_path
+    except Exception as e:
+        warnings.warn(f"Geometry-vs-phase plot failed: {e}")
+
+    # --- wind profile with a posterior band ---------------------------------
+    # Radii probed: the line of sight starting at the compact object has, by
+    # construction, an impact parameter relative to the companion centre equal
+    # to the sky-projected separation l3. So the profile inside min(l3) is never
+    # sampled, which is exactly the honest statement to put on the figure.
+    probed = None
+    if 'l3' in sim_df.columns:
+        l3 = sim_df['l3'].to_numpy(dtype=float)
+        if 'is_eclipsed' in sim_df.columns:
+            keep = ~sim_df['is_eclipsed'].to_numpy(dtype=bool)
+            l3 = l3[keep] if np.any(keep) else l3
+        l3 = l3[np.isfinite(l3)]
+        if l3.size:
+            probed = (float(np.min(l3)), float(np.max(l3)))
+
+    r_lo = max(1e-3, 0.5 * min(float(R), probed[0] if probed else float(R)))
+    r_hi = max(4.0 * float(R), (probed[1] * 3.0 if probed else 10.0 * float(R)))
+    if wind_params.get('Rb'):
+        r_hi = max(r_hi, 2.0 * float(wind_params['Rb']))
+    r_grid = np.logspace(np.log10(r_lo), np.log10(r_hi), 240)
+
+    g_rows: List[np.ndarray] = []
+    draws = np.atleast_2d(np.asarray(samples, dtype=float)) if samples is not None else None
+    if draws is not None and draws.size and draws.shape[1] == len(param_names):
+        n = min(int(n_profile_draws), draws.shape[0])
+        idx = (np.random.choice(draws.shape[0], size=n, replace=False)
+               if n < draws.shape[0] else np.arange(draws.shape[0]))
+        for k in idx:
+            th = draws[k]
+            try:
+                _, _, _, R_k, _ = _resolve_geom(
+                    th, reparam=reparam, active_names=param_names,
+                    param_spec=param_spec)
+                wp_k = _to_wind_params(th, param_names, wind_model, R_k,
+                                      fit_wind_shape=fit_wind_shape, frozen=frozen)
+                g_rows.append(np.asarray(
+                    evaluate_g_profile(r_grid, wind_model, wp_k), dtype=float))
+            except Exception:
+                continue
+    if not g_rows:
+        try:
+            g_rows.append(np.asarray(
+                evaluate_g_profile(r_grid, wind_model, wind_params), dtype=float))
+        except Exception as e:
+            warnings.warn(f"Wind-profile plot failed: {e}")
+            return written or None
+
+    shape_keys = WIND_SHAPE_FIT.get(wind_model, ())
+    summary = "\n".join(
+        f"{k:>7s} = {wind_params[k]:.4g}" + ("" if k in shape_keys and fit_wind_shape
+                                             else "  (fixed)")
+        for k in WIND_MODEL_PARAM_KEYS.get(wind_model, ())
+        if k in wind_params
+    )
+    profile_path = os.path.join(output_dir, f"{suffix}_wind_profile.png")
+    try:
+        plot_wind_profile(
+            r_grid, np.vstack(g_rows), R=R, probed_range=probed,
+            mark_radii={k: wind_params[k] for k in ('Rb', 'H', 'ell')
+                        if k in wind_params},
+            wind_model=WIND_MODELS.get(wind_model, wind_model),
+            band=band_label, shape_summary=summary or None,
+            output_path=profile_path, verbose=verbose)
+        written['wind_profile'] = profile_path
+    except Exception as e:
+        warnings.warn(f"Wind-profile plot failed: {e}")
+
+    return written or None
 
 
 def print_diagnostics(sampler, sampler_type: str = 'emcee',
@@ -2454,6 +2644,19 @@ def run_single_fit(
         )
         stats['reduced_chi2'] = red_chi2
 
+        if not getattr(args, 'no_geometry_plots', False):
+            plot_geometry_diagnostics(
+                stats, samples, band, wind_model, args.output_dir, suffix,
+                param_names=active_names,
+                reparam=reparam,
+                fit_wind_shape=fit_wind_shape,
+                param_spec=param_spec,
+                sim_params=sim_params,
+                dth=args.dth,
+                flux_csv_path=args.flux_csv,
+                verbose=not bool(getattr(args, 'quiet', False)),
+            )
+
     try:
         log_prob = sampler.get_log_prob(discard=args.n_burn, flat=True)
     except Exception:
@@ -2669,6 +2872,19 @@ def replot_from_existing(
             **_smooth_plot_kwargs(smoothed, args),
         )
         stats['reduced_chi2'] = red_chi2
+
+        if not getattr(args, 'no_geometry_plots', False):
+            plot_geometry_diagnostics(
+                stats, samples, band, wind_model, args.output_dir, suffix,
+                param_names=active_names,
+                reparam=(saved_mode == 'reparam'),
+                fit_wind_shape=saved_fit_wind_shape,
+                param_spec=spec_for_replot,
+                sim_params=sim_params,
+                dth=args.dth,
+                flux_csv_path=args.flux_csv,
+                verbose=not bool(getattr(args, 'quiet', False)),
+            )
 
     compute_bic_flag = bool(getattr(args, 'compute_bic', False))
     if HAS_ARVIZ or compute_bic_flag:
@@ -2978,6 +3194,14 @@ def main():
         type=str,
         default="mcmc_results",
         help="Directory to save output files"
+    )
+    parser.add_argument(
+        "--no-geometry-plots",
+        action="store_true",
+        help="Skip the binary-geometry figures (projected orbit / eclipse diagram, "
+             "geometry vs phase, and the wind profile with its posterior band). "
+             "They cost one extra simulate_lightcurve call (~60 ms) plus a cheap "
+             "analytic profile evaluation per draw."
     )
     parser.add_argument(
         "--no-plots",

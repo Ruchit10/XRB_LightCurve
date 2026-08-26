@@ -74,7 +74,9 @@ FITS light curves ──► utils/  ──►  data/…/*.txt      (time, counts
                              periodic model interpolation, fit_simulation
         utils/plot_utils.py  plot_lightcurve_fit  ← the one drawing routine
                              (+ plot_phase / plot_multi_column_fits /
-                              plot_corner / plot_trace / add_residual_panel)
+                              plot_corner / plot_trace / add_residual_panel /
+                              plot_orbit_geometry / plot_geometry_vs_phase /
+                              plot_wind_profile / plot_simulation_bands)
 ```
 
 Neither analysis script imports the other. Everything they share lives in
@@ -99,7 +101,10 @@ Neither analysis script imports the other. Everything they share lives in
   it arrays: `plot_best_fit` resolves the posterior point estimate and the
   per-sample phase shift; `plot_phase` interpolates a simulation CSV. Because
   both routes end in one function, the data, overlay, smoothed curve, residual
-  panel and title χ²/dof cannot drift apart.
+  panel and title χ²/dof cannot drift apart. It also holds the geometry figures
+  (`plot_orbit_geometry`, `plot_geometry_vs_phase`, `plot_wind_profile`) and the
+  per-band simulation grid (`plot_simulation_bands`), which `plot_results.py`
+  and `mcmc_lightcurve_fit.py` both drive.
 
 `chandra_phase_analysis.py` is now only the CLI (≈460 lines, down from ~1640)
 and re-exports every moved name, so `from chandra_phase_analysis import *` — the
@@ -586,6 +591,29 @@ All three live in `utils/plot_utils.py`.
 
 - `plot_corner` — posterior corner plot with 16/50/84 quantiles.
 - `plot_trace` — per-parameter walker traces with the burn-in marker.
+- `plot_geometry_diagnostics` — three geometry figures at the point estimate,
+  from one extra `simulate_lightcurve` call (skip with `--no-geometry-plots`):
+  - **`*_geometry_orbit.png`** — the projected orbit against the companion disk,
+    plus a to-scale top-down view. `(L3, h3)` from the simulation *are* the
+    sky-plane coordinates of the compact object relative to the companion
+    centre, so this is exact, not a sketch. The eclipse width constrains a
+    *combination* of `(a, R, i0)`, so this is where an implausible-but-well-
+    fitting parameter set becomes obvious; the footer states the numeric verdict
+    (`min projected separation` vs `R ± r` → total / partial / no eclipse).
+  - **`*_geometry_phase.png`** — projected separation `l3(φ)` against the
+    `R ± r` thresholds with the eclipse shaded, the sky-plane components
+    (`h > 0` ⇒ emitter behind, which is what gates the eclipse test),
+    `N_H(φ)` with its orbit mean (should equal `lam`), and the band flux. Turns
+    the eclipse from an emergent light-curve feature into a stated geometric
+    condition with visible margin.
+  - **`*_wind_profile.png`** — `g(r)` with 68/95% posterior credible bands, an
+    `r⁻²` reference, the companion surface, characteristic radii (`Rb`/`H`/`ell`)
+    and — the important part — the band of radii the line of sight actually
+    probes. That band is `[min l3, max l3]`: the LOS impact parameter relative
+    to the companion centre *equals* the projected separation, so the profile
+    inside `min l3` is unconstrained by the data. Shape parameters are only
+    interpretable jointly (`Rb` and `p` trade off strongly), so the constraint
+    reads far more clearly here than in a corner plot.
 - `plot_best_fit` (in `mcmc_lightcurve_fit.py`) — resolves the point estimate
   (MAP when available, else per-parameter medians), evaluates the model through
   `_evaluate_model` (the same entry point the likelihood uses, so geometry mode,
@@ -687,6 +715,7 @@ Per `(band, wind_model)` in `--output-dir`, prefixed `{band}_{wind_model}_`:
 | `*_chain.npz` | Full chain, log-prob, and run metadata (`mode`, frozen params, `likelihood`, `wind_model`, `n_obs`, …) for `--replot` / post-hoc BIC. |
 | `*_run_config.json` | The complete CLI configuration of the fit (`created`, `command`, every argparse value). Written before sampling starts, so it survives an interrupted run. `--replot` restores from it. |
 | `*_corner.png`, `*_trace.png`, `*_bestfit.png` | Diagnostic plots. |
+| `*_geometry_orbit.png`, `*_geometry_phase.png`, `*_wind_profile.png` | Binary-geometry figures at the point estimate (`--no-geometry-plots` to skip). |
 | `*_arviz_summary.csv` | ArviZ convergence table. |
 | `*_model_metrics.csv` | `bic`, `logL_hat`, `k_params`, `n_obs`, `theta_source`. |
 | `*_chi2.csv.gz` | Per-sample χ² (`--save-chi2`). |
@@ -806,7 +835,7 @@ Note `requirements.txt` predates the numba/arviz/zeus dependencies.
 | [compute_flux_vs_nH.py](compute_flux_vs_nH.py) | 934 | XSPEC `flux vs nH` table generator. |
 | [xspec_fit_mcmc.py](xspec_fit_mcmc.py) | 702 | XSPEC-side spectral MCMC. |
 | [chandra_analysis_combined_flux.py](chandra_analysis_combined_flux.py) | 539 | Fit pre-folded combined-flux files. |
-| [plot_results.py](plot_results.py) | 272 | Standalone plotting of simulation CSVs. |
+| [plot_results.py](plot_results.py) | 104 | Thin CLI over `utils/plot_utils.py` for simulation CSVs (`--geometric`, `--orbit`). |
 | [compute_count_to_flux_factor.py](compute_count_to_flux_factor.py) | 147 | Count-rate → flux factor. |
 | [example_usage.py](example_usage.py) | 96 | Programmatic `simulate_lightcurve` examples. |
 

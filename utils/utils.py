@@ -105,6 +105,31 @@ def band_label_from_column(column: str) -> str:
     return col
 
 
+# Energy-band display names and ranges (keV), for plot titles/legends.
+BAND_INFO: Dict[str, Tuple[str, str]] = {
+    "ultrasoft": ("Ultra-soft", "0.2-0.5 keV"),
+    "soft": ("Soft", "0.5-2 keV"),
+    "medium": ("Medium", "1.2-2.0 keV"),
+    "hard": ("Hard", "2.0-7.0 keV"),
+    "broad": ("Broad", "0.5-7.0 keV"),
+}
+
+
+def detect_energy_bands(df: pd.DataFrame) -> List[str]:
+    """Energy-band names present as ``nfl_{band}`` columns, in physical order."""
+    bands = {c[len("nfl_"):] for c in df.columns
+             if c.startswith("nfl_") and len(c) > len("nfl_")}
+    ordered = [b for b in BAND_INFO if b in bands]
+    return ordered + sorted(bands - set(ordered))
+
+
+def get_band_display_name(band: str) -> Tuple[str, str]:
+    """``(display_name, energy_range)`` for a band; range is '' if unknown."""
+    if band in BAND_INFO:
+        return BAND_INFO[band]
+    return (band.replace("_", " ").title(), "")
+
+
 def detect_flux_columns(df: pd.DataFrame) -> List[str]:
     """Detect available flux columns in simulation DataFrame.
 

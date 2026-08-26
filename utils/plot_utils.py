@@ -25,7 +25,7 @@ Dependencies: numpy, pandas, matplotlib; corner (optional, for corner plots).
 from __future__ import annotations
 
 import warnings
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -33,6 +33,8 @@ import matplotlib.pyplot as plt
 
 from utils.utils import (
     band_label_from_column,
+    detect_energy_bands,
+    get_band_display_name,
     model_from_wrap,
     obs_errors,
     prepare_model_interpolator,
@@ -595,3 +597,411 @@ def plot_trace(sampler, band: str, wind_model: str, output_path: str,
     plt.close()
 
     print(f"Trace plot saved to: {output_path}")
+
+
+# -----------------------------------------------------------------------------
+# Simulation / geometry plots
+# -----------------------------------------------------------------------------
+# These read the geometry columns that simulate_lightcurve already returns:
+#   l3, L3, h3   sky-plane position of the compact object relative to the
+#                companion centre. (L3, h3) are Cartesian components and
+#                l3 = sqrt(L3^2 + h3^2) is the projected separation -- exactly
+#                the quantity the eclipse test compares against R +/- r.
+#   fl           lam-normalized column density N_H (1e22 cm^-2)
+#   is_eclipsed  per-phase geometric eclipse flag
+# Two panels of the old plot_results.plot_geometric_parameters are deliberately
+# not reproduced: "Time vs Phase" is linear by construction, and A2 is the
+# polar-grid cell area, an artifact of the integration mesh rather than physics.
+
+def _shade_eclipse(ax: plt.Axes, phase: np.ndarray, eclipsed: np.ndarray,
+                   label: Optional[str] = "Geometric eclipse") -> bool:
+    """Shade the eclipsed phase interval(s). Returns True if anything was drawn."""
+    mask = np.asarray(eclipsed, dtype=bool)
+    if not np.any(mask):
+        return False
+    phase = np.asarray(phase, dtype=float)
+    order = np.argsort(phase)
+    p, m = phase[order], mask[order]
+    edges = np.flatnonzero(np.diff(m.astype(int)) != 0) + 1
+    for seg in np.split(np.arange(p.size), edges):
+        if seg.size and m[seg[0]]:
+            ax.axvspan(p[seg[0]], p[seg[-1]], color='0.85', zorder=0,
+                       label=label)
+            label = None  # legend entry only once
+    return True
+
+
+def plot_orbit_geometry(
+    sim_df: pd.DataFrame,
+    R: float,
+    r: float,
+    d1: float,
+    d2: float,
+    i0: float,
+    output_path: Optional[str] = None,
+    band: Optional[str] = None,
+    dpi: int = 150,
+    verbose: bool = True,
+) -> Optional[plt.Figure]:
+    """Sky-projected eclipse geometry and a top-down view of the orbit.
+
+    The most diagnostic geometry plot for a posterior: the eclipse width
+    constrains a combination of ``(a, R, i0)``, so very different parameter sets
+    can fit the same light curve. Seeing the projected track against the
+    companion disk makes that degeneracy concrete, and shows at a glance whether
+    the fitted parameters produce a *geometric* eclipse at all or whether the
+    dip is pure wind absorption.
+
+    Parameters
+    ----------
+    sim_df : DataFrame
+        Output of ``simulate_lightcurve`` at the parameters of interest; needs
+        ``phase``, ``L3``, ``h3`` and (optionally) ``is_eclipsed``.
+    R, r, d1, d2, i0 : float
+        Companion radius, compact-object/disk radius, the two distances from the
+        centre of mass (solar radii), and inclination (degrees).
+    """
+    for col in ("L3", "h3"):
+        if col not in sim_df.columns:
+            raise KeyError(f"sim_df must contain '{col}' (from simulate_lightcurve).")
+    L = sim_df["L3"].to_numpy(dtype=float)
+    h = sim_df["h3"].to_numpy(dtype=float)
+    phase = sim_df["phase"].to_numpy(dtype=float) if "phase" in sim_df.columns else None
+    eclipsed = (sim_df["is_eclipsed"].to_numpy(dtype=bool)
+                if "is_eclipsed" in sim_df.columns else np.zeros(L.size, dtype=bool))
+    a = float(d1) + float(d2)
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13, 6))
+
+    # --- panel 1: sky projection (what the observer sees) --------------------
+    ax.add_patch(plt.Circle((0, 0), float(R), color='darkorange', alpha=0.45,
+                            zorder=2, label=f'Companion (R = {float(R):.2f} R$_\\odot$)'))
+    ax.plot(L, h, '-', color='0.4', lw=1.2, zorder=3,
+            label='Compact-object track (projected)')
+    behind = h > 0  # emitter behind the companion: only these can be occulted
+    ax.plot(L[behind], h[behind], '.', color='C0', ms=3, zorder=4,
+            label='Behind companion')
+    if np.any(eclipsed):
+        ax.plot(L[eclipsed], h[eclipsed], 'o', color='crimson', ms=4, zorder=6,
+                label=f'Eclipsed ({100.0 * eclipsed.mean():.1f}% of orbit)')
+    else:
+        ax.plot([], [], ' ', label='No geometric eclipse')
+
+    # Mark phase 0 and the deepest-projection phase.
+    if phase is not None:
+        i_zero = int(np.argmin(np.abs(np.mod(phase, 1.0))))
+        ax.plot(L[i_zero], h[i_zero], '*', color='k', ms=13, zorder=7,
+                label='Phase 0')
+    l_proj = np.hypot(L, h)
+    i_min = int(np.argmin(np.where(h > 0, l_proj, np.inf)))
+    if np.isfinite(l_proj[i_min]):
+        ax.plot(L[i_min], h[i_min], 'v', color='crimson', ms=8, zorder=7,
+                label=f'Min projected sep. = {l_proj[i_min]:.2f} R$_\\odot$')
+
+    ax.axhline(0, color='0.8', lw=0.8, zorder=1)
+    ax.axvline(0, color='0.8', lw=0.8, zorder=1)
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.set_xlabel('Sky-plane offset $L$ (R$_\\odot$)', fontsize=11)
+    ax.set_ylabel('Sky-plane offset $h$ (R$_\\odot$)', fontsize=11)
+    ax.set_title('Projected geometry (observer view)', fontsize=12)
+    ax.legend(loc='best', fontsize=8)
+    ax.grid(alpha=0.25)
+
+    # --- panel 2: orbital plane, top-down ------------------------------------
+    th = np.linspace(0, 2 * np.pi, 361)
+    ax2.plot(a * np.cos(th), a * np.sin(th), '--', color='0.5', lw=1.0,
+             label=f'Relative orbit ($a$ = {a:.2f} R$_\\odot$)')
+    ax2.add_patch(plt.Circle((0, 0), float(R), color='darkorange', alpha=0.45,
+                             zorder=3, label='Companion'))
+    ax2.plot([0], [0], '+', color='k', ms=10, zorder=4)
+    ax2.plot([a], [0], 'o', color='C0', ms=7, zorder=4, label='Compact object')
+    # Line of sight enters the orbital plane at angle i0 from the normal; the
+    # observer sits in the +y direction of this projection.
+    span = 1.25 * a
+    ax2.annotate('', xy=(0, -0.95 * span), xytext=(0, -0.55 * span),
+                 arrowprops=dict(arrowstyle='-|>', color='C3', lw=1.8))
+    ax2.text(0.03 * span, -0.78 * span,
+             f'to observer\n$i_0$ = {float(i0):.2f}$^\\circ$',
+             color='C3', fontsize=9, va='center')
+    ax2.plot([0, a], [0, 0], ':', color='0.3', lw=1.0)
+    ax2.text(0.5 * a, 0.04 * span,
+             f'$d_1$={float(d1):.2f}, $d_2$={float(d2):.2f} R$_\\odot$',
+             fontsize=8, ha='center', color='0.3')
+    ax2.set_xlim(-span, span)
+    ax2.set_ylim(-span, span)
+    ax2.set_aspect('equal')
+    ax2.set_xlabel('Orbital plane $x$ (R$_\\odot$)', fontsize=11)
+    ax2.set_ylabel('Orbital plane $y$ (R$_\\odot$)', fontsize=11)
+    ax2.set_title('Orbit, to scale', fontsize=12)
+    ax2.legend(loc='upper right', fontsize=8)
+    ax2.grid(alpha=0.25)
+
+    # Eclipse condition, stated numerically so the figure is self-contained.
+    if np.isfinite(l_proj[i_min]):
+        verdict = ('total eclipse' if l_proj[i_min] <= float(R) - float(r)
+                   else 'partial eclipse' if l_proj[i_min] <= float(R) + float(r)
+                   else 'no eclipse')
+        fig.text(0.5, 0.005,
+                 f'min projected separation {l_proj[i_min]:.3f} vs '
+                 f'R - r = {float(R) - float(r):.3f} and '
+                 f'R + r = {float(R) + float(r):.3f} R$_\\odot$  ->  {verdict}',
+                 ha='center', fontsize=9, color='0.25')
+
+    if band:
+        fig.suptitle(f'{band} band - binary geometry', fontsize=13)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        if verbose:
+            print(f"Geometry plot saved to: {output_path}")
+        plt.close(fig)
+        return None
+    return fig
+
+
+def plot_geometry_vs_phase(
+    sim_df: pd.DataFrame,
+    R: float,
+    r: float,
+    band: Optional[str] = None,
+    flux_column: Optional[str] = None,
+    output_path: Optional[str] = None,
+    dpi: int = 150,
+    verbose: bool = True,
+) -> Optional[plt.Figure]:
+    """Projected separation, sky-plane components, N_H and band flux vs phase.
+
+    Panel 1 is the diagnostic one: ``l3(phase)`` against the ``R - r`` / ``R + r``
+    thresholds shows directly which phases are geometrically occulted and how
+    much margin the fit has, rather than leaving the eclipse width as an
+    emergent property of the light curve.
+    """
+    need = ("phase", "l3", "L3", "h3")
+    for col in need:
+        if col not in sim_df.columns:
+            raise KeyError(f"sim_df must contain '{col}' (from simulate_lightcurve).")
+    phase = sim_df["phase"].to_numpy(dtype=float)
+    order = np.argsort(phase)
+    phase = phase[order]
+    l3 = sim_df["l3"].to_numpy(dtype=float)[order]
+    L3 = sim_df["L3"].to_numpy(dtype=float)[order]
+    h3 = sim_df["h3"].to_numpy(dtype=float)[order]
+    eclipsed = (sim_df["is_eclipsed"].to_numpy(dtype=bool)[order]
+                if "is_eclipsed" in sim_df.columns else np.zeros(phase.size, bool))
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    ax_sep, ax_comp, ax_nh, ax_flux = axes.flatten()
+
+    # 1. projected separation vs the eclipse thresholds
+    _shade_eclipse(ax_sep, phase, eclipsed)
+    ax_sep.plot(phase, l3, '-', color='C0', lw=2, label='$l$ (projected sep.)')
+    ax_sep.axhline(float(R) + float(r), color='C3', ls='--', lw=1.2,
+                   label=f'$R+r$ = {float(R) + float(r):.2f}')
+    ax_sep.axhline(max(float(R) - float(r), 0.0), color='C3', ls=':', lw=1.2,
+                   label=f'$R-r$ = {float(R) - float(r):.2f}')
+    ax_sep.set_ylabel('Distance (R$_\\odot$)')
+    ax_sep.set_title('Projected separation vs eclipse thresholds', fontsize=11)
+    ax_sep.legend(fontsize=8, loc='best')
+    ax_sep.grid(alpha=0.3)
+
+    # 2. sky-plane components
+    _shade_eclipse(ax_comp, phase, eclipsed, label=None)
+    ax_comp.plot(phase, L3, '-', color='C0', lw=1.8, label='$L$ (in-plane)')
+    ax_comp.plot(phase, h3, '--', color='C2', lw=1.8, label='$h$ (out-of-plane)')
+    ax_comp.axhline(0, color='0.7', lw=0.8)
+    ax_comp.set_ylabel('Offset (R$_\\odot$)')
+    ax_comp.set_title('Sky-plane components ($h>0$: emitter behind)', fontsize=11)
+    ax_comp.legend(fontsize=8, loc='best')
+    ax_comp.grid(alpha=0.3)
+
+    # 3. column density
+    if 'fl' in sim_df.columns:
+        fl = sim_df['fl'].to_numpy(dtype=float)[order]
+        _shade_eclipse(ax_nh, phase, eclipsed, label=None)
+        ax_nh.plot(phase, fl, '-', color='C4', lw=2)
+        ax_nh.axhline(float(np.nanmean(fl)), color='0.4', ls='--', lw=1.0,
+                      label=f'orbit mean = {np.nanmean(fl):.4g} (= $\\lambda$)')
+        ax_nh.set_ylabel('$N_H$ ($10^{22}$ cm$^{-2}$)')
+        ax_nh.set_title('Wind column density along the line of sight', fontsize=11)
+        ax_nh.legend(fontsize=8, loc='best')
+    else:
+        ax_nh.text(0.5, 0.5, "no 'fl' column", ha='center', transform=ax_nh.transAxes)
+    ax_nh.set_xlabel('Orbital phase')
+    ax_nh.grid(alpha=0.3)
+
+    # 4. resulting band flux
+    if flux_column is None and band:
+        flux_column = f"nfl_{band.lower()}"
+    if flux_column and flux_column in sim_df.columns:
+        _shade_eclipse(ax_flux, phase, eclipsed, label=None)
+        ax_flux.plot(phase, sim_df[flux_column].to_numpy(dtype=float)[order],
+                     '-', color='C3', lw=2)
+        ax_flux.set_ylabel('Flux (erg/cm$^2$/s)')
+        ax_flux.set_title(f'Model band flux ({flux_column})', fontsize=11)
+    else:
+        ax_flux.text(0.5, 0.5, 'no band flux column', ha='center',
+                     transform=ax_flux.transAxes)
+    ax_flux.set_xlabel('Orbital phase')
+    ax_flux.grid(alpha=0.3)
+
+    if band:
+        fig.suptitle(f'{band} band - geometry and absorption vs phase', fontsize=13)
+    fig.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        if verbose:
+            print(f"Geometry-vs-phase plot saved to: {output_path}")
+        plt.close(fig)
+        return None
+    return fig
+
+
+def plot_wind_profile(
+    radii: np.ndarray,
+    g_samples: np.ndarray,
+    R: Optional[float] = None,
+    probed_range: Optional[tuple[float, float]] = None,
+    mark_radii: Optional[Dict[str, float]] = None,
+    wind_model: str = "",
+    band: Optional[str] = None,
+    shape_summary: Optional[str] = None,
+    output_path: Optional[str] = None,
+    dpi: int = 150,
+    verbose: bool = True,
+) -> Optional[plt.Figure]:
+    """Dimensionless wind density profile g(r) with a posterior credible band.
+
+    The wind-shape parameters are what the fit is ultimately constraining, but
+    they are only interpretable jointly (``Rb`` and ``p`` trade off strongly).
+    Propagating the posterior into g(r) shows the constraint on the quantity
+    that actually enters the model, and marking the radii the line of sight
+    truly probes shows which part of the profile the data can speak to at all.
+
+    Parameters
+    ----------
+    radii : array, shape (n_r,)
+        Radii (solar radii) at which the profile was evaluated.
+    g_samples : array, shape (n_samples, n_r)
+        g(r) for each posterior draw. A single row is fine (fixed shape).
+    R : float, optional
+        Companion radius, drawn as the stellar surface.
+    probed_range : (float, float), optional
+        Min/max radius actually sampled along the line of sight.
+    mark_radii : dict, optional
+        ``{label: radius}`` characteristic radii to mark (e.g. the break radius
+        ``Rb``), so a feature of the profile can be read against the radii the
+        data constrain.
+    """
+    radii = np.asarray(radii, dtype=float)
+    g = np.atleast_2d(np.asarray(g_samples, dtype=float))
+    finite = np.all(np.isfinite(g), axis=1)
+    g = g[finite] if np.any(finite) else g
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    med = np.nanmedian(g, axis=0)
+    if g.shape[0] >= 20:
+        lo95, lo68, hi68, hi95 = np.nanpercentile(g, [2.5, 16, 84, 97.5], axis=0)
+        ax.fill_between(radii, lo95, hi95, color='C0', alpha=0.15, label='95% credible')
+        ax.fill_between(radii, lo68, hi68, color='C0', alpha=0.30, label='68% credible')
+        ax.plot(radii, med, '-', color='C0', lw=2,
+                label=f'posterior median ({g.shape[0]} draws)')
+    else:
+        ax.plot(radii, med, '-', color='C0', lw=2, label='g(r)')
+
+    # r^-2 reference: every profile is asymptotically a free-streaming wind.
+    ref_at = radii[-1]
+    ref_val = med[-1] if np.isfinite(med[-1]) else np.nanmedian(med)
+    if np.isfinite(ref_val) and ref_val > 0:
+        ax.plot(radii, ref_val * (radii / ref_at) ** -2.0, ':', color='0.5', lw=1.4,
+                label=r'$r^{-2}$ (free-streaming)')
+
+    if R is not None and np.isfinite(R):
+        ax.axvline(float(R), color='darkorange', ls='--', lw=1.5,
+                   label=f'companion surface $R$ = {float(R):.2f} R$_\\odot$')
+    if probed_range is not None:
+        lo, hi = float(probed_range[0]), float(probed_range[1])
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            ax.axvspan(lo, hi, color='C2', alpha=0.10, zorder=0,
+                       label=f'radii probed by the LOS ({lo:.1f}-{hi:.1f} R$_\\odot$)')
+    for label, rad in (mark_radii or {}).items():
+        if rad is not None and np.isfinite(rad) and rad > 0:
+            ax.axvline(float(rad), color='C4', ls='-.', lw=1.3,
+                       label=f'{label} = {float(rad):.2f} R$_\\odot$')
+
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('Radius from companion centre $r$ (R$_\\odot$)', fontsize=11)
+    ax.set_ylabel('Dimensionless wind density $g(r)$', fontsize=11)
+    title = 'Wind density profile'
+    if wind_model:
+        title += f' - {wind_model}'
+    if band:
+        title = f'{band} band - ' + title
+    ax.set_title(title, fontsize=12)
+    if shape_summary:
+        ax.text(0.02, 0.02, shape_summary, transform=ax.transAxes, fontsize=8,
+                va='bottom', ha='left', family='monospace',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(alpha=0.3, which='both')
+
+    fig.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        if verbose:
+            print(f"Wind-profile plot saved to: {output_path}")
+        plt.close(fig)
+        return None
+    return fig
+
+
+def plot_simulation_bands(
+    sim_df: pd.DataFrame,
+    output_path: Optional[str] = None,
+    title: str = "XRB Lightcurve Simulation Results",
+    dpi: int = 300,
+) -> None:
+    """Grid of per-band model light curves from a simulation DataFrame.
+
+    One panel for the raw wind LOS integral and the lam-scaled column density
+    (when present), then one per detected ``nfl_{band}`` column.
+    """
+    bands = detect_energy_bands(sim_df)
+    has_base = "flx" in sim_df.columns and "fl" in sim_df.columns
+    panels: List[tuple] = []
+    if has_base:
+        panels.append(("flx", "Flux", "Wind LOS integral", "b-"))
+        panels.append(("fl", "Scaled $N_H$", "Scaled nH", "g-"))
+    for b in bands:
+        name, erange = get_band_display_name(b)
+        panels.append((f"nfl_{b}", f"{name} Band Flux",
+                       name + (f" ({erange})" if erange else ""), "b-"))
+    if not panels:
+        print("No plottable columns found in simulation DataFrame.")
+        return
+
+    x = sim_df["deg"] if "deg" in sim_df.columns else sim_df["phase"]
+    xlabel = "Phase (degrees)" if "deg" in sim_df.columns else "Orbital phase"
+    n_cols = min(2, len(panels))
+    n_rows = int(np.ceil(len(panels) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows),
+                            squeeze=False)
+    axes = axes.flatten()
+    for ax, (col, ylabel, label, style) in zip(axes, panels):
+        ax.plot(x, sim_df[col], style, lw=2, label=label)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(label)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    for ax in axes[len(panels):]:
+        ax.axis('off')
+    fig.suptitle(title, fontsize=16, fontweight="bold")
+    fig.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+        print(f"Plots saved to {output_path}")
+        plt.close(fig)
+    else:
+        plt.show()

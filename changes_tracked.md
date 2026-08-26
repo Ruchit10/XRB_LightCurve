@@ -33,9 +33,10 @@ fitting, and inference stack since the original R port.
 24. [Phase 23 — `utils/` Extraction and a Single Plotting Routine](#phase-23--utils-extraction-and-a-single-plotting-routine)
 25. [Phase 24 — Run-Config Persistence and a Replot-Mode Fix](#phase-24--run-config-persistence-and-a-replot-mode-fix)
 26. [Phase 25 — MCMC Script Slimming](#phase-25--mcmc-script-slimming)
-27. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
-28. [Current File Inventory](#current-file-inventory)
-29. [Current Status & Quick Commands](#current-status--quick-commands)
+27. [Phase 26 — Binary-Geometry Diagnostic Plots](#phase-26--binary-geometry-diagnostic-plots)
+28. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
+29. [Current File Inventory](#current-file-inventory)
+30. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -1208,6 +1209,95 @@ it prevents (`f_scatter` collapsing and aborting emcee on the condition number).
 
 ---
 
+## Phase 26 — Binary-Geometry Diagnostic Plots
+
+`mcmc_lightcurve_fit.py`, `utils/plot_utils.py`, `utils/utils.py`,
+`plot_results.py`. **Status: uncommitted** on branch `add_generic_wind`.
+
+`plot_results.py` had a `--geometric` mode that plotted `l3`/`L3`/`h3`, `A2`,
+`icd` and time against phase, but only for a simulation CSV and with no
+reference to the parameters that produce them — and nothing equivalent existed
+on the MCMC side, where a posterior can fit the light curve perfectly with a
+geometrically absurd configuration. Its plotting moved into `utils/plot_utils.py`
+(leaving a 104-line CLI) and three geometry figures are now produced per fit.
+
+### The key realization
+
+`simulate_lightcurve` already returns everything needed, and `(L3, h3)` are
+*exactly* the sky-plane Cartesian coordinates of the compact object relative to
+the companion centre, with `l3 = sqrt(L3² + h3²)` the projected separation the
+eclipse test compares against `R ± r`. So the projected-orbit diagram is exact
+rather than a schematic, and one further consequence follows: the line of sight
+from the compact object has impact parameter `l3` relative to the companion
+centre, so `[min l3, max l3]` is precisely the range of radii the data probe.
+
+### Three plots, chosen for what they answer
+
+1. **`*_geometry_orbit.png`** — projected orbit over the companion disk, plus a
+   to-scale top-down view with `d1`/`d2` and the observer direction. The eclipse
+   width constrains a *combination* of `(a, R, i0)`, so this is where a
+   well-fitting but implausible parameter set shows up. A footer states the
+   verdict numerically: min projected separation vs `R - r` and `R + r` ->
+   total / partial / no eclipse.
+2. **`*_geometry_phase.png`** — 4 panels: `l3(φ)` against the `R ± r` thresholds
+   with the eclipsed interval shaded; the sky-plane components (`h > 0` means
+   the emitter is behind, which is what gates the eclipse test, and explains why
+   the equally-close conjunction at φ≈0 is *not* eclipsed); `N_H(φ)` with its
+   orbit mean annotated (a direct check that it equals `lam`); and the resulting
+   band flux.
+3. **`*_wind_profile.png`** — `g(r)` with 68/95% posterior credible bands from
+   up to 300 draws, an `r⁻²` reference, the companion surface, the
+   characteristic radii (`Rb`/`H`/`ell`), and the probed-radius band. The shape
+   parameters are only interpretable jointly, so this shows the constraint on
+   the quantity that actually enters the model.
+
+Two panels of the old `plot_geometric_parameters` were deliberately dropped:
+"Time vs Phase" is linear by construction, and `A2` is the polar-grid cell area
+— an artifact of the integration mesh, not physics.
+
+### Wiring
+
+- `plot_geometry_diagnostics()` resolves the point estimate, calls
+  `simulate_lightcurve` **once**, and drives all three plots. Called from both
+  `run_single_fit` and `replot_from_existing`; `--no-geometry-plots` skips it.
+- It passes `scattered_flux=f_scatter` into the simulation, so the flux panel
+  shows the curve that was actually fitted rather than one missing the additive
+  floor. Verified: the eclipse floor reads 1.70251e-13, matching `plot_best_fit`
+  exactly; without it the panel bottomed at 0.
+- The MAP-vs-median point-estimate logic was extracted from `plot_best_fit` into
+  `_point_estimate_theta()`, now shared by both.
+- `BAND_INFO`, `detect_energy_bands`, `get_band_display_name` moved to
+  `utils/utils.py` next to `detect_flux_columns`.
+
+### What it immediately showed on the real broad fit
+
+At χ²/dof = 1.064 the MAP geometry is `a = 17.62`, `R = 14.70 R☉`, `i0 = 14.50°`:
+
+- **`R/a = 0.83`** — the companion nearly fills its own orbit. Worth a look
+  against the Roche lobe, which for `d1/d2 = 1.57` sits far inside `R`.
+- The eclipse is **total across 29.2% of the orbit** (min projected separation
+  4.41 vs `R - r` = 14.61), and the flat-bottomed minimum in the data is fitted
+  as that total eclipse plus the `f_scatter` floor — self-consistent, and now
+  visible as such.
+- **`Rb = 27.09 R☉` lies entirely outside the probed range (4.4–17.6 R☉)**, so
+  the break radius is unconstrained by these data; only the inner slope `p` is
+  doing work over the sampled radii. That is a degeneracy the corner plot does
+  not make obvious.
+
+### Verification (conda env `henv`)
+
+- `--replot --output-dir mcmc_results` still reports χ²/dof **1.06423** and BIC
+  **195.673**, now writing three extra figures.
+- Eclipsing (broad kepler, 29.2% eclipsed) and non-eclipsing (short soft fit,
+  min projected separation 9.21 vs `R + r` = 2.69) posteriors both render
+  correctly, the latter labelled "No geometric eclipse".
+- `--no-geometry-plots` suppresses all three.
+- `plot_results.py` exercised in all three modes (`--geometric`, `--orbit`,
+  default band grid), including the argument-validation path
+  (`--orbit requires --R, --d1, --d2, --i0`).
+
+---
+
 ## Side Investigation — Reference Epoch Recalibration
 
 Plan: `reference_epoch_recalibration_ae1cf98a.plan.md`.
@@ -1246,7 +1336,7 @@ study script itself is **not present** in the working tree.
 | `compute_flux_vs_nH.py`       |  934  | active | XSPEC table generator (flux vs nH).                    |
 | `xspec_fit_mcmc.py`           |  702  | active | XSPEC-side MCMC for spectral fits.                     |
 | `chandra_analysis_combined_flux.py` | 539 | active | Pre-folded combined-flux phase analysis.           |
-| `plot_results.py`             |  272  | active | Standalone plotting of simulation CSVs.                |
+| `plot_results.py`             |  104  | active | Thin CLI over `utils/plot_utils.py` (`--geometric`, `--orbit`). |
 | `compute_count_to_flux_factor.py` | 147 | active | Count-rate → flux conversion factor.               |
 | `example_usage.py`            |   96  | active | Programmatic `simulate_lightcurve` examples.           |
 
