@@ -17,7 +17,7 @@ $ python plot_results.py sim.csv --geometric --R 2.0 --r 0.001 --output geom.png
 
 # Projected orbit / eclipse diagram (needs the geometry parameters)
 $ python plot_results.py sim.csv --orbit --R 2.0 --r 0.001 \
-    --d1 11.0 --d2 8.0 --i0 26.0 --output orbit.png
+    --d1 11.0 --d2 8.0 --i0 64.0 --output orbit.png
 """
 from __future__ import annotations
 
@@ -69,7 +69,8 @@ def main() -> None:
     parser.add_argument("--d2", type=float, default=None,
                         help="Companion distance from the centre of mass (--orbit)")
     parser.add_argument("--i0", type=float, default=None,
-                        help="Orbital inclination in degrees (--orbit)")
+                        help="Orbital inclination in degrees from the orbital-plane "
+                             "normal, 90 = edge-on (--orbit)")
     parser.add_argument("--band", type=str, default=None,
                         help="Energy band label for titles and the flux panel")
 

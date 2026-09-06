@@ -17,7 +17,7 @@ import math
 import os
 import sys
 import warnings
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Callable
 from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
 
@@ -43,14 +43,28 @@ except ImportError:
 # =============================================================================
 #
 # Each wind model defines a dimensionless density profile g(r) with r in solar
-# radii. The absolute scale of g is arbitrary — the simulation normalizes the
-# wind LOS integral so that mean(fl) = lam (the target mean nH from a fit).
+# radii. The absolute scale of g is arbitrary — the simulation either normalizes
+# the wind LOS integral so that mean(fl) = lam (wind_norm="lam", the historical
+# behavior), or fixes it from Mdot/v_inf (wind_norm="physical").
 #
 # Supported models (Wind_Density.pdf):
 #   0 broken_pl   — piecewise power law; params (Rb, p)
 #   1 smooth_pl   — smoothly broken power law; params (Rb, p, Delta)
 #   2 beta_law    — velocity-based (exponential + CAK beta-law); params (R_star, beta, H)
 #   3 confinement — inner confinement / compression; params (R_star, fconf, ell)
+
+# Physical constants. Defined here rather than beside the column-density
+# helpers below because they are used as default argument values.
+R_SUN_CM = 6.957e10  # 1 solar radius in cm
+M_H_G = 1.6726e-24  # hydrogen atom mass in g
+M_SUN_G = 1.989e33  # solar mass in g
+KM_TO_CM = 1.0e5  # 1 km in cm
+YEAR_S = 3.1558e7  # 1 Julian year in s
+
+# Mean mass per hydrogen-equivalent nucleus. TBabs columns are quoted as
+# equivalent hydrogen columns at solar abundance, so this converts a wind mass
+# column into the N_H that the flux_vs_nH table expects.
+MU_WIND_DEFAULT = 1.4
 
 WIND_MODEL_IDS: Dict[str, int] = {
     "broken_pl": 0,
@@ -331,6 +345,16 @@ def _simulate_phases_numba(
 
     n_th = int(360.0 / d2h_deg) + 1
     n_r_ring = 10
+
+    # Per-cell LOS columns and areas. The nH -> flux conversion is nonlinear,
+    # so <F(N)> != F(<N>): when the column varies steeply across the emitter
+    # disk (near the occulter limb, or anywhere in physical-normalization mode)
+    # the flux must be converted per cell and only then area-averaged. Callers
+    # that only need the mean column can ignore these.
+    n_cells_max = n_th * n_r_ring
+    cell_col_out = np.zeros((n_phases, n_cells_max))
+    cell_area_out = np.zeros((n_phases, n_cells_max))
+    cell_count_out = np.zeros(n_phases, dtype=np.int64)
     d2h_rad = d2h_deg * math.pi / 180.0
     th_step_rad = 2.0 * math.pi / (n_th - 1)
     th_vals = np.empty(n_th, dtype=np.float64)
@@ -427,6 +451,11 @@ def _simulate_phases_numba(
                     sum_lw += los_val * A_seg
                     sum_A += A_seg
 
+                    k_cell = cell_count_out[ip]
+                    cell_col_out[ip, k_cell] = los_val
+                    cell_area_out[ip, k_cell] = A_seg
+                    cell_count_out[ip] = k_cell + 1
+
                 prev_r = r_val
                 prev_th = th_val
                 prev_is_set = True
@@ -436,7 +465,10 @@ def _simulate_phases_numba(
         icd_out[ip] = sum_lw
         A2_out[ip] = sum_A
 
-    return flx_out, icd_out, A2_out, l_out, L_out, h_out, eclipse_out
+    return (
+        flx_out, icd_out, A2_out, l_out, L_out, h_out, eclipse_out,
+        cell_col_out, cell_area_out, cell_count_out,
+    )
 
 
 @njit(cache=True, parallel=True)
@@ -1144,13 +1176,30 @@ def default_wind_params(wind_model: str, R: float) -> Dict[str, float]:
     raise ValueError(f"Unknown wind_model '{wind_model}'")
 
 
+def inclination_to_internal_rad(i0_deg: float) -> float:
+    """Convert a conventional inclination into the kernels' internal angle.
+
+    ``i0`` at the public API is the standard astronomical inclination: the angle
+    between the orbital-plane normal and the line of sight, so ``i0 = 90 deg``
+    is edge-on (eclipses possible) and ``i0 = 0 deg`` is face-on (the orbit lies
+    in the plane of the sky and never eclipses).
+
+    The geometry kernels (``_simulate_phases_numba``, ``wind_los_integral``)
+    instead measure ``incl`` from the *line of sight*, so that
+    ``h = a sin(gma) sin(incl)`` is the sky-plane offset and
+    ``z = a sin(gma) cos(incl)`` the offset along the line of sight. The two
+    differ by the 90 deg complement applied here; nothing downstream changes.
+    """
+    return (90.0 - float(i0_deg)) * np.pi / 180.0
+
+
 def simulate_lightcurve(
     r: float = 0.001,
     R: float = 2.0,
     d1: float = 11.0,
     d2: float = 8.0,
     gma0: float = -90.0,
-    i0: float = 26.0,
+    i0: float = 64.0,
     dth: float = 1.0,
     d2h: float = 6.0,
     dz: float = 0.5,
@@ -1165,6 +1214,11 @@ def simulate_lightcurve(
     wind_model: str = "smooth_pl",
     wind_params: Optional[Dict[str, float]] = None,
     scattered_flux: float = 0.0,
+    wind_norm: str = "lam",
+    mdot: float = 4.0e-6,
+    v_inf: float = 1750.0,
+    mu_wind: float = MU_WIND_DEFAULT,
+    f_opacity: float = 1.0,
 ) -> pd.DataFrame:
     """
     Main simulation function for lightcurve calculation.
@@ -1175,7 +1229,10 @@ def simulate_lightcurve(
         d1: Distance of star B from COM in solar radii
         d2: Distance of star A from COM in solar radii
         gma0: Starting phase angle in degrees
-        i0: Orbital inclination in degrees
+        i0: Orbital inclination in degrees, standard astronomical convention:
+            measured from the orbital-plane normal, so 90 deg is edge-on and
+            0 deg is face-on. Converted internally by
+            inclination_to_internal_rad(); the geometry itself is unchanged.
         dth: Orbital increment in degrees
         d2h: Angular cell size (degrees) for the polar grid used in the surface integral
         dz: Step size along the line of sight (solar radii)
@@ -1215,7 +1272,9 @@ def simulate_lightcurve(
     """
     # Convert angles to radians
     gma = gma0 * np.pi / 180
-    i = i0 * np.pi / 180
+    # Only the input convention changes here: `i` is the internal angle from the
+    # line of sight that every geometry expression below already assumes.
+    i = inclination_to_internal_rad(i0)
     d = d1 + d2
 
     # Wind profile parameter packing (done once per call)
@@ -1253,8 +1312,13 @@ def simulate_lightcurve(
         and (Rmax_use is None or converge_rmax_use)
     )
 
+    cell_col_arr = None
+    cell_area_arr = None
+    cell_count_arr = None
+
     if use_mega_kernel:
-        flx_arr, icd_arr, A2_arr, l_arr, L_arr, h_arr, eclipsed_arr = (
+        (flx_arr, icd_arr, A2_arr, l_arr, L_arr, h_arr, eclipsed_arr,
+         cell_col_arr, cell_area_arr, cell_count_arr) = (
             _simulate_phases_numba(
                 gma_values.astype(np.float64),
                 float(r),
@@ -1426,18 +1490,47 @@ def simulate_lightcurve(
         }
     )
 
-    # Scale raw wind integrals so that mean(fl) = lam (target mean nH)
-    mean_flx = float(np.mean(flx))
-    lam_scale = lam / mean_flx if mean_flx > 0 else 1.0
-    fl = np.array(flx) * lam_scale
+    # ------------------------------------------------------------------
+    # Column-density normalization.
+    #
+    # "lam"      (default, backward compatible): rescale so mean(fl) = lam.
+    #            The absolute column is discarded, so the model depends only
+    #            on ratios (R/a, r/a, Rb/a) and the overall scale of the
+    #            system is unconstrained.
+    # "physical": set n_0 from Mdot / v_inf, so fl carries real units. This
+    #            breaks that scale degeneracy and lets the eclipse emerge
+    #            from wind opacity instead of from the geometric cutoff.
+    # ------------------------------------------------------------------
+    if wind_norm not in ("lam", "physical"):
+        raise ValueError(
+            f"Invalid wind_norm: {wind_norm!r}. Must be 'lam' or 'physical'."
+        )
+
+    if wind_norm == "lam":
+        mean_flx = float(np.mean(flx))
+        col_scale = lam / mean_flx if mean_flx > 0 else 1.0
+    else:
+        n0 = wind_density_norm_from_mdot(
+            mdot, v_inf, wind_model, wind_params, mu=mu_wind
+        )
+        # fl is in units of 1e22 cm^-2; flx is the LOS integral of g in R_sun.
+        # f_opacity is an effective-opacity factor absorbing wind ionization,
+        # clumping and abundance departures from the solar-abundance TBabs
+        # table (a hyper-ionized wind has far less photoelectric opacity than
+        # its mass column implies).
+        col_scale = float(f_opacity) * n0 * R_SUN_CM / 1.0e22
+
+    fl = np.array(flx) * col_scale
     results["fl"] = fl
 
-    # Calculate scaled fluxes based on method
+    # Build one nH -> flux mapping per band, then apply it either to the
+    # per-phase mean column (lam mode) or per emitter cell (physical mode).
+    band_maps: Dict[str, Callable[[np.ndarray], np.ndarray]] = {}
     if flux_method == "legacy":
         # Legacy hardcoded exponential coefficients (single wind model only)
-        results["nfl_hard"] = 9.524 * np.exp(-fl * 0.057)
-        results["nfl_soft"] = 9.3923 * np.exp(-fl * 2.5062)
-        
+        band_maps["hard"] = lambda n: 9.524 * np.exp(-n * 0.057)
+        band_maps["soft"] = lambda n: 9.3923 * np.exp(-n * 2.5062)
+
     elif flux_method == "interpolate":
         # Interpolate from CSV data
         if flux_csv_path is None:
@@ -1447,14 +1540,12 @@ def simulate_lightcurve(
         if verbose:
             print(f"Detected energy bands in CSV: {', '.join(available_bands)}")
         for band in available_bands:
-            try:
-                results[f"nfl_{band}"] = _interpolate_flux_from_context(
-                    fl, ctx, band,
-                    warn_extrapolation=verbose,
+            band_maps[band] = (
+                lambda n, _b=band: _interpolate_flux_from_context(
+                    n, ctx, _b, warn_extrapolation=False,
                 )
-            except Exception as e:
-                warnings.warn(f"Failed to interpolate flux for band '{band}': {e}")
-        
+            )
+
     elif flux_method == "refit":
         # Fit new exponentials to CSV data
         if flux_csv_path is None:
@@ -1468,21 +1559,54 @@ def simulate_lightcurve(
         # constructing the same validated DataFrame once.
         df_flux, _ = load_flux_vs_nh_csv(flux_csv_path, verbose=False)
         for band in available_bands:
-            try:
-                if band in exp_fit_cache:
-                    A, B = exp_fit_cache[band]
-                else:
-                    A, B = fit_exponential_to_csv(df_flux, band, flux_type=flux_type)
-                    exp_fit_cache[band] = (A, B)
-                results[f"nfl_{band}"] = A * np.exp(-B * fl)
-            except Exception as e:
-                warnings.warn(f"Failed to fit exponential for band '{band}': {e}")
-        
+            if band in exp_fit_cache:
+                A, B = exp_fit_cache[band]
+            else:
+                A, B = fit_exponential_to_csv(df_flux, band, flux_type=flux_type)
+                exp_fit_cache[band] = (A, B)
+            band_maps[band] = lambda n, _A=A, _B=B: _A * np.exp(-_B * n)
+
     else:
         raise ValueError(
             f"Invalid flux_method: {flux_method}. "
             "Must be 'legacy', 'interpolate', or 'refit'"
         )
+
+    use_per_cell = wind_norm == "physical"
+    if use_per_cell and cell_col_arr is None:
+        warnings.warn(
+            "wind_norm='physical' needs the numba mega-kernel for per-cell "
+            "columns; falling back to converting the mean column, which "
+            "understates the eclipse-core leakage. Install numba or leave "
+            "Rmax/converge_rmax at their defaults."
+        )
+        use_per_cell = False
+
+    if use_per_cell:
+        cell_nh = np.asarray(cell_col_arr, dtype=float) * col_scale
+        cell_A = np.asarray(cell_area_arr, dtype=float)
+        counts = np.asarray(cell_count_arr, dtype=np.int64)
+        valid = np.arange(cell_A.shape[1])[None, :] < counts[:, None]
+        cell_A = np.where(valid, cell_A, 0.0)
+        area_tot = cell_A.sum(axis=1)
+
+    for band, fmap in band_maps.items():
+        try:
+            if use_per_cell:
+                # <F(N)> over the emitter disk, NOT F(<N>): during ingress and
+                # in the eclipse core the column varies by orders of magnitude
+                # across the disk, and the surviving flux is dominated by the
+                # least-absorbed cells.
+                per_cell = fmap(cell_nh.reshape(-1)).reshape(cell_nh.shape)
+                num = np.einsum("ij,ij->i", np.nan_to_num(per_cell), cell_A)
+                results[f"nfl_{band}"] = np.divide(
+                    num, area_tot,
+                    out=np.zeros_like(num), where=area_tot > 0,
+                )
+            else:
+                results[f"nfl_{band}"] = fmap(fl)
+        except Exception as e:
+            warnings.warn(f"Failed to compute flux for band '{band}': {e}")
 
     # Set all scaled flux columns to 0 when eclipsed.
     # During eclipse the emitter is physically blocked - flux should be zero,
@@ -1527,10 +1651,51 @@ def simulate_lightcurve(
 # compute_surface_density returns n(R_star) directly so callers need not know
 # about g's internal normalization.
 
-R_SUN_CM = 6.957e10  # 1 solar radius in cm
-M_H_G = 1.6726e-24  # hydrogen atom mass in g
-M_SUN_G = 1.989e33  # solar mass in g
-KM_TO_CM = 1.0e5  # 1 km in cm
+def wind_asymptotic_coefficient(
+    wind_model: str, wind_params: Dict[str, float]
+) -> float:
+    """Return C with ``g(r) -> C / r^2`` as ``r -> inf`` (r in solar radii).
+
+    Needed to tie the dimensionless profile to a physical mass-loss rate: far
+    from the star every supported profile relaxes to a constant-velocity
+    ``r^-2`` wind, and C is whatever prefactor that limit carries.
+    """
+    if wind_model in ("broken_pl", "smooth_pl"):
+        Rb = float(wind_params["Rb"])
+        return Rb * Rb
+    if wind_model in ("beta_law", "confinement"):
+        return 1.0
+    raise ValueError(f"Unknown wind_model '{wind_model}'")
+
+
+def wind_density_norm_from_mdot(
+    mdot_msun_yr: float,
+    v_inf_kms: float,
+    wind_model: str,
+    wind_params: Dict[str, float],
+    mu: float = MU_WIND_DEFAULT,
+) -> float:
+    """Absolute density normalization ``n_0`` [cm^-3] from Mdot and v_inf.
+
+    The profile is used as ``n(r) = n_0 * g(r)``. Matching the asymptotic
+    ``r^-2`` limit to a spherical constant-velocity wind,
+    ``n(r) = Mdot / (4 pi (r R_sun)^2 v_inf mu m_H)``, gives
+
+        n_0 = Mdot / (4 pi R_sun^2 v_inf mu m_H C)
+
+    with C from :func:`wind_asymptotic_coefficient`.
+
+    Unlike the ``mean(fl) = lam`` rescaling, this carries real units, which is
+    what makes the light curve sensitive to the *absolute* size of the system
+    rather than only to ratios such as R/a.
+    """
+    mdot_cgs = float(mdot_msun_yr) * M_SUN_G / YEAR_S
+    v_cgs = float(v_inf_kms) * KM_TO_CM
+    C = wind_asymptotic_coefficient(wind_model, wind_params)
+    denom = 4.0 * np.pi * (R_SUN_CM ** 2) * v_cgs * float(mu) * M_H_G * C
+    if denom <= 0.0:
+        raise ValueError("Non-positive denominator in wind density normalization.")
+    return mdot_cgs / denom
 
 
 def compute_surface_density(
@@ -1900,7 +2065,9 @@ def main():
         "--gma0", type=float, default=-90.0, help="Starting phase angle in degrees"
     )
     parser.add_argument(
-        "--i0", type=float, default=26.0, help="Orbital inclination in degrees"
+        "--i0", type=float, default=64.0,
+        help="Orbital inclination in degrees from the orbital-plane normal "
+             "(90 = edge-on, 0 = face-on)",
     )
     parser.add_argument(
         "--dth", type=float, default=1.0, help="Orbital increment in degrees"
@@ -2060,7 +2227,8 @@ def main():
     print(f"  d1 (emitter separation): {args.d1} solar radii")
     print(f"  d2 (companion separation): {args.d2} solar radii")
     print(f"  gma0 (starting phase): {args.gma0} degrees")
-    print(f"  i0 (inclination): {args.i0} degrees")
+    print(f"  i0 (inclination): {args.i0} degrees from the orbital-plane normal "
+          f"(90 = edge-on)")
     print(f"  dth (orbital increment): {args.dth} degrees")
     print(f"  d2h (polar cell size): {args.d2h} degrees")
     print(f"  dz (LOS step size): {args.dz}")

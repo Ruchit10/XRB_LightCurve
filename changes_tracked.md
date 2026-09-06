@@ -34,9 +34,11 @@ fitting, and inference stack since the original R port.
 25. [Phase 24 — Run-Config Persistence and a Replot-Mode Fix](#phase-24--run-config-persistence-and-a-replot-mode-fix)
 26. [Phase 25 — MCMC Script Slimming](#phase-25--mcmc-script-slimming)
 27. [Phase 26 — Binary-Geometry Diagnostic Plots](#phase-26--binary-geometry-diagnostic-plots)
-28. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
-29. [Current File Inventory](#current-file-inventory)
-30. [Current Status & Quick Commands](#current-status--quick-commands)
+28. [Phase 27 — Standard Inclination Convention at the Public API](#phase-27--standard-inclination-convention-at-the-public-api)
+29. [Phase 28 — Physical Wind Normalization & Per-Cell Flux Conversion](#phase-28--physical-wind-normalization--per-cell-flux-conversion)
+30. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
+31. [Current File Inventory](#current-file-inventory)
+32. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -1298,6 +1300,248 @@ At χ²/dof = 1.064 the MAP geometry is `a = 17.62`, `R = 14.70 R☉`, `i0 = 14.
 
 ---
 
+## Phase 27 — Standard Inclination Convention at the Public API
+
+### The mismatch
+
+`simulate_lightcurve`'s `i0` was measured from the **line of sight**: the
+geometry expressions want `h = a·sin(γ)·sin(incl)` for the sky-plane offset and
+`z = a·sin(γ)·cos(incl)` along the LOS, and the code passed `i0·π/180` straight
+into them. So `i0 = 0` meant edge-on and `i0 = 90` meant face-on — the reverse
+of the astronomical convention, in which inclination is measured from the
+orbital-plane normal (equivalently, from the plane of the sky), `i = 90°` is
+edge-on and `i = 0°` face-on.
+
+The consequence was not a bug in the model but a translation tax on every
+result: the fitted `i0 ≈ 14.5°` had to be reported as `≈ 75.5°`, and every prior
+taken from the literature had to be complemented by hand before being typed as
+`--prior-i0`.
+
+### The change
+
+The conversion is confined to a single line at the input boundary:
+
+```python
+def inclination_to_internal_rad(i0_deg: float) -> float:
+    return (90.0 - float(i0_deg)) * np.pi / 180.0
+```
+
+`simulate_lightcurve` calls it in place of `i0 * np.pi / 180`. **No geometry
+expression was touched** — `_simulate_phases_numba` and `wind_los_integral`
+still take `incl` from the line of sight, which is the right internal choice
+because it is the angle that appears directly in the two projection formulas.
+Splitting the public convention from the internal one this way means the eclipse
+test, the LOS integral and the `(L3, h3)` outputs are provably unchanged.
+
+Defaults and priors were complemented so the *behaviour* is identical, only the
+number typed differs:
+
+| Where | Before (from LOS) | After (from normal) |
+| ----- | ----------------- | ------------------- |
+| `simulate_lightcurve(i0=…)` | `26.0` | `64.0` |
+| `xrb_lightcurve.py --i0` | `26.0` | `64.0` |
+| `DEFAULT_PRIORS['i0']` | mean 26, σ 20, [10, 85] | mean 64, σ 20, [5, 80] |
+| `REPARAM_PRIORS['i0']` | mean 26, σ 20, [10, 85] | mean 64, σ 20, [5, 80] |
+| `KEPLER_PRIORS['i0']` | mean 26, σ 20, [10, 85] | mean 64, σ 20, [5, 80] |
+
+The prior mapping is exact rather than approximate: a Gaussian is symmetric
+about its mean, so `N(μ, σ)` truncated to `[lo, hi]` becomes `N(90 − μ, σ)`
+truncated to `[90 − hi, 90 − lo]` with identical density at the reflected point.
+`--freeze i0=…` and `--prior-i0` now both take conventional degrees.
+
+### Stale-chain guard
+
+Chains fitted under the old convention store the complement of what the model
+now expects, and nothing in the numbers reveals it — `i0 = 14.5` is a perfectly
+legal value in either convention. New run configs therefore carry
+
+```json
+"inclination_convention": "i0-from-orbital-normal"
+```
+
+and `apply_saved_run_config` warns when a config lacks the stamp, stating that
+any χ² from that chain is meaningless. Confirmed on the existing broad kepler
+run: `--replot` warns and reports χ²/dof **83.36** instead of 1.064, because
+`i0 = 14.5` is now read as nearly face-on. Those results need refitting; no
+migration path is provided, by choice.
+
+### Verification (conda env `henv`)
+
+- **Bit-for-bit round trip.** The pre-change `xrb_lightcurve.py` was loaded
+  alongside the new one and `old(i0=x)` compared against `new(i0=90−x)` for
+  `x ∈ {26, 12, 5, 60}`, over every output column including `flx`, `fl`,
+  `nfl_*`, `l3`, `L3`, `h3`, `icd`, `A2` and `is_eclipsed`: **max relative
+  difference 0.000e+00** in all four cases. The light-curve geometry is
+  untouched, which was the whole requirement.
+- `inclination_to_internal_rad` checked at 64→26, 90→0, 0→90, 45→45.
+- Sanity of the new sign convention: `i0 = 90` (edge-on) eclipses, `i0 = 0`
+  (face-on) does not.
+- New `h3`/`L3` match the analytic `a·sin(γ)·sin(26°)` / `a·cos(γ)` to 1.8e-15.
+- End-to-end MCMC (short broad kepler fit, `--prior-i0 75,5,40,85`) lands on the
+  same physical mode as the original: MAP `i0 = 74.98°` (≈ 90 − 15.0),
+  `a = 17.60`, `R = 14.49`, χ²/dof 1.068, BIC 196.2 — versus `i0 = 14.5°`,
+  `a = 17.62`, `R = 14.70`, χ²/dof 1.064, BIC 195.673 before.
+- A freshly written run config replots with no warning and reproduces its own
+  χ²/dof exactly (1.06755).
+- Consistency suite: ALL CHECKS PASSED. `xrb_lightcurve.py` CLI and
+  `plot_results.py` (`--orbit`, `--geometric`, default) all exercised.
+- `chandra_phase_analysis.py` and `chandra_analysis_combined_flux.py` contain no
+  reference to `i0` or `incl` (they consume a precomputed simulation CSV), so
+  they are unaffected.
+
+### Not changed
+
+`rkp_run_w_mcmc_cmds.sh` is a historical log of commands as they were run, and
+already contains flags that no longer exist (`--lam2`, `--load-grid`,
+`--compute-waic`, `--wind-model av`). Its `--i0` / `--prior-i0` values are left
+in the old convention rather than partially rewriting the record. The notebooks
+also call `simulate_lightcurve` with old-convention `i0` and need their values
+complemented before they are re-run.
+
+---
+
+## Phase 28 — Physical Wind Normalization & Per-Cell Flux Conversion
+
+### Why: two exact degeneracies in the `lam` normalization
+
+A broad-band kepler fit (35k steps, zeus) reached χ²_red = 1.020 but reported
+`converged: False` with autocorrelation times up to 1509 steps, and its MAP
+`M_X = 2.53 M☉` fell outside the marginal 16/84 interval `9.17 (+8.20/−5.50)`.
+Neither is a sampler defect. Measured directly against the model:
+
+| Test | Result |
+| ---- | ------ |
+| Scale `(r, R, d1, d2, Rb)` by λ ∈ [0.8, 1.5] | flux changes ≤ 3e-3 (grid round-off); implied `M_tot` swings 14 → 94 M☉ |
+| Vary `q = M_RH/M_tot` from 0.30 → 0.95 at fixed `a` | flux changes ~1e-15 (floating-point noise) |
+
+Because `simulate_lightcurve` rescaled the wind integral so that
+`mean(fl) = lam`, the absolute column was discarded and the model depended only
+on **ratios** — `R/a`, `r/a`, `Rb/a`, `p`, `i0`. The posterior confirms it:
+`R/a` = 0.881 at the MAP versus 0.894 at the median, essentially identical,
+while `a` itself ranged 13.7 → 16.3 R☉. And since only `a = d1 + d2` enters the
+geometry, the mass *split* is invisible.
+
+The consequence is that under `--kepler`, where `a = K·M_tot^(1/3)`, **`M_X` and
+`M_RH` were determined entirely by their priors**. The reported `M_X` was never
+a measurement, the MAP wandered freely along a flat ridge, and the flat
+directions are what produced the 1500-step autocorrelation times.
+
+### Why: the visible-area term was discarded
+
+`A2` (unmasked emitter area) was computed by the kernel and written to the
+output frame, but never used to compute `nfl_*` — those came only from `fl`.
+Partial occultation therefore did not attenuate the flux at all. Measured at the
+posterior median, `A2/A2_max` ramps 1.00 → 0.05 over Δφ ≈ 0.066 (**2.3 h**)
+before total eclipse begins, against an observed ingress of Δφ ≈ 0.08 (2.8 h).
+The model held flux at full level across that entire ramp and then dropped
+abruptly to `f_scatter`, which is also why `R` inflated to 14.6 R☉ (a 10.3 h
+total eclipse against ~5–7 h observed): without a penumbra, `R` had to stretch
+to cover the observed width.
+
+### The change: `wind_norm`
+
+`simulate_lightcurve` gained a `wind_norm` switch. **`"lam"` remains the
+default and is bit-for-bit unchanged.**
+
+```python
+if wind_norm == "lam":                    # historical behaviour
+    col_scale = lam / mean(flx)
+else:                                     # "physical"
+    n0 = wind_density_norm_from_mdot(mdot, v_inf, wind_model, wind_params, mu)
+    col_scale = f_opacity * n0 * R_SUN_CM / 1e22
+```
+
+Two new helpers back it:
+
+- `wind_asymptotic_coefficient(wind_model, wind_params)` — returns `C` with
+  `g(r) → C/r²` as `r → ∞` (`Rb²` for the power-law models, 1 for `beta_law` /
+  `confinement`), since every supported profile relaxes to a constant-velocity
+  `r^-2` wind far from the star.
+- `wind_density_norm_from_mdot(...)` — matches that limit to a spherical wind,
+  `n_0 = Ṁ / (4π R_☉² v_∞ μ m_H C)`.
+
+This is what breaks the scale degeneracy: `N_H` now depends on the **absolute**
+`Rb` in R☉ rather than only on ratios, so scaling all lengths no longer leaves
+the light curve invariant.
+
+`R` also recovers its original meaning under `wind_norm="physical"` — the
+genuinely opaque photosphere (~2 R☉) — because the extended opaque core now
+emerges from the wind column instead of from the geometric cutoff. Under
+`"lam"`, `R` remains the *effective* eclipsing radius (~9–14 R☉, comparable to
+the 8–10 R☉ that Laycock et al. 2015 derive from the 5 h eclipse).
+
+### The change: per-cell flux conversion
+
+This was required, not cosmetic. The nH → flux mapping is nonlinear, so
+`⟨F(N)⟩ ≠ F(⟨N⟩)`. When the column varies steeply across the emitter disk —
+near the occulter limb, and everywhere in physical mode — the surviving flux is
+dominated by the least-absorbed cells. Converting the *mean* column would be
+wrong by many powers of `e` in the eclipse core.
+
+`_simulate_phases_numba` therefore also returns `cell_col`, `cell_area` and
+`cell_count` (`n_phases × n_th·n_r_ring`), and the flux block was refactored
+into a `band_maps: Dict[str, Callable]` applied either to the per-phase mean
+column (`lam`) or per emitter cell followed by an area-weighted average
+(`physical`). Falls back with a warning if the numba mega-kernel is unavailable,
+since the pure-Python path cannot supply per-cell data.
+
+Physical constants (`R_SUN_CM`, `M_H_G`, `M_SUN_G`, `KM_TO_CM`, `YEAR_S`,
+`MU_WIND_DEFAULT = 1.4`) moved from their block below `simulate_lightcurve` to
+module top, because they are now used as default argument values.
+
+### MCMC wiring
+
+New CLI group **Wind Normalization**: `--wind-norm {lam,physical}` (default
+`lam`), `--mdot` (4e-6 M☉/yr), `--v-inf` (1750 km/s), `--mu-wind`, and
+`--fit-fopacity`.
+
+`log_fopa` — log₁₀ of the effective-opacity factor — becomes a fitted dimension,
+inserted after `f_scatter` and before the wind-shape parameters. It absorbs wind
+photoionization, clumping, and the departure of a He-rich WR wind from the solar
+abundances the TBabs `flux_vs_nH` table assumes. `FOPACITY_PRIOR` is centred at
+−1.5 because Clark & Crowther's Ṁ predicts N_H ≈ 19–47 ×10²² out of eclipse
+against an observed ~0.75 ×10²². Supporting changes: `ParamSpec.wind_norm` /
+`.fit_fopacity`, `_resolve_fopacity`, `log_fopa` freezable via `--freeze`,
+`get_active_priors(fit_fopacity=…)`, and `DirectLightCurveModel.evaluate`
+gaining an `f_opacity` argument. `--fit-fopacity` outside physical mode is
+rejected at parse time.
+
+### Verification (conda env `henv`)
+
+- **Backward compatibility exact.** With `wind_norm` at its default,
+  `mean(fl)` reproduces `0.589537` to all printed digits and `nfl_*` are
+  unchanged. `utils/test_flux_methods.py` passes.
+- **Degeneracy break confirmed but partial.** In physical mode with Ṁ fixed,
+  the normalized light-curve shape changes by 2.8% at λ = 0.8 and 4.9% at
+  λ = 1.5, versus < 0.3% for the same sweep under `lam`. Roughly a 15×
+  improvement in scale sensitivity — a real constraint on `a`, not a tight one.
+- **Eclipse now from wind opacity.** With `R = 2` (photosphere), geometric
+  eclipse phases drop to zero and the core reaches N_H ~ 10⁵ ×10²², genuinely
+  Compton-thick.
+- End-to-end MCMC smoke tests pass in both modes; `log_fopa` appears in the
+  ArviZ summary and is sampled.
+- Cost: 13.7 → 18.0 ms per light curve (+31%), from the per-cell interpolation.
+
+### Known limitations
+
+- The degeneracy is broken only weakly (see above). Do **not** quote a
+  black-hole mass from a `lam`-mode fit; `M_X` there is a prior artifact.
+- `f_opacity` is doing heavy lifting (~0.02–0.04). Physically that is wind
+  photoionization stripping the metals that carry photoelectric opacity
+  (ξ ~ 10³), but it is phase- and position-dependent — the shadowed sector stays
+  neutral, which is the Laycock et al. 2015 He II argument — so folding it into
+  one scalar is an approximation. It is also partly degenerate with λ, which is
+  why the scale degeneracy is only partially broken.
+- `Rb` and `p` fitted under `lam` are **not** valid starting points for physical
+  mode: at those values the ingress comes out at 7.6 h against 2.8 h observed.
+  They only ever had to reproduce out-of-eclipse modulation. Refit, and move
+  `R`'s prior back to the photosphere (`--prior-R 2,0.6,1.2,5`).
+- The observed ~12% eclipse floor must still come from `--fit-scatter`: the wind
+  core is genuinely opaque, so the residual is scattered light — the same
+  conclusion Steiner et al. 2016 reach independently.
+
+---
+
 ## Side Investigation — Reference Epoch Recalibration
 
 Plan: `reference_epoch_recalibration_ae1cf98a.plan.md`.
@@ -1471,12 +1715,31 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
     --reparam --freeze q=0.5,Rb=6.0 --n-steps 2000 \
     --output-dir mcmc_results/broad/frozen
 
+# MCMC: physical wind normalization (breaks the scale degeneracy; R is the
+# photosphere here, not the effective eclipsing radius)
+python mcmc_lightcurve_fit.py --band broad \
+    --flux-csv flux_vs_nH_tbabs_broad.csv --data-dir data/IC_10_X1_LC_CIAO \
+    --obs-column flux_t --time-column t_raw \
+    --wind-model smooth_pl --kepler --fit-wind-shape --fit-scatter \
+    --wind-norm physical --fit-fopacity --mdot 4e-6 --v-inf 1750 \
+    --likelihood jitter --counts-per-bin 100 \
+    --sampler zeus --n-walkers 24 --n-steps 21000 --n-burn 2000 \
+    --n-threads 4 --dth 4.0 \
+    --prior-R 2,0.6,1.2,5 --prior-r 1.5,0.8,0.05,4 \
+    --prior-Rb 8,4,2,40 --prior-p 4,1.5,2,8 \
+    --compute-bic --output-dir mcmc_results/broad/smooth_pl/kepler_physical
+
 # Re-plot / recompute BIC from saved results (pass the same data/binning flags)
 python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
     --data-dir data/IC_10_X1_LC_CIAO --obs-column flux_t --time-column t_raw \
     --wind-model smooth_pl --counts-per-bin 100 \
     --replot --compute-bic --output-dir mcmc_results/broad/smooth_pl/geom
 ```
+
+**Interpreting `M_X` / `M_RH`:** under the default `--wind-norm lam` the model
+is scale-invariant and independent of `q`, so both masses are set entirely by
+their priors and must not be quoted as measurements. See
+[Phase 28](#phase-28--physical-wind-normalization--per-cell-flux-conversion).
 
 **Uncommitted work in progress** (branch `add_generic_wind`): Phase 19 —
 Gaussian smoothing, `f_scatter`, and residual panels — is implemented in
@@ -1485,5 +1748,5 @@ Gaussian smoothing, `f_scatter`, and residual panels — is implemented in
 
 ---
 
-**Last Updated:** August 12, 2026  
+**Last Updated:** September 6, 2026  
 **Maintainer:** R. Panchal

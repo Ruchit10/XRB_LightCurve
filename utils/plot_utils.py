@@ -659,7 +659,9 @@ def plot_orbit_geometry(
         ``phase``, ``L3``, ``h3`` and (optionally) ``is_eclipsed``.
     R, r, d1, d2, i0 : float
         Companion radius, compact-object/disk radius, the two distances from the
-        centre of mass (solar radii), and inclination (degrees).
+        centre of mass (solar radii), and inclination (degrees from the
+        orbital-plane normal; 90 = edge-on). ``i0`` is annotation only — the
+        projected track comes from ``L3``/``h3`` in *sim_df*.
     """
     for col in ("L3", "h3"):
         if col not in sim_df.columns:
@@ -715,13 +717,14 @@ def plot_orbit_geometry(
                              zorder=3, label='Companion'))
     ax2.plot([0], [0], '+', color='k', ms=10, zorder=4)
     ax2.plot([a], [0], 'o', color='C0', ms=7, zorder=4, label='Compact object')
-    # Line of sight enters the orbital plane at angle i0 from the normal; the
-    # observer sits in the +y direction of this projection.
+    # The line of sight makes angle i0 with the orbital-plane normal; its
+    # projection onto this plane points toward the observer in -y.
     span = 1.25 * a
     ax2.annotate('', xy=(0, -0.95 * span), xytext=(0, -0.55 * span),
                  arrowprops=dict(arrowstyle='-|>', color='C3', lw=1.8))
     ax2.text(0.03 * span, -0.78 * span,
-             f'to observer\n$i_0$ = {float(i0):.2f}$^\\circ$',
+             f'to observer\n$i$ = {float(i0):.2f}$^\\circ$ from normal\n'
+             f'({90.0 - float(i0):.2f}$^\\circ$ from LOS)',
              color='C3', fontsize=9, va='center')
     ax2.plot([0, a], [0, 0], ':', color='0.3', lw=1.0)
     ax2.text(0.5 * a, 0.04 * span,

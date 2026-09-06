@@ -31,7 +31,7 @@ This will run the simulation with default parameters and save results to `xrb_li
 ### Custom Parameters
 
 ```bash
-python xrb_lightcurve.py --r 0.001 --R 2.0 --d1 11.0 --d2 8.0 --gma0 -90.0 --i0 26.0 --dth 1.0 --output my_results.csv
+python xrb_lightcurve.py --r 0.001 --R 2.0 --d1 11.0 --d2 8.0 --gma0 -90.0 --i0 64.0 --dth 1.0 --output my_results.csv
 ```
 
 ### Available Parameters
@@ -43,7 +43,7 @@ python xrb_lightcurve.py --r 0.001 --R 2.0 --d1 11.0 --d2 8.0 --gma0 -90.0 --i0 
 | `--d1` | 11.0 | Distance of star B from COM in solar radii |
 | `--d2` | 8.0 | Distance of star A from COM in solar radii |
 | `--gma0` | -90.0 | Starting phase angle in degrees |
-| `--i0` | 26.0 | Orbital inclination in degrees |
+| `--i0` | 64.0 | Orbital inclination in degrees, measured from the orbital-plane normal (standard astronomical convention: 90 = edge-on, 0 = face-on) |
 | `--dth` | 1.0 | Orbital increment in degrees |
 | `--d2h` | 6.0 | Angular cell size for polar grid (degrees) |
 | `--dz` | 0.1 | Step size along line of sight (solar radii) |

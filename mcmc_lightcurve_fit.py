@@ -15,7 +15,8 @@ GEOMETRY parameters (always fit):
 - d2: Distance of companion star from center of mass (solar radii)
 - r:  Radius of compact object/accretion disk (solar radii)
 - R:  Radius of companion star (solar radii)
-- i0: Orbital inclination (degrees)
+- i0: Orbital inclination (degrees from the orbital-plane normal, standard
+      astronomical convention: 90 = edge-on, 0 = face-on)
 
 WIND-SHAPE parameters (added with --fit-wind-shape; the set depends on the
 chosen --wind-model):
@@ -107,6 +108,7 @@ warnings.filterwarnings(
 from xrb_lightcurve import (
     simulate_lightcurve,
     WIND_MODEL_PARAM_KEYS,
+    MU_WIND_DEFAULT,
     default_wind_params,
     evaluate_g_profile,
 )
@@ -159,13 +161,17 @@ def _init_numba_worker(max_numba_threads: int = 1):
         # If numba is unavailable or thread control fails, proceed with defaults.
         pass
 
-# Default priors based on IC 10 X-1 parameters
+# Default priors based on IC 10 X-1 parameters.
+# i0 follows the standard astronomical convention (degrees from the
+# orbital-plane normal; 90 = edge-on, 0 = face-on), matching
+# simulate_lightcurve's input. Chains written before that convention change
+# stored the complement 90 - i0 and are not comparable.
 DEFAULT_PRIORS = {
     'd1': {'mean': 11.0, 'std': 3.0, 'min': 5.0, 'max': 20.0},      # Solar radii
     'd2': {'mean': 8.0, 'std': 3.0, 'min': 3.0, 'max': 15.0},       # Solar radii
     'r': {'mean': 0.001, 'std': 0.001, 'min': 0.0001, 'max': 0.1}, # Solar radii
     'R': {'mean': 2.0, 'std': 0.5, 'min': 1.0, 'max': 5.0},         # Solar radii
-    'i0': {'mean': 26.0, 'std': 20.0, 'min': 10.0, 'max': 85.0},    # Degrees
+    'i0': {'mean': 64.0, 'std': 20.0, 'min': 5.0, 'max': 80.0},     # Degrees
 }
 
 # Parameter names for labeling
@@ -185,7 +191,7 @@ REPARAM_PRIORS = {
     'q':  {'mean': 0.58, 'std': 0.15, 'min': 0.01,   'max': 0.99},
     'r':  {'mean': 0.001, 'std': 0.001, 'min': 0.0001, 'max': 0.1},
     'R':  {'mean': 2.0,  'std': 0.5,  'min': 1.0,    'max': 5.0},
-    'i0': {'mean': 26.0, 'std': 20.0, 'min': 10.0,   'max': 85.0},
+    'i0': {'mean': 64.0, 'std': 20.0, 'min': 5.0,    'max': 80.0},
 }
 
 REPARAM_PARAM_NAMES = ['a', 'q', 'r', 'R', 'i0']
@@ -202,7 +208,7 @@ KEPLER_PRIORS = {
     'M_RH': {'mean': 20.0, 'std': 10.0, 'min': 1.0, 'max': 100.0},    # Solar masses
     'r': {'mean': 0.001, 'std': 0.001, 'min': 0.0001, 'max': 0.1},    # Solar radii
     'R': {'mean': 2.0, 'std': 0.5, 'min': 1.0, 'max': 5.0},           # Solar radii
-    'i0': {'mean': 26.0, 'std': 20.0, 'min': 10.0, 'max': 85.0},      # Degrees
+    'i0': {'mean': 64.0, 'std': 20.0, 'min': 5.0, 'max': 80.0},       # Degrees
 }
 
 KEPLER_PARAM_NAMES = ['M_X', 'M_RH', 'r', 'R', 'i0']
@@ -234,6 +240,8 @@ class ParamSpec:
     likelihood: str = 'chi2'
     orbital_period_s: float = float(ORBITAL_PERIOD)
     K_kepler: float = 0.0
+    wind_norm: str = 'lam'
+    fit_fopacity: bool = False
 
 
 def _compute_kepler_prefactor(orbital_period_s: float) -> float:
@@ -282,6 +290,8 @@ def build_param_spec(
     fit_scatter: bool = False,
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
+    wind_norm: str = 'lam',
+    fit_fopacity: bool = False,
 ) -> ParamSpec:
     """Build canonical active-parameter layout for this run."""
     if reparam and kepler:
@@ -296,6 +306,15 @@ def build_param_spec(
     if fit_scatter:
         names.append('f_scatter')
         labels.append(r'$f_\mathrm{scat}$')
+    if fit_fopacity:
+        if wind_norm != 'physical':
+            raise ValueError(
+                "--fit-fopacity requires --wind-norm physical; under the 'lam' "
+                "normalization the column scale is fixed by lam and f_opacity "
+                "has no effect."
+            )
+        names.append('log_fopa')
+        labels.append(r'$\log_{10} f_\mathrm{opa}$')
     if fit_wind_shape:
         if wind_model not in WIND_SHAPE_FIT:
             raise ValueError(
@@ -310,6 +329,8 @@ def build_param_spec(
     # Allow freezing shape parameters even when fit_wind_shape is off.
     valid_frozen.update(WIND_SHAPE_FIT.get(wind_model, []))
     valid_frozen.add('f_scatter')
+    if wind_norm == 'physical':
+        valid_frozen.add('log_fopa')
 
     if 'log_f' in frozen:
         raise ValueError("Freezing log_f is not supported. Use --likelihood chi2/jitter.")
@@ -345,6 +366,8 @@ def build_param_spec(
         likelihood=likelihood,
         orbital_period_s=float(orbital_period_s),
         K_kepler=_compute_kepler_prefactor(orbital_period_s),
+        wind_norm=wind_norm,
+        fit_fopacity=fit_fopacity,
     )
 
 
@@ -403,6 +426,15 @@ LIKELIHOOD_TYPES = {
 
 JITTER_PRIOR = {'mean': -3.0, 'std': 2.0, 'min': -10.0, 'max': 0.0}
 
+# log10 of the effective-opacity factor, used only with --wind-norm physical.
+# It rescales the Mdot-derived column to the *effective* photoelectric column,
+# absorbing wind ionization (a hyper-ionized wind has far less opacity than its
+# mass column implies), clumping, and the departure of a He-rich WR wind from
+# the solar abundances assumed by the TBabs flux_vs_nH table. Centered near
+# -1.5 because Clark & Crowther's Mdot predicts N_H ~ 20-50e22 out of eclipse
+# against an observed ~0.75e22.
+FOPACITY_PRIOR = {'mean': -1.5, 'std': 1.0, 'min': -4.0, 'max': 0.5}
+
 SAMPLER_TYPES = {
     'emcee': 'emcee Ensemble Sampler (stretch moves)',
     'zeus': 'zeus Ensemble Slice Sampler',
@@ -452,6 +484,7 @@ def get_active_priors(
     fit_scatter: bool = False,
     scatter_prior: Optional[Dict[str, float]] = None,
     frozen: Optional[Dict[str, float]] = None,
+    fit_fopacity: bool = False,
 ) -> Dict:
     """Build the merged prior dict covering geometry + jitter + shape params.
 
@@ -463,6 +496,11 @@ def get_active_priors(
     out = dict(base_priors)
     if likelihood == 'jitter':
         out.setdefault('log_f', dict(JITTER_PRIOR))
+    if fit_fopacity:
+        prior = dict(FOPACITY_PRIOR)
+        if shape_prior_overrides and 'log_fopa' in shape_prior_overrides:
+            prior.update(shape_prior_overrides['log_fopa'])
+        out['log_fopa'] = prior
     if fit_wind_shape:
         for name in WIND_SHAPE_FIT.get(wind_model, []):
             prior = dict(WIND_SHAPE_PRIORS[name])
@@ -586,12 +624,14 @@ class DirectLightCurveModel:
         i0: float,
         obs_phases: np.ndarray,
         wind_params: Dict[str, float] = None,
+        f_opacity: Optional[float] = None,
     ) -> np.ndarray:
         """Evaluate model by running simulate_lightcurve.
 
         ``wind_params`` overrides the default fixed shape parameters when
         provided. R_star is auto-filled from R for beta_law / confinement
-        if not present.
+        if not present. ``f_opacity`` is only used when the run is in
+        ``wind_norm='physical'`` mode.
         """
         if wind_params is None:
             wp = dict(self.wind_params_default)
@@ -613,6 +653,14 @@ class DirectLightCurveModel:
                 lam=self.sim_params.get('lam', 0.589537),
                 wind_model=self.wind_model,
                 wind_params=wp,
+                wind_norm=self.sim_params.get('wind_norm', 'lam'),
+                mdot=self.sim_params.get('mdot', 4.0e-6),
+                v_inf=self.sim_params.get('v_inf', 1750.0),
+                mu_wind=self.sim_params.get('mu_wind', MU_WIND_DEFAULT),
+                f_opacity=(
+                    self.sim_params.get('f_opacity', 1.0)
+                    if f_opacity is None else float(f_opacity)
+                ),
                 verbose=False,
             )
         except Exception as e:
@@ -729,6 +777,28 @@ def _resolve_scatter(
     return 0.0
 
 
+def _resolve_fopacity(
+    theta: np.ndarray,
+    active_names: Optional[List[str]],
+    param_spec: Optional[ParamSpec],
+) -> Optional[float]:
+    """Resolve the effective-opacity factor from active or frozen parameters.
+
+    Returns None when the run is not in physical-normalization mode, so the
+    caller leaves simulate_lightcurve on its configured default.
+    """
+    if param_spec is None or param_spec.wind_norm != 'physical':
+        return None
+    names = list(active_names or [])
+    if param_spec.active_names:
+        names = list(param_spec.active_names)
+    if 'log_fopa' in names:
+        return float(10.0 ** theta[names.index('log_fopa')])
+    if 'log_fopa' in param_spec.frozen:
+        return float(10.0 ** param_spec.frozen['log_fopa'])
+    return None
+
+
 def _evaluate_model(
     theta,
     model,
@@ -765,9 +835,14 @@ def _evaluate_model(
         frozen=(param_spec.frozen if param_spec is not None else None),
     )
 
+    f_opacity = _resolve_fopacity(
+        np.asarray(theta, dtype=float), active_names, param_spec
+    )
+
     try:
         model_flux = model.evaluate(
             d1, d2, r, R, i0, obs_phase, wind_params=wind_params,
+            f_opacity=f_opacity,
         )
     except TypeError:
         # Backward compat with any model.evaluate() that doesn't accept
@@ -2497,6 +2572,8 @@ def run_single_fit(
     fit_scatter = bool(getattr(args, 'fit_scatter', False))
     frozen_params = dict(getattr(args, 'frozen_params', {}) or {})
     orbital_period_s = float(getattr(args, 'orbital_period', ORBITAL_PERIOD))
+    wind_norm = sim_params.get('wind_norm', getattr(args, 'wind_norm', 'lam'))
+    fit_fopacity = bool(getattr(args, 'fit_fopacity', False))
 
     param_spec = build_param_spec(
         likelihood=likelihood,
@@ -2507,6 +2584,8 @@ def run_single_fit(
         fit_scatter=fit_scatter,
         frozen=frozen_params,
         orbital_period_s=orbital_period_s,
+        wind_norm=wind_norm,
+        fit_fopacity=fit_fopacity,
     )
 
     # Active priors include geometry + (optional) jitter + (optional) shape.
@@ -2519,6 +2598,7 @@ def run_single_fit(
         fit_scatter=fit_scatter,
         scatter_prior=scatter_prior,
         frozen=param_spec.frozen,
+        fit_fopacity=fit_fopacity,
     )
 
     print(f"\n{'#'*60}")
@@ -3055,7 +3135,56 @@ def main():
         help="Use raw 100s data without phase binning. Usually best paired with "
              "--likelihood jitter."
     )
-    
+
+    # Wind column-density normalization
+    norm_group = parser.add_argument_group(
+        'Wind Normalization',
+        "How the wind LOS integral is converted into an absolute N_H."
+    )
+    norm_group.add_argument(
+        "--wind-norm",
+        type=str,
+        choices=['lam', 'physical'],
+        default='lam',
+        help="'lam' (default, backward compatible): rescale so mean(fl)=lam; "
+             "the model then depends only on ratios (R/a, r/a, Rb/a) and the "
+             "absolute scale -- hence M_X and M_RH -- is set entirely by the "
+             "priors. 'physical': fix the density from --mdot/--v-inf so the "
+             "column carries real units, the eclipse emerges from wind opacity "
+             "rather than the geometric cutoff, and the scale degeneracy is "
+             "(partially) broken."
+    )
+    norm_group.add_argument(
+        "--mdot",
+        type=float,
+        default=4.0e-6,
+        help="WR mass-loss rate in Msun/yr for --wind-norm physical. "
+             "Default 4e-6 (Clark & Crowther 2004, clumping-corrected)."
+    )
+    norm_group.add_argument(
+        "--v-inf",
+        type=float,
+        default=1750.0,
+        help="Wind terminal velocity in km/s for --wind-norm physical. "
+             "Default 1750 (Clark & Crowther 2004)."
+    )
+    norm_group.add_argument(
+        "--mu-wind",
+        type=float,
+        default=MU_WIND_DEFAULT,
+        help=f"Mean mass per hydrogen-equivalent nucleus, converting the wind "
+             f"mass column to the N_H that the TBabs flux_vs_nH table expects. "
+             f"Default {MU_WIND_DEFAULT}."
+    )
+    norm_group.add_argument(
+        "--fit-fopacity",
+        action="store_true",
+        help="Fit log10(f_opacity), the effective-opacity factor that absorbs "
+             "wind ionization, clumping and WR abundance departures. Requires "
+             "--wind-norm physical. Strongly recommended in that mode: the "
+             "Mdot-derived column overpredicts the observed N_H by ~1-2 dex."
+    )
+
     # MCMC options
     parser.add_argument(
         "--sampler",
@@ -3328,7 +3457,9 @@ def main():
         ("d2", None, DEFAULT_PRIORS, "d2 (companion distance from COM)"),
         ("r", None, DEFAULT_PRIORS, "r (compact object/disk radius)"),
         ("R", None, DEFAULT_PRIORS, "R (companion star radius)"),
-        ("i0", None, DEFAULT_PRIORS, "i0 (orbital inclination, degrees)"),
+        ("i0", None, DEFAULT_PRIORS,
+         "i0 (orbital inclination, degrees from the orbital-plane normal; "
+         "90 = edge-on, 0 = face-on)"),
         ("a", None, REPARAM_PRIORS, "a = d1+d2 (orbital separation, --reparam only)"),
         ("q", None, REPARAM_PRIORS, "q = d1/(d1+d2) (mass-ratio proxy, --reparam only)"),
         ("MX", "prior_M_X", KEPLER_PRIORS, "compact-object mass M_X (Msun, --kepler only)"),
@@ -3423,7 +3554,15 @@ def main():
         'gma0': args.gma0,
         'd2h': args.d2h,
         'dz': args.dz,
+        'wind_norm': getattr(args, 'wind_norm', 'lam'),
+        'mdot': getattr(args, 'mdot', 4.0e-6),
+        'v_inf': getattr(args, 'v_inf', 1750.0),
+        'mu_wind': getattr(args, 'mu_wind', MU_WIND_DEFAULT),
     }
+    wind_norm = getattr(args, 'wind_norm', 'lam')
+    fit_fopacity = bool(getattr(args, 'fit_fopacity', False))
+    if fit_fopacity and wind_norm != 'physical':
+        parser.error("--fit-fopacity requires --wind-norm physical.")
 
     # Build custom geometry priors
     reparam = getattr(args, 'reparam', False)
@@ -3464,6 +3603,8 @@ def main():
             fit_scatter=fit_scatter,
             frozen=frozen_params,
             orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
+            wind_norm=wind_norm,
+            fit_fopacity=fit_fopacity,
         )
     except Exception as e:
         parser.error(str(e))
@@ -3480,6 +3621,7 @@ def main():
             if fit_scatter else None
         ),
         frozen=None,
+        fit_fopacity=fit_fopacity,
     )
     for sname in WIND_SHAPE_FIT.get(args.wind_model, []):
         _check_priors.setdefault(sname, dict(WIND_SHAPE_PRIORS[sname]))

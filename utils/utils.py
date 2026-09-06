@@ -1317,6 +1317,11 @@ RUN_CONFIG_SUFFIX = "_run_config.json"
 # config was found, not by what the original run typed.
 _RUN_CONFIG_NEVER_RESTORE = frozenset({"replot", "output_dir"})
 
+# Stamped into every new run config. i0 was formerly measured from the line of
+# sight, so a chain written before the switch stores the complement of what the
+# priors and plots now mean; --replot cannot detect that from the numbers alone.
+INCLINATION_CONVENTION = "i0-from-orbital-normal"
+
 
 def _jsonable(value):
     """Best-effort conversion of an argparse value into JSON-representable form."""
@@ -1346,6 +1351,7 @@ def save_run_config(output_dir: str, band: str, wind_model: str, args) -> Option
         "command": shlex.join(sys.argv),
         "band": band,
         "wind_model": wind_model,
+        "inclination_convention": INCLINATION_CONVENTION,
         "args": {k: _jsonable(v) for k, v in sorted(vars(args).items())},
     }
     try:
@@ -1461,6 +1467,16 @@ def apply_saved_run_config(
     if not isinstance(saved_args, dict):
         warnings.warn(f"Run config {config_path} has no 'args' block; ignoring.")
         return None
+
+    if config.get("inclination_convention") != INCLINATION_CONVENTION:
+        warnings.warn(
+            f"{os.path.basename(config_path)} predates the inclination convention "
+            f"change: its i0 samples and --prior-i0 are measured from the line of "
+            f"sight, whereas i0 is now measured from the orbital-plane normal "
+            f"(90 deg = edge-on). Its i0 values mean the complement of what the "
+            f"model now expects, so any chi2 reported from this chain is "
+            f"meaningless. Refit before trusting the output."
+        )
 
     # dest -> the flag the user would type ('prior_M_X' is spelled '--prior-MX').
     dest_to_flag: Dict[str, str] = {}

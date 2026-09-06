@@ -44,7 +44,9 @@ nuisance parameters.
 
 **System working values:** compact-object/disk radius `r ≈ 0.001 R☉`, companion
 radius `R ≈ 2 R☉`, `d1 ≈ 11 R☉`, `d2 ≈ 8 R☉` (separation `a = d1 + d2 ≈ 19 R☉`),
-inclination `i₀ ≈ 26°`, orbital period `P = 125431 s ≈ 1.45 d`.
+inclination `i₀ ≈ 64°` (standard convention, from the orbital-plane normal —
+equivalently 26° from the line of sight, which is how the geometry kernels
+measure it), orbital period `P = 125431 s ≈ 1.45 d`.
 
 **Adopted spectral model:** `TBabs × powerlaw` with `nH ≈ 0.75×10²² cm⁻²`,
 `Γ ≈ 1.86`, `χ²_red ≈ 1.52` (preferred over `phabs` by `Δχ² ≈ 8.5`).
@@ -193,7 +195,7 @@ which is what makes direct-evaluation MCMC feasible.
 
 ```python
 simulate_lightcurve(
-    r=0.001, R=2.0, d1=11.0, d2=8.0, gma0=-90.0, i0=26.0,
+    r=0.001, R=2.0, d1=11.0, d2=8.0, gma0=-90.0, i0=64.0,
     dth=1.0, d2h=6.0, dz=0.5,
     flux_method="legacy", flux_csv_path=None, flux_type="erg",
     lam=0.589537,
@@ -203,6 +205,16 @@ simulate_lightcurve(
     verbose=False, n_jobs=1,
 ) -> pd.DataFrame
 ```
+
+**Inclination convention.** `i0` is the standard astronomical inclination:
+degrees from the orbital-plane normal, so `i0 = 90°` is edge-on (eclipses
+possible) and `i0 = 0°` is face-on (the orbit lies in the plane of the sky and
+never eclipses). The geometry kernels (`_simulate_phases_numba`,
+`wind_los_integral`) instead measure `incl` from the *line of sight*, because
+that is the angle appearing directly in `h = a·sin(γ)·sin(incl)` (sky-plane) and
+`z = a·sin(γ)·cos(incl)` (along the LOS). `simulate_lightcurve` bridges the two
+with `inclination_to_internal_rad(i0) = (90 − i0)·π/180`, at the input boundary
+only — no geometry expression changed.
 
 Output columns:
 
@@ -736,7 +748,7 @@ python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec --model tbabs \
 python xrb_lightcurve.py --flux_method interpolate \
     --flux_csv flux_vs_nH_tbabs_broad.csv \
     --wind-model smooth_pl --Rb 5 --p 4 --Delta 1 \
-    --i0 12.0 --lam 0.572385 --output sim_broad.csv
+    --i0 78.0 --lam 0.572385 --output sim_broad.csv
 
 # 3. Fold the data and χ²-fit that one model (phase shift free; flux never rescaled)
 python chandra_phase_analysis.py \
@@ -885,6 +897,13 @@ One `*.plan.md` per feature increment: `unified_wind_model`,
 
 ## Known rough edges
 
+- **MCMC results predating the inclination convention change are stale.** `i0`
+  used to be measured from the line of sight and is now measured from the
+  orbital-plane normal, so those chains store the complement of what the model
+  expects. New run configs carry `"inclination_convention":
+  "i0-from-orbital-normal"` and `--replot` warns when the stamp is absent; the
+  fix is to refit. The notebooks and `rkp_run_w_mcmc_cmds.sh` still pass
+  old-convention `--i0` / `--prior-i0` values.
 - **`Delta` default is inconsistent.** `xrb_lightcurve.py --Delta` defaults to
   `1.0`, but `default_wind_params("smooth_pl")` and
   `mcmc_lightcurve_fit.WIND_SHAPE_FIXED['smooth_pl']` both use `2.0` (and the
