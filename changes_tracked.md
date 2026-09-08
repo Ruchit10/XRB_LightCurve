@@ -36,9 +36,10 @@ fitting, and inference stack since the original R port.
 27. [Phase 26 — Binary-Geometry Diagnostic Plots](#phase-26--binary-geometry-diagnostic-plots)
 28. [Phase 27 — Standard Inclination Convention at the Public API](#phase-27--standard-inclination-convention-at-the-public-api)
 29. [Phase 28 — Physical Wind Normalization & Per-Cell Flux Conversion](#phase-28--physical-wind-normalization--per-cell-flux-conversion)
-30. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
-31. [Current File Inventory](#current-file-inventory)
-32. [Current Status & Quick Commands](#current-status--quick-commands)
+30. [Phase 29 — Mass Reparameterization & Error-Column Fix](#phase-29--mass-reparameterization--error-column-fix)
+31. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
+32. [Current File Inventory](#current-file-inventory)
+33. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -1542,6 +1543,124 @@ rejected at parse time.
 
 ---
 
+## Phase 29 — Mass Reparameterization & Error-Column Fix
+
+### `q` is exactly unidentifiable, so `--kepler` cannot fit masses
+
+For a circular two-body orbit the light curve sees only the *relative*
+separation. Both geometry expressions,
+
+```
+l       = (d1 + d2) · sqrt(sin²γ · sin²i + cos²γ)
+z_start = (d1 + d2) · sinγ · cos i
+```
+
+depend on the sum alone: however the centre of mass splits `a`, the emitter's
+position relative to the companion and its wind is unchanged. Sweeping
+`q = M_RH/M_tot` from 0.20 to 0.95 at fixed `a` changes the flux by
+
+| `wind_norm` | max relative change |
+| ----------- | ------------------- |
+| `lam`       | **0.00e+00** (bit-identical) |
+| `physical`  | **3.9e-16** (round-off) |
+
+The physical normalization does **not** help, and the geometry is correct —
+there was nothing to fix there. But it means only `M_tot` enters the model, via
+`a = K·M_tot^{1/3}`, so sampling `(M_X, M_RH)` lays one *exactly* flat
+direction diagonally across both axes. The saved run configs show the symptom
+plainly: two otherwise identical runs (25k and 35k steps) returned MAP
+`M_X` = 4.50 and 2.53 while their medians agreed (9.04, 9.17), with
+autocorrelation times of 707 and 1509 steps and `converged: False` in both.
+
+### `--kepler-mtot`
+
+Samples `(M_tot, q_m)` with `q_m = M_RH/M_tot` — the same reasoning that
+motivated `--reparam` for `(d1, d2) → (a, q)`. The flat direction becomes
+axis-aligned, so it no longer degrades the mixing of every other parameter;
+`q_m`'s posterior comes out equal to its prior, which is honest and visible
+rather than hidden inside a mass posterior; and `M_X`, `M_RH`, `a`, `d1`, `d2`
+are reported as *derived*. `--freeze q_m=…` drops the dead dimension entirely.
+
+| Mode | Sampled | Derived |
+| ---- | ------- | ------- |
+| `kepler` (`--kepler`) | `M_X, M_RH, r, R, i0` | `a`, `q`, `d1`, `d2` |
+| `kepler_mtot` (`--kepler-mtot`) | `M_tot, q_m, r, R, i0` | `a`, `M_X`, `M_RH`, `d1`, `d2` |
+
+New flags `--kepler-mtot`, `--prior-Mtot`, `--prior-qm`; three-way mutual
+exclusion with `--reparam` / `--kepler`, both unchanged. Confirmed on a short
+physical-mode run: `q_m` = 0.628 (+0.159/−0.154) against a `0.6 ± 0.15` prior,
+i.e. posterior ≡ prior, exactly as predicted.
+
+**Reporting rule.** `M_tot` is a (weak) measurement in `physical` mode; the
+`M_X`/`M_RH` split is entirely the `q_m` prior. Quote `q_m` as a stated
+assumption, not a result.
+
+### Error-column auto-detection fix
+
+`load_data` mis-detected the error column for lower-case proportional
+observables. Two compounding defects:
+
+1. The candidate list contained
+   `obs_column.replace("FLUX", "FLUX_ERR")`, a **no-op on a lower-case name**,
+   so `"flux_t"` survived in the list and matched *its own column* —
+   `error := flux`.
+2. `"rate_err"` was accepted for *any* observable. That has the right shape but
+   the wrong scale for `flux_t`. `_derive_err_from_rate_err` was written for
+   exactly this case and was unreachable.
+
+Candidates are now built upper-cased, any candidate equal to the observable is
+skipped, and `RATE_ERR` / `ERR_RATE` / `COUNT_RATE_ERR` are only offered when
+the observable *is* the rate; the generic `*_ERR` fallback no longer accepts a
+bare rate error for a non-rate observable.
+
+`rate_err = rate/√counts` holds exactly in these files, so `flux_t` now derives
+`flux_t/√counts` (matching to 2.7e-13 relative). `obs_column='rate'` still
+returns `rate_err` exactly, and an explicit `--obs-error-column` still
+overrides.
+
+**Impact.** This affected every run using `--obs-column flux_t` without an
+explicit error column — which includes both saved run configs. At
+`--counts-per-bin 100` the median fractional error goes **0.386 → 0.101**, so
+errors were **3.8× too large** and χ² **too small by ~14.6×** after
+inverse-variance binning: a reported χ²/dof of 1.02 is closer to 15. Both the
+single-LC and MCMC paths go through `load_data`, so both are corrected.
+Expect χ²/dof ≈ 4–5 on the broad band now, reflecting ~20–25% intrinsic
+aperiodic variability — which is why `--likelihood jitter` is no longer
+optional if the credible intervals are to mean anything.
+
+### Also fixed
+
+A reporting regression from Phase 28: the summary writer called
+`get_param_config` without `wind_norm` / `fit_fopacity`, so under
+`--wind-norm physical` the sampled `log_fopa` row was silently omitted from
+`mcmc_summary.txt` (it was present in the ArviZ table). `get_param_config` now
+takes `kepler_mtot`, `wind_norm` and `fit_fopacity`, and the derived-quantity
+rows are selected per mode.
+
+### Verification (conda env `henv`)
+
+- `phys`, `--reparam` and `--kepler` all still run and report their own
+  parameterizations (regression sweep).
+- `--kepler-mtot` runs end-to-end with `--wind-norm physical --fit-fopacity
+  --likelihood jitter`, reporting `M_tot`/`q_m` plus derived
+  `a`/`M_X`/`M_RH`/`d1`/`d2`.
+- `flux_t` → `flux_t/√counts`; `rate` → `rate_err`; explicit override honored.
+- `utils/test_flux_methods.py` passes.
+
+### Not changed
+
+`resolve_band_directory` tries `{band}/single` **before** `{band}/`, so
+`--data-dir data/IC_10_X1_LC_CIAO --band broad` silently resolves to
+`broad/single/` — one observation, not twelve. Every existing run in
+`mcmc_results/` is therefore a single-ObsID (15803) fit; the `n=154` in those
+BIC lines is exactly the single-obs bin count at 100 counts/bin, against ~432
+for all twelve. Left as-is rather than reordering the candidates, which would
+silently change the meaning of existing commands. Pass the band directory
+explicitly (`.../broad` for all, `.../broad/single` for one). Note there are
+**12** broad files, not 10: 3953, 7082, 8458, 11080–11086, 15803, 26188.
+
+---
+
 ## Side Investigation — Reference Epoch Recalibration
 
 Plan: `reference_epoch_recalibration_ae1cf98a.plan.md`.
@@ -1659,7 +1778,8 @@ but `Delta` defaults to `1.0` on the `xrb_lightcurve.py` CLI and `2.0` in
 
 **MCMC defaults:** `phys` mode (`d1, d2, r, R, i0`), `chi2` likelihood,
 `emcee`, 50 fixed-width phase bins, per-sample phase-shift alignment **on**,
-direct evaluator (no grid path exists).
+direct evaluator (no grid path exists), `--wind-norm lam`. Parameterizations:
+`phys` / `--reparam` / `--kepler` / `--kepler-mtot` (mutually exclusive).
 
 ```bash
 # Build/refresh the XSPEC flux-vs-nH table
@@ -1715,19 +1835,26 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
     --reparam --freeze q=0.5,Rb=6.0 --n-steps 2000 \
     --output-dir mcmc_results/broad/frozen
 
-# MCMC: physical wind normalization (breaks the scale degeneracy; R is the
-# photosphere here, not the effective eclipsing radius)
+# MCMC: physical wind normalization + mass reparameterization.
+# R is the true photosphere here, not the effective eclipsing radius, and the
+# eclipse is produced by wind opacity. Keep d2h small: physical mode averages
+# flux *per emitter cell*, and d2h=30 gives only 13 azimuthal cells, which
+# under-resolves the eclipse-core leakage.
 python mcmc_lightcurve_fit.py --band broad \
-    --flux-csv flux_vs_nH_tbabs_broad.csv --data-dir data/IC_10_X1_LC_CIAO \
+    --flux-csv ./analyses/flux_vs_nH_tbabs_600bin_15803_broad.csv \
+    --data-dir data/IC_10_X1_LC_CIAO/broad/single/ \
     --obs-column flux_t --time-column t_raw \
-    --wind-model smooth_pl --kepler --fit-wind-shape --fit-scatter \
+    --wind-model smooth_pl --kepler-mtot --fit-wind-shape --fit-scatter \
     --wind-norm physical --fit-fopacity --mdot 4e-6 --v-inf 1750 \
     --likelihood jitter --counts-per-bin 100 \
-    --sampler zeus --n-walkers 24 --n-steps 21000 --n-burn 2000 \
-    --n-threads 4 --dth 4.0 \
-    --prior-R 2,0.6,1.2,5 --prior-r 1.5,0.8,0.05,4 \
-    --prior-Rb 8,4,2,40 --prior-p 4,1.5,2,8 \
-    --compute-bic --output-dir mcmc_results/broad/smooth_pl/kepler_physical
+    --sampler zeus --n-walkers 24 --n-steps 30000 --n-burn 3000 \
+    --n-threads 4 --dth 5.0 --d2h 6.0 --scatter-eclipse-phase 0.4 0.6 \
+    --prior-Mtot 45,18,10,110 --prior-qm 0.60,0.12,0.05,0.95 \
+    --prior-R 2.0,0.6,1.2,6 --prior-r 1.4,0.8,0.05,4 \
+    --prior-i0 78,8,63,89.5 \
+    --prior-Rb 8,4,2,40 --prior-p 4,1.5,2,10 \
+    --compute-bic --smooth \
+    --output-dir mcmc_results/broad/smooth_pl/single_15803_physical_mtot
 
 # Re-plot / recompute BIC from saved results (pass the same data/binning flags)
 python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
@@ -1736,10 +1863,17 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
     --replot --compute-bic --output-dir mcmc_results/broad/smooth_pl/geom
 ```
 
-**Interpreting `M_X` / `M_RH`:** under the default `--wind-norm lam` the model
-is scale-invariant and independent of `q`, so both masses are set entirely by
-their priors and must not be quoted as measurements. See
-[Phase 28](#phase-28--physical-wind-normalization--per-cell-flux-conversion).
+**Interpreting `M_X` / `M_RH`:** the light curve is independent of `q` in
+*every* mode, and under the default `--wind-norm lam` it is scale-invariant as
+well — so with `--kepler` both masses are set entirely by their priors and must
+not be quoted as measurements. Prefer `--kepler-mtot`, which samples
+`(M_tot, q_m)`: under `--wind-norm physical`, `M_tot` is a weak measurement
+(`a` to ±10–15%, so `M_tot ∝ a³` to ~±35%) while the split remains the `q_m`
+prior. See [Phase 28](#phase-28--physical-wind-normalization--per-cell-flux-conversion)
+and [Phase 29](#phase-29--mass-reparameterization--error-column-fix).
+
+**`--data-dir` resolves `{band}/single` before `{band}/`.** Pass the band
+directory explicitly to control which observations are fitted.
 
 **Uncommitted work in progress** (branch `add_generic_wind`): Phase 19 —
 Gaussian smoothing, `f_scatter`, and residual panels — is implemented in
@@ -1748,5 +1882,5 @@ Gaussian smoothing, `f_scatter`, and residual panels — is implemented in
 
 ---
 
-**Last Updated:** September 6, 2026  
+**Last Updated:** September 7, 2026  
 **Maintainer:** R. Panchal

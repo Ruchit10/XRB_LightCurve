@@ -220,6 +220,38 @@ KEPLER_PARAM_LABELS = [
     r'$i$ (deg)',
 ]
 
+# Mass-total reparameterization of Kepler mode: (M_X, M_RH) -> (M_tot, q_m)
+# with q_m = M_RH / M_tot, so M_RH = q_m * M_tot and M_X = (1 - q_m) * M_tot.
+#
+# For a circular two-body orbit the light curve sees only the *relative*
+# separation a = d1 + d2 = K * M_tot^(1/3); the split of a about the centre of
+# mass cancels out of every geometry expression (l and z_start both depend on
+# d1 + d2 alone). q_m is therefore *exactly* unidentifiable -- verified to
+# floating-point round-off under both wind_norm='lam' and 'physical'.
+#
+# Sampling (M_X, M_RH) lays that flat direction diagonally across both axes,
+# which is why --kepler mixes so badly (autocorrelation ~700-1500 steps) and
+# why its MAP M_X wanders between otherwise identical runs. Sampling
+# (M_tot, q_m) puts the one identifiable combination on its own axis and leaves
+# q_m's posterior equal to its prior, which is honest and obvious rather than
+# hidden. Freeze q_m to drop the dead dimension entirely.
+KEPLER_MTOT_PRIORS = {
+    'M_tot': {'mean': 45.0, 'std': 15.0, 'min': 5.0, 'max': 120.0},  # Solar masses
+    'q_m': {'mean': 0.6, 'std': 0.2, 'min': 0.02, 'max': 0.98},      # M_RH/M_tot
+    'r': {'mean': 2.0, 'std': 1.5, 'min': 0.05, 'max': 6.0},         # Solar radii
+    'R': {'mean': 9.5, 'std': 2.5, 'min': 3.0, 'max': 20.0},         # Solar radii
+    'i0': {'mean': 78.0, 'std': 8.0, 'min': 63.0, 'max': 89.5},      # Degrees
+}
+
+KEPLER_MTOT_PARAM_NAMES = ['M_tot', 'q_m', 'r', 'R', 'i0']
+KEPLER_MTOT_PARAM_LABELS = [
+    r'$M_\mathrm{tot}$ (M$_\odot$)',
+    r'$q_m = M_\mathrm{RH}/M_\mathrm{tot}$',
+    r'$r$ (R$_\odot$)',
+    r'$R$ (R$_\odot$)',
+    r'$i$ (deg)',
+]
+
 G_SI = 6.674e-11
 R_SUN_M = 6.957e8
 M_SUN_KG = 1.989e30
@@ -278,6 +310,8 @@ def get_mode_name_label(mode: str) -> Tuple[List[str], List[str]]:
         return list(REPARAM_PARAM_NAMES), list(REPARAM_PARAM_LABELS)
     if mode == 'kepler':
         return list(KEPLER_PARAM_NAMES), list(KEPLER_PARAM_LABELS)
+    if mode == 'kepler_mtot':
+        return list(KEPLER_MTOT_PARAM_NAMES), list(KEPLER_MTOT_PARAM_LABELS)
     return list(PARAM_NAMES), list(PARAM_LABELS)
 
 
@@ -292,11 +326,19 @@ def build_param_spec(
     orbital_period_s: float = ORBITAL_PERIOD,
     wind_norm: str = 'lam',
     fit_fopacity: bool = False,
+    kepler_mtot: bool = False,
 ) -> ParamSpec:
     """Build canonical active-parameter layout for this run."""
-    if reparam and kepler:
-        raise ValueError("--reparam and --kepler are mutually exclusive.")
-    mode = 'kepler' if kepler else ('reparam' if reparam else 'phys')
+    if sum(bool(x) for x in (reparam, kepler, kepler_mtot)) > 1:
+        raise ValueError(
+            "--reparam, --kepler and --kepler-mtot are mutually exclusive."
+        )
+    mode = (
+        'kepler_mtot' if kepler_mtot
+        else 'kepler' if kepler
+        else 'reparam' if reparam
+        else 'phys'
+    )
     frozen = dict(frozen or {})
 
     names, labels = get_mode_name_label(mode)
@@ -450,6 +492,9 @@ def get_param_config(
     fit_scatter: bool = False,
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
+    kepler_mtot: bool = False,
+    wind_norm: str = 'lam',
+    fit_fopacity: bool = False,
 ):
     """Return (param_names, param_labels) for the active MCMC vector.
 
@@ -466,11 +511,14 @@ def get_param_config(
         likelihood=likelihood,
         reparam=reparam,
         kepler=kepler,
+        kepler_mtot=kepler_mtot,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
         fit_scatter=fit_scatter,
         frozen=frozen,
         orbital_period_s=orbital_period_s,
+        wind_norm=wind_norm,
+        fit_fopacity=fit_fopacity,
     )
     return list(spec.active_names), list(spec.active_labels)
 
@@ -727,6 +775,14 @@ def _resolve_geom(
         q = mrh / mtot
         d1 = a * q
         d2 = a * (1.0 - q)
+    elif mode == 'kepler_mtot':
+        mtot = _theta_value(theta, 'M_tot', names, frozen)
+        q = _theta_value(theta, 'q_m', names, frozen)
+        if mtot is None or q is None or mtot <= 0:
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+        a = float(param_spec.K_kepler) * mtot ** (1.0 / 3.0)
+        d1 = a * q
+        d2 = a * (1.0 - q)
     else:
         raise ValueError(f"Unknown parameter mode '{mode}'")
 
@@ -863,8 +919,14 @@ def _evaluate_model(
     return model_flux
 
 
-def _default_priors(reparam: bool = False, kepler: bool = False) -> Dict:
+def _default_priors(
+    reparam: bool = False,
+    kepler: bool = False,
+    kepler_mtot: bool = False,
+) -> Dict:
     """The prior dict for a parameterization, as a fresh copy."""
+    if kepler_mtot:
+        return copy.deepcopy(KEPLER_MTOT_PRIORS)
     if kepler:
         return copy.deepcopy(KEPLER_PRIORS)
     if reparam:
@@ -1457,6 +1519,30 @@ def compute_statistics(
             ('d1', a_samples * q_samples),
             ('d2', a_samples * (1.0 - q_samples)),
         ]
+    elif mode == 'kepler_mtot':
+        frozen = (param_spec.frozen if param_spec is not None else {})
+
+        def _col(name):
+            if name in param_names:
+                return samples[:, param_names.index(name)]
+            if name in frozen:
+                return np.full(len(samples), float(frozen[name]))
+            raise ValueError(f"Could not resolve '{name}' for kepler_mtot stats.")
+
+        mtot = _col('M_tot')
+        q_samples = _col('q_m')
+        K = _compute_kepler_prefactor(orbital_period_s)
+        a_samples = K * np.power(mtot, 1.0 / 3.0)
+        # M_X and M_RH are *derived* here, and only M_tot is informed by the
+        # light curve: q_m is exactly unidentifiable, so its posterior is its
+        # prior and the split inherits that width.
+        derived = [
+            ('a', a_samples),
+            ('M_RH', q_samples * mtot),
+            ('M_X', (1.0 - q_samples) * mtot),
+            ('d1', a_samples * q_samples),
+            ('d2', a_samples * (1.0 - q_samples)),
+        ]
     else:
         derived = []
 
@@ -1498,6 +1584,23 @@ def compute_statistics(
                 q_map = mrh_map / mtot_map
                 stats['a']['map'] = a_map
                 stats['q']['map'] = q_map
+                stats['d1']['map'] = a_map * q_map
+                stats['d2']['map'] = a_map * (1.0 - q_map)
+            elif mode == 'kepler_mtot':
+                frozen = (param_spec.frozen if param_spec is not None else {})
+
+                def _map_val(name):
+                    if name in param_names:
+                        return float(map_sample[param_names.index(name)])
+                    return float(frozen[name])
+
+                mtot_map = _map_val('M_tot')
+                q_map = _map_val('q_m')
+                a_map = _compute_kepler_prefactor(orbital_period_s) * (
+                    mtot_map ** (1.0 / 3.0))
+                stats['a']['map'] = a_map
+                stats['M_RH']['map'] = q_map * mtot_map
+                stats['M_X']['map'] = (1.0 - q_map) * mtot_map
                 stats['d1']['map'] = a_map * q_map
                 stats['d2']['map'] = a_map * (1.0 - q_map)
             stats['_map_meta'] = {
@@ -2574,11 +2677,13 @@ def run_single_fit(
     orbital_period_s = float(getattr(args, 'orbital_period', ORBITAL_PERIOD))
     wind_norm = sim_params.get('wind_norm', getattr(args, 'wind_norm', 'lam'))
     fit_fopacity = bool(getattr(args, 'fit_fopacity', False))
+    kepler_mtot = bool(getattr(args, 'kepler_mtot', False))
 
     param_spec = build_param_spec(
         likelihood=likelihood,
         reparam=reparam,
         kepler=kepler,
+        kepler_mtot=kepler_mtot,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
         fit_scatter=fit_scatter,
@@ -3210,6 +3315,18 @@ def main():
              "parameters for faster MCMC convergence."
     )
     parser.add_argument(
+        "--kepler-mtot",
+        action="store_true",
+        help="Kepler mode reparameterized as (M_tot, q_m) with q_m = M_RH/M_tot, "
+             "instead of (M_X, M_RH). Preferred when fitting masses: the light "
+             "curve constrains only M_tot (via a = K*M_tot^(1/3)), while q_m is "
+             "*exactly* unidentifiable, so sampling (M_X, M_RH) lays a flat "
+             "direction diagonally across both axes and mixes badly. Here the "
+             "flat direction is axis-aligned, q_m's posterior equals its prior, "
+             "and M_X / M_RH are reported as derived quantities. Freeze q_m to "
+             "drop the dead dimension. Mutually exclusive with --reparam/--kepler."
+    )
+    parser.add_argument(
         "--kepler",
         action="store_true",
         help="Sample (M_X, M_RH) and derive (a, q) from Kepler's third law and lever-arm. "
@@ -3464,6 +3581,11 @@ def main():
         ("q", None, REPARAM_PRIORS, "q = d1/(d1+d2) (mass-ratio proxy, --reparam only)"),
         ("MX", "prior_M_X", KEPLER_PRIORS, "compact-object mass M_X (Msun, --kepler only)"),
         ("MRH", "prior_M_RH", KEPLER_PRIORS, "companion mass M_RH (Msun, --kepler only)"),
+        ("Mtot", "prior_M_tot", KEPLER_MTOT_PRIORS,
+         "total mass M_tot (Msun, --kepler-mtot only); sets a = K*M_tot^(1/3)"),
+        ("qm", "prior_q_m", KEPLER_MTOT_PRIORS,
+         "mass ratio q_m = M_RH/M_tot (--kepler-mtot only); unidentifiable by "
+         "the light curve, so this prior IS the posterior"),
     ):
         d = prior_defs[dest[len("prior_"):] if dest else flag]
         prior_group.add_argument(
@@ -3530,8 +3652,14 @@ def main():
     if args.counts_per_bin is not None and args.counts_per_bin <= 0:
         parser.error("--counts-per-bin must be > 0.")
 
-    if args.reparam and getattr(args, 'kepler', False):
-        parser.error("--reparam and --kepler are mutually exclusive.")
+    _mode_flags = [
+        ('--reparam', bool(args.reparam)),
+        ('--kepler', bool(getattr(args, 'kepler', False))),
+        ('--kepler-mtot', bool(getattr(args, 'kepler_mtot', False))),
+    ]
+    _on = [name for name, on in _mode_flags if on]
+    if len(_on) > 1:
+        parser.error(f"{', '.join(_on)} are mutually exclusive.")
     if getattr(args, "smooth_sigma", 0.0) <= 0:
         parser.error("--smooth-sigma must be > 0.")
     if getattr(args, "smooth_n_mc", 0) < 0:
@@ -3567,9 +3695,13 @@ def main():
     # Build custom geometry priors
     reparam = getattr(args, 'reparam', False)
     kepler = bool(getattr(args, 'kepler', False))
-    priors = _default_priors(reparam, kepler)
+    kepler_mtot = bool(getattr(args, 'kepler_mtot', False))
+    priors = _default_priors(reparam, kepler, kepler_mtot)
     base_names, _ = get_mode_name_label(
-        'kepler' if kepler else ('reparam' if reparam else 'phys'))
+        'kepler_mtot' if kepler_mtot
+        else 'kepler' if kepler
+        else 'reparam' if reparam
+        else 'phys')
     priors.update(_parse_prior_overrides(parser, args, base_names))
 
     # Wind-shape overrides are always parsed; they are only applied when
@@ -3605,6 +3737,7 @@ def main():
             orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
             wind_norm=wind_norm,
             fit_fopacity=fit_fopacity,
+            kepler_mtot=kepler_mtot,
         )
     except Exception as e:
         parser.error(str(e))
@@ -3791,10 +3924,20 @@ def main():
             active_names, _ = get_param_config(
                 likelihood, reparam=reparam,
                 kepler=kepler,
+                kepler_mtot=kepler_mtot,
                 wind_model=args.wind_model, fit_wind_shape=fit_wind_shape,
                 fit_scatter=fit_scatter,
                 frozen=getattr(args, 'frozen_params', {}),
                 orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
+                wind_norm=wind_norm,
+                fit_fopacity=fit_fopacity,
+            )
+            # Derived rows to print per mode. kepler_mtot reports the masses as
+            # derived, since only M_tot is informed by the light curve.
+            derived_names = (
+                ('a', 'M_X', 'M_RH', 'd1', 'd2') if kepler_mtot
+                else ('d1', 'd2') if (reparam or kepler)
+                else ()
             )
             for key, stats in all_results.items():
                 band, wind_model = key
@@ -3828,8 +3971,8 @@ def main():
                         if ('mean' in s) and ('std' in s):
                             f.write(f"  [mean={_fmt_val(s['mean'])}, std={_fmt_val(s['std'])}]")
                         f.write("\n")
-                if reparam or kepler:
-                    for derived in ('d1', 'd2'):
+                if derived_names:
+                    for derived in derived_names:
                         if derived in stats:
                             s = stats[derived]
                             f.write(f"  {derived} (derived): {_fmt_val(s['median'])} "
@@ -3851,14 +3994,15 @@ def main():
                     for param in active_names:
                         if param in stats and 'map' in stats[param]:
                             f.write(f"  {param}: {_fmt_val(stats[param]['map'])}\n")
-                    if reparam or kepler:
-                        for derived in ('d1', 'd2'):
+                    if derived_names:
+                        for derived in derived_names:
                             if derived in stats and 'map' in stats[derived]:
                                 f.write(
                                     f"  {derived} (derived): "
                                     f"{_fmt_val(stats[derived]['map'])}\n"
                                 )
-                    if (reparam or kepler) and all(k in stats for k in ('a', 'q', 'd1', 'd2')):
+                    if (reparam or kepler) and all(
+                            k in stats for k in ('a', 'q', 'd1', 'd2')):
                         a_map = stats['a']['map']
                         d1_map = stats['d1']['map']
                         d2_map = stats['d2']['map']
