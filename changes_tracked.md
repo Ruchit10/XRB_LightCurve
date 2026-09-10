@@ -37,9 +37,10 @@ fitting, and inference stack since the original R port.
 28. [Phase 27 — Standard Inclination Convention at the Public API](#phase-27--standard-inclination-convention-at-the-public-api)
 29. [Phase 28 — Physical Wind Normalization & Per-Cell Flux Conversion](#phase-28--physical-wind-normalization--per-cell-flux-conversion)
 30. [Phase 29 — Mass Reparameterization & Error-Column Fix](#phase-29--mass-reparameterization--error-column-fix)
-31. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
-32. [Current File Inventory](#current-file-inventory)
-33. [Current Status & Quick Commands](#current-status--quick-commands)
+31. [Phase 30 — Physical Norm in the Single-Model CLI, Model-LC Dump & χ²_eff Fix](#phase-30--physical-norm-in-the-single-model-cli-model-lc-dump--χ_eff-fix)
+32. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
+33. [Current File Inventory](#current-file-inventory)
+34. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -1661,6 +1662,123 @@ explicitly (`.../broad` for all, `.../broad/single` for one). Note there are
 
 ---
 
+## Phase 30 — Physical Norm in the Single-Model CLI, Model-LC Dump & χ²_eff Fix
+
+### Physical normalization was unreachable from `xrb_lightcurve.py`
+
+`simulate_lightcurve()` has accepted `wind_norm` / `mdot` / `v_inf` /
+`mu_wind` / `f_opacity` since Phase 28, but the script's argument parser never
+exposed them, so a physical-norm light curve could only be produced by going
+through a full MCMC. (The MCMC does not use this CLI at all:
+`DirectLightCurveModel.evaluate()` calls `simulate_lightcurve()` directly as a
+Python function, reading `wind_norm`/`mdot`/`v_inf`/`mu_wind` from its
+`sim_params` dict and passing `f_opacity` per sample from `log_fopa`.)
+
+Added `--wind-norm {lam,physical}` (default `lam`), `--mdot`, `--v-inf`,
+`--mu-wind`, `--f-opacity`, wired through to `simulate_lightcurve` and echoed
+in the parameter banner (only the fields relevant to the active mode).
+
+```bash
+python xrb_lightcurve.py --wind-norm physical \
+    --mdot 4e-6 --v-inf 1750 --f-opacity 0.03 \
+    --r 1.4 --R 2.0 --d1 12.2 --d2 8.1 --i0 82 --dth 1 --d2h 6 \
+    --wind-model smooth_pl --Rb 12 --p 6.7 --Delta 2 \
+    --flux_method interpolate --flux_csv flux_vs_nH_tbabs_broad.csv \
+    --output lc_physical.csv
+```
+
+### `--Rmax` silently degraded physical mode
+
+The CLI auto-set `--Rmax = 2*(d1+d2)` when omitted, and a *fixed* `Rmax`
+disables the numba mega-kernel — the only path that returns the per-cell
+columns Phase 28 relies on. Physical mode was therefore falling back (with a
+warning that is easy to miss) to converting the **mean** column, which badly
+understates eclipse-core leakage.
+
+The auto-default now applies only under `--wind-norm lam`, preserving legacy
+behaviour exactly (`Rmax = 40.6` for the reference geometry, `mean(fl)`
+reproduced to all printed digits). Under `--wind-norm physical`, `Rmax` is left
+adaptive so the mega-kernel is used, and passing `--Rmax` explicitly prints a
+warning. The adaptive limits integrate the full z-tail, so this is strictly
+more accurate as well as faster.
+
+**Timing** (single LC, `dth=1`, `d2h=6`): lam/default **1.36 s**, lam +
+`--converge-rmax` **1.25 s**, physical **1.19 s**. Physical mode is marginally
+*faster* because it now takes the mega-kernel path.
+
+### Best-fit model light curve as text
+
+Every MCMC fit now writes `{band}_{wind}_bestfit_model.txt` beside
+`_bestfit.png`, so the best-fit curve is usable outside the figure without
+re-deriving the point estimate from the chain.
+
+A `#` header records the point-estimate type (MAP or median), the
+parameterization, `wind_norm`, χ²/dof and dof, jitter `f` and χ²_eff/dof, the
+applied phase shift, every sampled and frozen parameter, the derived geometry
+(`d1, d2, a, q, r, R, i0`, plus `M_X`/`M_RH`/`M_tot` where they exist), the
+resolved wind-shape parameters, `f_opacity` and `f_scatter` — enough to
+reproduce the curve from the file alone. Then two whitespace-delimited tables:
+
+| Block | Rows | Columns |
+| ----- | ---- | ------- |
+| 1 — dense model curve | 359 | `phase`, `model_flux` |
+| 2 — observed bins vs model | one per bin | `phase`, `obs_flux`, `obs_err`, `model_flux`, `resid_sigma` |
+
+Block 1 is already shifted into the observed frame. Both read with
+`np.genfromtxt(..., names=True)` after slicing to the block. The model grid
+spans phase 0 and 1 inclusive, so wrapping it through the phase shift leaves a
+redundant abscissa (the two copies differ only at bit level, and printed
+identically at `%.8f`); it is dropped with a 1e-9 tolerance, orders of
+magnitude below the ~1/360 grid spacing, leaving 359 strictly increasing rows.
+
+### Per-parameter autocorrelation times
+
+`mcmc_summary.txt` keeps its min/median/max line and adds a per-parameter
+breakdown, with the number of τ contained in the chain and a convergence flag,
+so a single badly-mixing dimension is attributable instead of hidden inside the
+maximum:
+
+```
+  autocorr_time_steps per parameter:
+    M_tot: 7.91  (7.6 tau in chain, <50 -> unconverged)
+    q_m: 7.37  (8.1 tau in chain, <50 -> unconverged)
+    ...
+```
+
+### χ²_eff was wrong by ~9 orders of magnitude
+
+Surfaced while writing the model-LC header: a jitter run reported
+`chi2_eff/dof = 6.87e-10`. Recomputing from the written Block 2 table gives
+**1.4768**.
+
+The cause is `sigma2 = np.maximum(sigma2, np.finfo(float).eps)`. That imposes
+an **absolute** floor of 2.2e-16 on a flux variance of order 1e-25, so it
+clamped *every* bin to the floor and deflated χ²_eff by ~9 dex. It is the same
+class of mistake already documented in the walker-init code for `f_scatter`
+("an absolute epsilon exceeded f_scatter's entire range"); these two sites
+never got the fix. Both now use a positivity-only guard (`np.finfo(float).tiny`),
+which is all that is needed since `sigma2` is a sum of squares.
+
+**The likelihood itself was never affected.** `log_likelihood_jitter` uses
+`sigma2` directly with no clamp, so existing fits, chains and posteriors are
+valid — only the reported χ²_eff/dof diagnostic was wrong, at both the
+per-sample χ² path and the best-fit overlay. Now reads 1.19 on a smoke run.
+
+### Verification (conda env `henv`)
+
+- `lam` mode unchanged through the CLI: `mean(fl)` reproduces `--lam` exactly
+  and `Rmax` still defaults to `2*(d1+d2)`.
+- Physical mode through the CLI runs on the mega-kernel with no fallback
+  warning; `N_H` and eclipse depth as expected.
+- All four parameterizations (`phys`, `--reparam`, `--kepler`,
+  `--kepler-mtot`) run end-to-end, each writing `_bestfit_model.txt` and a
+  per-parameter τ block.
+- Block 1 verified 359 rows and strictly increasing as printed; both blocks
+  round-trip through `np.genfromtxt(names=True)`.
+- `xrb_lightcurve.py --help` and `utils/test_flux_methods.py` pass.
+
+---
+
 ## Side Investigation — Reference Epoch Recalibration
 
 Plan: `reference_epoch_recalibration_ae1cf98a.plan.md`.
@@ -1797,6 +1915,16 @@ python xrb_lightcurve.py --flux_method interpolate \
     --wind-model smooth_pl --Rb 5 --p 4 --Delta 1 \
     --i0 12.0 --lam 0.572385 --output sim_broad.csv
 
+# Simulate one light curve with the physical wind normalization (no MCMC
+# needed). R is the true photosphere here and the eclipse comes from wind
+# opacity; leave --Rmax unset so the per-cell mega-kernel path is used.
+python xrb_lightcurve.py --wind-norm physical \
+    --mdot 4e-6 --v-inf 1750 --f-opacity 0.03 \
+    --r 1.4 --R 2.0 --d1 12.2 --d2 8.1 --i0 82 --dth 1 --d2h 6 \
+    --wind-model smooth_pl --Rb 12 --p 6.7 --Delta 2 \
+    --flux_method interpolate --flux_csv flux_vs_nH_tbabs_broad.csv \
+    --output lc_physical.csv
+
 # Single-model χ² fit + smoothed overlay + residual panel
 python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \
     --obs-column flux_t --time-column t_raw \
@@ -1882,5 +2010,5 @@ Gaussian smoothing, `f_scatter`, and residual panels — is implemented in
 
 ---
 
-**Last Updated:** September 7, 2026  
+**Last Updated:** September 9, 2026  
 **Maintainer:** R. Panchal

@@ -66,6 +66,7 @@ import copy
 from dataclasses import dataclass, field
 import multiprocessing as mp
 import os
+import re
 import time
 import warnings
 from typing import Tuple, List, Dict, Optional
@@ -1839,7 +1840,11 @@ def compute_chi2_for_samples(
                     idx_logf = active_names.index('log_f')
                     f = np.exp(sample_params[idx_logf])
                     sigma2 = obs_err2 + (f * model_flux) ** 2
-                    sigma2 = np.maximum(sigma2, np.finfo(float).eps)
+                    # Positivity guard only. An absolute floor of eps (2.2e-16)
+                    # is enormous next to a flux variance of order 1e-25 and
+                    # clamped every bin, deflating chi2_eff by ~9 orders of
+                    # magnitude. sigma2 is a sum of squares, so tiny suffices.
+                    sigma2 = np.maximum(sigma2, np.finfo(float).tiny)
                     chi2_eff = np.sum((obs_flux - model_flux) ** 2 / sigma2)
                     red_chi2_eff = chi2_eff / dof if dof > 0 else np.nan
             else:
@@ -2061,7 +2066,9 @@ def plot_best_fit(
     if likelihood == 'jitter' and 'log_f' in stats and point_key in stats['log_f']:
         f_best = float(np.exp(stats['log_f'][point_key]))
         sigma2 = obs_err ** 2 + (f_best * obs_model) ** 2
-        sigma2 = np.maximum(sigma2, np.finfo(float).eps)
+        # Positivity guard only -- see the note in the per-sample chi2 path; an
+        # absolute eps floor swamps a flux variance of order 1e-25.
+        sigma2 = np.maximum(sigma2, np.finfo(float).tiny)
         chi2_eff = np.sum((obs_flux - obs_model) ** 2 / sigma2)
     chi2 = chi2_obs
     n_phys = len(param_names) - (1 if 'log_f' in param_names else 0)
@@ -2111,7 +2118,153 @@ def plot_best_fit(
 
     print(f"Best-fit plot saved to: {output_path}")
 
+    # Companion text dump of the drawn curve, so the best-fit model light curve
+    # is usable outside the plot (overplotting, further analysis) without
+    # re-deriving the point estimate from the chain.
+    model_txt_path = re.sub(r'\.png$', '', str(output_path)) + "_model.txt"
+    try:
+        _write_bestfit_model_txt(
+            model_txt_path,
+            overlay_phase=overlay_phase,
+            model_flux=model_flux,
+            obs_phase=obs_phase,
+            obs_flux=obs_flux,
+            obs_err=obs_err,
+            obs_model=obs_model,
+            theta_best=theta_best,
+            param_names=param_names,
+            param_spec=param_spec,
+            stats=stats,
+            point_key=point_key,
+            band=band,
+            wind_model=wind_model,
+            red_chi2=red_chi2,
+            dof=dof,
+            best_phase_shift=(best_phase_shift if fit_phase_shift else 0.0),
+            f_best=f_best,
+            red_chi2_eff=red_chi2_eff,
+            f_scatter_best=f_scatter_best,
+        )
+        print(f"Best-fit model light curve saved to: {model_txt_path}")
+    except Exception as e:
+        warnings.warn(f"Could not write best-fit model light curve: {e}")
+
     return red_chi2
+
+
+def _write_bestfit_model_txt(
+    path: str,
+    *,
+    overlay_phase: np.ndarray,
+    model_flux: np.ndarray,
+    obs_phase: np.ndarray,
+    obs_flux: np.ndarray,
+    obs_err: np.ndarray,
+    obs_model: np.ndarray,
+    theta_best: np.ndarray,
+    param_names: List[str],
+    param_spec: Optional[ParamSpec],
+    stats: Dict,
+    point_key: str,
+    band: str,
+    wind_model: str,
+    red_chi2: float,
+    dof: int,
+    best_phase_shift: float,
+    f_best: Optional[float],
+    red_chi2_eff: float,
+    f_scatter_best: float,
+) -> None:
+    """Write the best-fit model light curve, with a reproducible header.
+
+    Two blocks: the dense model curve on the plotting grid, then the observed
+    bins with the model evaluated at their phases and the normalized residual.
+    Both are plain whitespace-delimited tables under ``#`` comments, so
+    ``np.genfromtxt(..., names=True)`` reads either after selecting its rows.
+    """
+    frozen = dict(param_spec.frozen) if param_spec is not None else {}
+    mode = param_spec.mode if param_spec is not None else 'phys'
+
+    d1, d2, r_val, R_val, i0_val = _resolve_geom(
+        np.asarray(theta_best, dtype=float),
+        active_names=list(param_names), param_spec=param_spec,
+    )
+    wind_params = _resolve_shape(
+        theta=np.asarray(theta_best, dtype=float), R_value=R_val,
+        active_names=list(param_names), wind_model=wind_model,
+        fit_wind_shape=(param_spec.fit_wind_shape if param_spec else False),
+        frozen=frozen,
+    )
+    f_opacity = _resolve_fopacity(
+        np.asarray(theta_best, dtype=float), list(param_names), param_spec)
+
+    order = np.argsort(np.asarray(overlay_phase, dtype=float))
+    mp = np.asarray(overlay_phase, dtype=float)[order]
+    mf = np.asarray(model_flux, dtype=float)[order]
+    # The model grid spans phase 0 and 1 inclusive, so wrapping it through the
+    # phase shift leaves a redundant abscissa that would break downstream
+    # interpolation. The two copies differ only at bit level, hence the
+    # tolerance -- it is orders of magnitude below the ~1/360 grid spacing, so
+    # it can only ever catch the wrap duplicate.
+    if mp.size > 1:
+        keep = np.concatenate(([True], np.diff(mp) > 1e-9))
+        mp, mf = mp[keep], mf[keep]
+
+    with open(path, 'w') as f:
+        f.write(f"# Best-fit model light curve -- {band.upper()} band, "
+                f"{WIND_MODELS.get(wind_model, wind_model)}\n")
+        f.write(f"# point_estimate: {'MAP' if point_key == 'map' else 'median'}\n")
+        f.write(f"# parameterization: {mode}\n")
+        if param_spec is not None:
+            f.write(f"# wind_norm: {param_spec.wind_norm}\n")
+        f.write(f"# chi2/dof: {red_chi2:.6g}  (dof = {dof})\n")
+        if f_best is not None:
+            f.write(f"# jitter f: {f_best:.6g}")
+            if np.isfinite(red_chi2_eff):
+                f.write(f"   chi2_eff/dof: {red_chi2_eff:.6g}")
+            f.write("\n")
+        f.write(f"# phase_shift applied to model: {best_phase_shift:.6f}\n")
+        f.write("#\n# Sampled parameters at this point estimate:\n")
+        for name, val in zip(param_names, np.asarray(theta_best, dtype=float)):
+            f.write(f"#   {name} = {val:.8g}\n")
+        if frozen:
+            f.write("# Frozen parameters:\n")
+            for name, val in sorted(frozen.items()):
+                f.write(f"#   {name} = {float(val):.8g}\n")
+        f.write("# Derived geometry:\n")
+        for name, val in (('d1', d1), ('d2', d2), ('a', d1 + d2),
+                          ('q', d1 / (d1 + d2) if (d1 + d2) else np.nan),
+                          ('r', r_val), ('R', R_val), ('i0_deg', i0_val)):
+            f.write(f"#   {name} = {float(val):.8g}\n")
+        for extra in ('M_X', 'M_RH', 'M_tot'):
+            if extra in stats and point_key in stats[extra]:
+                f.write(f"#   {extra} = {float(stats[extra][point_key]):.8g}\n")
+        if wind_params:
+            f.write("# Wind shape parameters:\n")
+            for name, val in sorted(wind_params.items()):
+                f.write(f"#   {name} = {float(val):.8g}\n")
+        if f_opacity is not None:
+            f.write(f"#   f_opacity = {float(f_opacity):.8g}\n")
+        f.write(f"#   f_scatter = {float(f_scatter_best):.8g}\n")
+        f.write("#\n")
+        f.write("# --- BLOCK 1: dense model curve (phase already shifted to the "
+                "observed frame) ---\n")
+        f.write("phase model_flux\n")
+        for p_val, flux_val in zip(mp, mf):
+            f.write(f"{p_val:.8f} {flux_val:.8e}\n")
+
+        obs_phase = np.asarray(obs_phase, dtype=float)
+        obs_model = np.asarray(obs_model, dtype=float)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            resid = (np.asarray(obs_flux, dtype=float) - obs_model) / np.asarray(
+                obs_err, dtype=float)
+        o = np.argsort(obs_phase)
+        f.write("#\n# --- BLOCK 2: observed bins vs model ---\n")
+        f.write("phase obs_flux obs_err model_flux resid_sigma\n")
+        for idx in o:
+            f.write(f"{obs_phase[idx]:.8f} {float(obs_flux[idx]):.8e} "
+                    f"{float(obs_err[idx]):.8e} {obs_model[idx]:.8e} "
+                    f"{resid[idx]:.6f}\n")
 
 
 def plot_geometry_diagnostics(
@@ -4042,6 +4195,21 @@ def main():
                                 f"  autocorr_time_steps: min={np.min(tau_vals):.2f}, "
                                 f"median={np.median(tau_vals):.2f}, max={np.max(tau_vals):.2f}\n"
                             )
+                        # Per-parameter tau, so a single badly-mixing dimension
+                        # is attributable instead of hidden in the max.
+                        n_steps_run = run_meta.get('n_steps')
+                        f.write("  autocorr_time_steps per parameter:\n")
+                        for pname, tau_v in diag['autocorr_time'].items():
+                            tau_f = float(tau_v)
+                            if not np.isfinite(tau_f) or tau_f <= 0:
+                                f.write(f"    {pname}: n/a\n")
+                                continue
+                            note = ""
+                            if n_steps_run:
+                                n_tau = float(n_steps_run) / tau_f
+                                note = f"  ({n_tau:.1f} tau in chain"
+                                note += ", OK)" if n_tau >= 50 else ", <50 -> unconverged)"
+                            f.write(f"    {pname}: {tau_f:.2f}{note}\n")
                     if diag.get('effective_independent_samples') is not None:
                         f.write(
                             f"  effective_independent_samples: "

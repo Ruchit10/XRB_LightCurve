@@ -2141,7 +2141,52 @@ def main():
         type=float,
         default=0.589537,
         help="Target mean nH in 1e22 cm^-2 units. The raw wind integral is "
-        "scaled so that mean(fl) = lam. Default: 0.589537.",
+        "scaled so that mean(fl) = lam. Only used with --wind-norm lam. "
+        "Default: 0.589537.",
+    )
+    parser.add_argument(
+        "--wind-norm",
+        type=str,
+        choices=["lam", "physical"],
+        default="lam",
+        help="How the wind LOS integral becomes an absolute N_H. 'lam' "
+        "(default) rescales so mean(fl) = --lam, which discards the absolute "
+        "column and leaves the light curve dependent only on ratios (R/a, "
+        "r/a, Rb/a). 'physical' fixes the density from --mdot / --v-inf so the "
+        "column carries real units, the eclipse is produced by wind opacity "
+        "rather than the geometric cutoff, and R means the true photosphere.",
+    )
+    parser.add_argument(
+        "--mdot",
+        type=float,
+        default=4.0e-6,
+        help="WR mass-loss rate in Msun/yr, used only with --wind-norm "
+        "physical. Default 4e-6 (Clark & Crowther 2004, clumping-corrected).",
+    )
+    parser.add_argument(
+        "--v-inf",
+        type=float,
+        default=1750.0,
+        help="Wind terminal velocity in km/s, used only with --wind-norm "
+        "physical. Default 1750 (Clark & Crowther 2004).",
+    )
+    parser.add_argument(
+        "--mu-wind",
+        type=float,
+        default=MU_WIND_DEFAULT,
+        help="Mean mass per hydrogen-equivalent nucleus, converting the wind "
+        "mass column into the N_H that the solar-abundance TBabs flux_vs_nH "
+        f"table expects. Default {MU_WIND_DEFAULT}.",
+    )
+    parser.add_argument(
+        "--f-opacity",
+        type=float,
+        default=1.0,
+        help="Effective-opacity factor applied to the Mdot-derived column "
+        "(only with --wind-norm physical). Absorbs wind photoionization, "
+        "clumping and WR abundance departures. Clark & Crowther's Mdot "
+        "overpredicts the observed N_H by ~1.5-2 dex, so values around "
+        "0.01-0.03 reproduce IC 10 X-1. Default 1.0 (no correction).",
     )
     parser.add_argument(
         "--wind-model",
@@ -2202,10 +2247,22 @@ def main():
 
     args = parser.parse_args()
 
-    # Default physical cutoff reproduces legacy behavior
-    if args.Rmax is None:
+    # Default physical cutoff reproduces legacy behavior. Not applied under
+    # --wind-norm physical: a fixed Rmax disables the numba mega-kernel, which
+    # is the only path that returns per-cell columns, and without those the
+    # nonlinear nH -> flux conversion degrades to converting the *mean* column
+    # and badly understates eclipse-core leakage. The adaptive limits used
+    # instead integrate the full z-tail, which is strictly more accurate.
+    if args.Rmax is None and args.wind_norm == "lam":
         args.Rmax = 2.0 * (args.d1 + args.d2)
-    
+    if args.Rmax is not None and args.wind_norm == "physical" and not args.converge_rmax:
+        print(
+            "\n[warn] --Rmax with --wind-norm physical disables the per-cell "
+            "flux conversion (mega-kernel off). Drop --Rmax or add "
+            "--converge-rmax for the accurate eclipse core.\n"
+        )
+
+
     # Validate arguments
     if args.flux_method in ["interpolate", "refit"] and args.flux_csv is None:
         parser.error(f"--flux_csv is required when flux_method='{args.flux_method}'")
@@ -2241,7 +2298,14 @@ def main():
     if args.flux_csv:
         print(f"  flux_csv: {args.flux_csv}")
         print(f"  flux_type: {args.flux_type}")
-    print(f"  lam: {args.lam}")
+    print(f"  wind_norm: {args.wind_norm}")
+    if args.wind_norm == "lam":
+        print(f"  lam: {args.lam}")
+    else:
+        print(f"  mdot: {args.mdot} Msun/yr")
+        print(f"  v_inf: {args.v_inf} km/s")
+        print(f"  mu_wind: {args.mu_wind}")
+        print(f"  f_opacity: {args.f_opacity}")
     print(f"  wind_model: {args.wind_model}")
     print(f"  wind_params: {wind_params}")
     print(f"  Output file: {args.output}")
@@ -2268,6 +2332,11 @@ def main():
         converge_rmax=args.converge_rmax,
         wind_model=args.wind_model,
         wind_params=wind_params,
+        wind_norm=args.wind_norm,
+        mdot=args.mdot,
+        v_inf=args.v_inf,
+        mu_wind=args.mu_wind,
+        f_opacity=args.f_opacity,
     )
 
     # Save results
