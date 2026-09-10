@@ -105,6 +105,31 @@ def band_label_from_column(column: str) -> str:
     return col
 
 
+# Energy-band display names and ranges (keV), for plot titles/legends.
+BAND_INFO: Dict[str, Tuple[str, str]] = {
+    "ultrasoft": ("Ultra-soft", "0.2-0.5 keV"),
+    "soft": ("Soft", "0.5-2 keV"),
+    "medium": ("Medium", "1.2-2.0 keV"),
+    "hard": ("Hard", "2.0-7.0 keV"),
+    "broad": ("Broad", "0.5-7.0 keV"),
+}
+
+
+def detect_energy_bands(df: pd.DataFrame) -> List[str]:
+    """Energy-band names present as ``nfl_{band}`` columns, in physical order."""
+    bands = {c[len("nfl_"):] for c in df.columns
+             if c.startswith("nfl_") and len(c) > len("nfl_")}
+    ordered = [b for b in BAND_INFO if b in bands]
+    return ordered + sorted(bands - set(ordered))
+
+
+def get_band_display_name(band: str) -> Tuple[str, str]:
+    """``(display_name, energy_range)`` for a band; range is '' if unknown."""
+    if band in BAND_INFO:
+        return BAND_INFO[band]
+    return (band.replace("_", " ").title(), "")
+
+
 def detect_flux_columns(df: pd.DataFrame) -> List[str]:
     """Detect available flux columns in simulation DataFrame.
 
@@ -364,33 +389,57 @@ def read_observation(
                                 error_col = col
                                 break
 
+                    obs_upper = actual_obs_column.upper()
+                    # Whether the observable *is* the count rate. rate_err
+                    # measures the rate, so it may only be used directly in that
+                    # case; for a proportional column such as flux_t it has the
+                    # wrong scale and must be converted by
+                    # _derive_err_from_rate_err instead.
+                    obs_is_rate = obs_upper in {"RATE", "COUNT_RATE", "NET_RATE"}
+
                     if not error_col:
-                        # Auto-detect error column
-                        possible_error_cols = [
-                            f"{actual_obs_column}_ERR",
-                            f"ERR_{actual_obs_column}",
-                            actual_obs_column.replace("RATE", "ERR_RATE").replace("FLUX", "FLUX_ERR"),
-                            # For CIAO format, try rate_err and count_rate_err
-                            "rate_err",
-                            "count_rate_err",
+                        # Auto-detect an error column belonging to *this*
+                        # observable. Candidates are matched case-insensitively
+                        # and a candidate equal to the observable is always
+                        # skipped: the previous case-sensitive
+                        # .replace("FLUX", "FLUX_ERR") was a no-op on a
+                        # lower-case name, so "flux_t" matched its own column
+                        # and errors were silently set equal to the flux
+                        # (~3x too large after inverse-variance binning, and
+                        # chi2 too small by ~an order of magnitude).
+                        candidates = [
+                            f"{obs_upper}_ERR",
+                            f"ERR_{obs_upper}",
+                            obs_upper.replace("RATE", "ERR_RATE"),
+                            obs_upper.replace("FLUX", "FLUX_ERR"),
                         ]
-                        for err_col in possible_error_cols:
+                        if obs_is_rate:
+                            candidates += ["RATE_ERR", "ERR_RATE", "COUNT_RATE_ERR"]
+
+                        seen = set()
+                        for err_name in candidates:
+                            if err_name == obs_upper or err_name in seen:
+                                continue
+                            seen.add(err_name)
                             for col in df.columns:
-                                if col.upper() == err_col.upper():
+                                if col.upper() == err_name:
                                     error_col = col
                                     break
                             if error_col:
                                 break
 
-                        # Also try case-insensitive matching for generic error columns
+                        # Generic fallback: any *_ERR column naming this
+                        # observable. Deliberately does not accept a bare
+                        # rate_err for a non-rate observable.
                         if not error_col:
+                            obs_base = obs_upper.split('_')[0]
                             for col in df.columns:
-                                if 'ERR' in col.upper():
-                                    # Prefer error column related to the obs column
-                                    obs_base = actual_obs_column.split('_')[0].upper()
-                                    if obs_base in col.upper() or 'RATE' in col.upper():
-                                        error_col = col
-                                        break
+                                col_upper = col.upper()
+                                if col_upper == obs_upper or 'ERR' not in col_upper:
+                                    continue
+                                if obs_base and obs_base in col_upper:
+                                    error_col = col
+                                    break
 
                     if error_col:
                         result_df['error'] = df[error_col]
@@ -1292,6 +1341,11 @@ RUN_CONFIG_SUFFIX = "_run_config.json"
 # config was found, not by what the original run typed.
 _RUN_CONFIG_NEVER_RESTORE = frozenset({"replot", "output_dir"})
 
+# Stamped into every new run config. i0 was formerly measured from the line of
+# sight, so a chain written before the switch stores the complement of what the
+# priors and plots now mean; --replot cannot detect that from the numbers alone.
+INCLINATION_CONVENTION = "i0-from-orbital-normal"
+
 
 def _jsonable(value):
     """Best-effort conversion of an argparse value into JSON-representable form."""
@@ -1321,6 +1375,7 @@ def save_run_config(output_dir: str, band: str, wind_model: str, args) -> Option
         "command": shlex.join(sys.argv),
         "band": band,
         "wind_model": wind_model,
+        "inclination_convention": INCLINATION_CONVENTION,
         "args": {k: _jsonable(v) for k, v in sorted(vars(args).items())},
     }
     try:
@@ -1436,6 +1491,16 @@ def apply_saved_run_config(
     if not isinstance(saved_args, dict):
         warnings.warn(f"Run config {config_path} has no 'args' block; ignoring.")
         return None
+
+    if config.get("inclination_convention") != INCLINATION_CONVENTION:
+        warnings.warn(
+            f"{os.path.basename(config_path)} predates the inclination convention "
+            f"change: its i0 samples and --prior-i0 are measured from the line of "
+            f"sight, whereas i0 is now measured from the orbital-plane normal "
+            f"(90 deg = edge-on). Its i0 values mean the complement of what the "
+            f"model now expects, so any chi2 reported from this chain is "
+            f"meaningless. Refit before trusting the output."
+        )
 
     # dest -> the flag the user would type ('prior_M_X' is spelled '--prior-MX').
     dest_to_flag: Dict[str, str] = {}

@@ -44,7 +44,9 @@ nuisance parameters.
 
 **System working values:** compact-object/disk radius `r ≈ 0.001 R☉`, companion
 radius `R ≈ 2 R☉`, `d1 ≈ 11 R☉`, `d2 ≈ 8 R☉` (separation `a = d1 + d2 ≈ 19 R☉`),
-inclination `i₀ ≈ 26°`, orbital period `P = 125431 s ≈ 1.45 d`.
+inclination `i₀ ≈ 64°` (standard convention, from the orbital-plane normal —
+equivalently 26° from the line of sight, which is how the geometry kernels
+measure it), orbital period `P = 125431 s ≈ 1.45 d`.
 
 **Adopted spectral model:** `TBabs × powerlaw` with `nH ≈ 0.75×10²² cm⁻²`,
 `Γ ≈ 1.86`, `χ²_red ≈ 1.52` (preferred over `phabs` by `Δχ² ≈ 8.5`).
@@ -74,7 +76,9 @@ FITS light curves ──► utils/  ──►  data/…/*.txt      (time, counts
                              periodic model interpolation, fit_simulation
         utils/plot_utils.py  plot_lightcurve_fit  ← the one drawing routine
                              (+ plot_phase / plot_multi_column_fits /
-                              plot_corner / plot_trace / add_residual_panel)
+                              plot_corner / plot_trace / add_residual_panel /
+                              plot_orbit_geometry / plot_geometry_vs_phase /
+                              plot_wind_profile / plot_simulation_bands)
 ```
 
 Neither analysis script imports the other. Everything they share lives in
@@ -99,7 +103,10 @@ Neither analysis script imports the other. Everything they share lives in
   it arrays: `plot_best_fit` resolves the posterior point estimate and the
   per-sample phase shift; `plot_phase` interpolates a simulation CSV. Because
   both routes end in one function, the data, overlay, smoothed curve, residual
-  panel and title χ²/dof cannot drift apart.
+  panel and title χ²/dof cannot drift apart. It also holds the geometry figures
+  (`plot_orbit_geometry`, `plot_geometry_vs_phase`, `plot_wind_profile`) and the
+  per-band simulation grid (`plot_simulation_bands`), which `plot_results.py`
+  and `mcmc_lightcurve_fit.py` both drive.
 
 `chandra_phase_analysis.py` is now only the CLI (≈460 lines, down from ~1640)
 and re-exports every moved name, so `from chandra_phase_analysis import *` — the
@@ -188,7 +195,7 @@ which is what makes direct-evaluation MCMC feasible.
 
 ```python
 simulate_lightcurve(
-    r=0.001, R=2.0, d1=11.0, d2=8.0, gma0=-90.0, i0=26.0,
+    r=0.001, R=2.0, d1=11.0, d2=8.0, gma0=-90.0, i0=64.0,
     dth=1.0, d2h=6.0, dz=0.5,
     flux_method="legacy", flux_csv_path=None, flux_type="erg",
     lam=0.589537,
@@ -198,6 +205,16 @@ simulate_lightcurve(
     verbose=False, n_jobs=1,
 ) -> pd.DataFrame
 ```
+
+**Inclination convention.** `i0` is the standard astronomical inclination:
+degrees from the orbital-plane normal, so `i0 = 90°` is edge-on (eclipses
+possible) and `i0 = 0°` is face-on (the orbit lies in the plane of the sky and
+never eclipses). The geometry kernels (`_simulate_phases_numba`,
+`wind_los_integral`) instead measure `incl` from the *line of sight*, because
+that is the angle appearing directly in `h = a·sin(γ)·sin(incl)` (sky-plane) and
+`z = a·sin(γ)·cos(incl)` (along the LOS). `simulate_lightcurve` bridges the two
+with `inclination_to_internal_rad(i0) = (90 − i0)·π/180`, at the input boundary
+only — no geometry expression changed.
 
 Output columns:
 
@@ -586,6 +603,29 @@ All three live in `utils/plot_utils.py`.
 
 - `plot_corner` — posterior corner plot with 16/50/84 quantiles.
 - `plot_trace` — per-parameter walker traces with the burn-in marker.
+- `plot_geometry_diagnostics` — three geometry figures at the point estimate,
+  from one extra `simulate_lightcurve` call (skip with `--no-geometry-plots`):
+  - **`*_geometry_orbit.png`** — the projected orbit against the companion disk,
+    plus a to-scale top-down view. `(L3, h3)` from the simulation *are* the
+    sky-plane coordinates of the compact object relative to the companion
+    centre, so this is exact, not a sketch. The eclipse width constrains a
+    *combination* of `(a, R, i0)`, so this is where an implausible-but-well-
+    fitting parameter set becomes obvious; the footer states the numeric verdict
+    (`min projected separation` vs `R ± r` → total / partial / no eclipse).
+  - **`*_geometry_phase.png`** — projected separation `l3(φ)` against the
+    `R ± r` thresholds with the eclipse shaded, the sky-plane components
+    (`h > 0` ⇒ emitter behind, which is what gates the eclipse test),
+    `N_H(φ)` with its orbit mean (should equal `lam`), and the band flux. Turns
+    the eclipse from an emergent light-curve feature into a stated geometric
+    condition with visible margin.
+  - **`*_wind_profile.png`** — `g(r)` with 68/95% posterior credible bands, an
+    `r⁻²` reference, the companion surface, characteristic radii (`Rb`/`H`/`ell`)
+    and — the important part — the band of radii the line of sight actually
+    probes. That band is `[min l3, max l3]`: the LOS impact parameter relative
+    to the companion centre *equals* the projected separation, so the profile
+    inside `min l3` is unconstrained by the data. Shape parameters are only
+    interpretable jointly (`Rb` and `p` trade off strongly), so the constraint
+    reads far more clearly here than in a corner plot.
 - `plot_best_fit` (in `mcmc_lightcurve_fit.py`) — resolves the point estimate
   (MAP when available, else per-parameter medians), evaluates the model through
   `_evaluate_model` (the same entry point the likelihood uses, so geometry mode,
@@ -687,6 +727,7 @@ Per `(band, wind_model)` in `--output-dir`, prefixed `{band}_{wind_model}_`:
 | `*_chain.npz` | Full chain, log-prob, and run metadata (`mode`, frozen params, `likelihood`, `wind_model`, `n_obs`, …) for `--replot` / post-hoc BIC. |
 | `*_run_config.json` | The complete CLI configuration of the fit (`created`, `command`, every argparse value). Written before sampling starts, so it survives an interrupted run. `--replot` restores from it. |
 | `*_corner.png`, `*_trace.png`, `*_bestfit.png` | Diagnostic plots. |
+| `*_geometry_orbit.png`, `*_geometry_phase.png`, `*_wind_profile.png` | Binary-geometry figures at the point estimate (`--no-geometry-plots` to skip). |
 | `*_arviz_summary.csv` | ArviZ convergence table. |
 | `*_model_metrics.csv` | `bic`, `logL_hat`, `k_params`, `n_obs`, `theta_source`. |
 | `*_chi2.csv.gz` | Per-sample χ² (`--save-chi2`). |
@@ -707,7 +748,7 @@ python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec --model tbabs \
 python xrb_lightcurve.py --flux_method interpolate \
     --flux_csv flux_vs_nH_tbabs_broad.csv \
     --wind-model smooth_pl --Rb 5 --p 4 --Delta 1 \
-    --i0 12.0 --lam 0.572385 --output sim_broad.csv
+    --i0 78.0 --lam 0.572385 --output sim_broad.csv
 
 # 3. Fold the data and χ²-fit that one model (phase shift free; flux never rescaled)
 python chandra_phase_analysis.py \
@@ -806,7 +847,7 @@ Note `requirements.txt` predates the numba/arviz/zeus dependencies.
 | [compute_flux_vs_nH.py](compute_flux_vs_nH.py) | 934 | XSPEC `flux vs nH` table generator. |
 | [xspec_fit_mcmc.py](xspec_fit_mcmc.py) | 702 | XSPEC-side spectral MCMC. |
 | [chandra_analysis_combined_flux.py](chandra_analysis_combined_flux.py) | 539 | Fit pre-folded combined-flux files. |
-| [plot_results.py](plot_results.py) | 272 | Standalone plotting of simulation CSVs. |
+| [plot_results.py](plot_results.py) | 104 | Thin CLI over `utils/plot_utils.py` for simulation CSVs (`--geometric`, `--orbit`). |
 | [compute_count_to_flux_factor.py](compute_count_to_flux_factor.py) | 147 | Count-rate → flux factor. |
 | [example_usage.py](example_usage.py) | 96 | Programmatic `simulate_lightcurve` examples. |
 
@@ -856,6 +897,13 @@ One `*.plan.md` per feature increment: `unified_wind_model`,
 
 ## Known rough edges
 
+- **MCMC results predating the inclination convention change are stale.** `i0`
+  used to be measured from the line of sight and is now measured from the
+  orbital-plane normal, so those chains store the complement of what the model
+  expects. New run configs carry `"inclination_convention":
+  "i0-from-orbital-normal"` and `--replot` warns when the stamp is absent; the
+  fix is to refit. The notebooks and `rkp_run_w_mcmc_cmds.sh` still pass
+  old-convention `--i0` / `--prior-i0` values.
 - **`Delta` default is inconsistent.** `xrb_lightcurve.py --Delta` defaults to
   `1.0`, but `default_wind_params("smooth_pl")` and
   `mcmc_lightcurve_fit.WIND_SHAPE_FIXED['smooth_pl']` both use `2.0` (and the

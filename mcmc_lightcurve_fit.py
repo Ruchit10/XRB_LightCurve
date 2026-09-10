@@ -15,7 +15,8 @@ GEOMETRY parameters (always fit):
 - d2: Distance of companion star from center of mass (solar radii)
 - r:  Radius of compact object/accretion disk (solar radii)
 - R:  Radius of companion star (solar radii)
-- i0: Orbital inclination (degrees)
+- i0: Orbital inclination (degrees from the orbital-plane normal, standard
+      astronomical convention: 90 = edge-on, 0 = face-on)
 
 WIND-SHAPE parameters (added with --fit-wind-shape; the set depends on the
 chosen --wind-model):
@@ -65,6 +66,7 @@ import copy
 from dataclasses import dataclass, field
 import multiprocessing as mp
 import os
+import re
 import time
 import warnings
 from typing import Tuple, List, Dict, Optional
@@ -107,20 +109,20 @@ warnings.filterwarnings(
 from xrb_lightcurve import (
     simulate_lightcurve,
     WIND_MODEL_PARAM_KEYS,
+    MU_WIND_DEFAULT,
     default_wind_params,
+    evaluate_g_profile,
 )
 from utils.utils import (
     DEFAULT_PHASE_SHIFT_EVAL_POINTS,
     DEFAULT_PHASE_SHIFT_GRID_SIZE,
     ORBITAL_PERIOD,
-    REF_EPOCH,
     RUN_CONFIG_SUFFIX,
     apply_best_phase_shift as _apply_best_phase_shift,
     apply_saved_run_config,
     build_phase_shift_terms as _build_phase_shift_terms,
     estimate_scattered_flux,
     fmt_val as _fmt_val,
-    frac,
     interp_periodic_phases as _interp_periodic_phases,
     load_observed_lightcurves,
     phase_bin_data,
@@ -132,8 +134,11 @@ from utils.utils import (
 )
 from utils.plot_utils import (
     plot_corner,
+    plot_geometry_vs_phase,
     plot_lightcurve_fit,
+    plot_orbit_geometry,
     plot_trace,
+    plot_wind_profile,
 )
 
 
@@ -157,13 +162,17 @@ def _init_numba_worker(max_numba_threads: int = 1):
         # If numba is unavailable or thread control fails, proceed with defaults.
         pass
 
-# Default priors based on IC 10 X-1 parameters
+# Default priors based on IC 10 X-1 parameters.
+# i0 follows the standard astronomical convention (degrees from the
+# orbital-plane normal; 90 = edge-on, 0 = face-on), matching
+# simulate_lightcurve's input. Chains written before that convention change
+# stored the complement 90 - i0 and are not comparable.
 DEFAULT_PRIORS = {
     'd1': {'mean': 11.0, 'std': 3.0, 'min': 5.0, 'max': 20.0},      # Solar radii
     'd2': {'mean': 8.0, 'std': 3.0, 'min': 3.0, 'max': 15.0},       # Solar radii
     'r': {'mean': 0.001, 'std': 0.001, 'min': 0.0001, 'max': 0.1}, # Solar radii
     'R': {'mean': 2.0, 'std': 0.5, 'min': 1.0, 'max': 5.0},         # Solar radii
-    'i0': {'mean': 26.0, 'std': 20.0, 'min': 10.0, 'max': 85.0},    # Degrees
+    'i0': {'mean': 64.0, 'std': 20.0, 'min': 5.0, 'max': 80.0},     # Degrees
 }
 
 # Parameter names for labeling
@@ -183,7 +192,7 @@ REPARAM_PRIORS = {
     'q':  {'mean': 0.58, 'std': 0.15, 'min': 0.01,   'max': 0.99},
     'r':  {'mean': 0.001, 'std': 0.001, 'min': 0.0001, 'max': 0.1},
     'R':  {'mean': 2.0,  'std': 0.5,  'min': 1.0,    'max': 5.0},
-    'i0': {'mean': 26.0, 'std': 20.0, 'min': 10.0,   'max': 85.0},
+    'i0': {'mean': 64.0, 'std': 20.0, 'min': 5.0,    'max': 80.0},
 }
 
 REPARAM_PARAM_NAMES = ['a', 'q', 'r', 'R', 'i0']
@@ -200,13 +209,45 @@ KEPLER_PRIORS = {
     'M_RH': {'mean': 20.0, 'std': 10.0, 'min': 1.0, 'max': 100.0},    # Solar masses
     'r': {'mean': 0.001, 'std': 0.001, 'min': 0.0001, 'max': 0.1},    # Solar radii
     'R': {'mean': 2.0, 'std': 0.5, 'min': 1.0, 'max': 5.0},           # Solar radii
-    'i0': {'mean': 26.0, 'std': 20.0, 'min': 10.0, 'max': 85.0},      # Degrees
+    'i0': {'mean': 64.0, 'std': 20.0, 'min': 5.0, 'max': 80.0},       # Degrees
 }
 
 KEPLER_PARAM_NAMES = ['M_X', 'M_RH', 'r', 'R', 'i0']
 KEPLER_PARAM_LABELS = [
     r'$M_X$ (M$_\odot$)',
     r'$M_\mathrm{RH}$ (M$_\odot$)',
+    r'$r$ (R$_\odot$)',
+    r'$R$ (R$_\odot$)',
+    r'$i$ (deg)',
+]
+
+# Mass-total reparameterization of Kepler mode: (M_X, M_RH) -> (M_tot, q_m)
+# with q_m = M_RH / M_tot, so M_RH = q_m * M_tot and M_X = (1 - q_m) * M_tot.
+#
+# For a circular two-body orbit the light curve sees only the *relative*
+# separation a = d1 + d2 = K * M_tot^(1/3); the split of a about the centre of
+# mass cancels out of every geometry expression (l and z_start both depend on
+# d1 + d2 alone). q_m is therefore *exactly* unidentifiable -- verified to
+# floating-point round-off under both wind_norm='lam' and 'physical'.
+#
+# Sampling (M_X, M_RH) lays that flat direction diagonally across both axes,
+# which is why --kepler mixes so badly (autocorrelation ~700-1500 steps) and
+# why its MAP M_X wanders between otherwise identical runs. Sampling
+# (M_tot, q_m) puts the one identifiable combination on its own axis and leaves
+# q_m's posterior equal to its prior, which is honest and obvious rather than
+# hidden. Freeze q_m to drop the dead dimension entirely.
+KEPLER_MTOT_PRIORS = {
+    'M_tot': {'mean': 45.0, 'std': 15.0, 'min': 5.0, 'max': 120.0},  # Solar masses
+    'q_m': {'mean': 0.6, 'std': 0.2, 'min': 0.02, 'max': 0.98},      # M_RH/M_tot
+    'r': {'mean': 2.0, 'std': 1.5, 'min': 0.05, 'max': 6.0},         # Solar radii
+    'R': {'mean': 9.5, 'std': 2.5, 'min': 3.0, 'max': 20.0},         # Solar radii
+    'i0': {'mean': 78.0, 'std': 8.0, 'min': 63.0, 'max': 89.5},      # Degrees
+}
+
+KEPLER_MTOT_PARAM_NAMES = ['M_tot', 'q_m', 'r', 'R', 'i0']
+KEPLER_MTOT_PARAM_LABELS = [
+    r'$M_\mathrm{tot}$ (M$_\odot$)',
+    r'$q_m = M_\mathrm{RH}/M_\mathrm{tot}$',
     r'$r$ (R$_\odot$)',
     r'$R$ (R$_\odot$)',
     r'$i$ (deg)',
@@ -232,6 +273,8 @@ class ParamSpec:
     likelihood: str = 'chi2'
     orbital_period_s: float = float(ORBITAL_PERIOD)
     K_kepler: float = 0.0
+    wind_norm: str = 'lam'
+    fit_fopacity: bool = False
 
 
 def _compute_kepler_prefactor(orbital_period_s: float) -> float:
@@ -268,6 +311,8 @@ def get_mode_name_label(mode: str) -> Tuple[List[str], List[str]]:
         return list(REPARAM_PARAM_NAMES), list(REPARAM_PARAM_LABELS)
     if mode == 'kepler':
         return list(KEPLER_PARAM_NAMES), list(KEPLER_PARAM_LABELS)
+    if mode == 'kepler_mtot':
+        return list(KEPLER_MTOT_PARAM_NAMES), list(KEPLER_MTOT_PARAM_LABELS)
     return list(PARAM_NAMES), list(PARAM_LABELS)
 
 
@@ -280,11 +325,21 @@ def build_param_spec(
     fit_scatter: bool = False,
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
+    wind_norm: str = 'lam',
+    fit_fopacity: bool = False,
+    kepler_mtot: bool = False,
 ) -> ParamSpec:
     """Build canonical active-parameter layout for this run."""
-    if reparam and kepler:
-        raise ValueError("--reparam and --kepler are mutually exclusive.")
-    mode = 'kepler' if kepler else ('reparam' if reparam else 'phys')
+    if sum(bool(x) for x in (reparam, kepler, kepler_mtot)) > 1:
+        raise ValueError(
+            "--reparam, --kepler and --kepler-mtot are mutually exclusive."
+        )
+    mode = (
+        'kepler_mtot' if kepler_mtot
+        else 'kepler' if kepler
+        else 'reparam' if reparam
+        else 'phys'
+    )
     frozen = dict(frozen or {})
 
     names, labels = get_mode_name_label(mode)
@@ -294,6 +349,15 @@ def build_param_spec(
     if fit_scatter:
         names.append('f_scatter')
         labels.append(r'$f_\mathrm{scat}$')
+    if fit_fopacity:
+        if wind_norm != 'physical':
+            raise ValueError(
+                "--fit-fopacity requires --wind-norm physical; under the 'lam' "
+                "normalization the column scale is fixed by lam and f_opacity "
+                "has no effect."
+            )
+        names.append('log_fopa')
+        labels.append(r'$\log_{10} f_\mathrm{opa}$')
     if fit_wind_shape:
         if wind_model not in WIND_SHAPE_FIT:
             raise ValueError(
@@ -308,6 +372,8 @@ def build_param_spec(
     # Allow freezing shape parameters even when fit_wind_shape is off.
     valid_frozen.update(WIND_SHAPE_FIT.get(wind_model, []))
     valid_frozen.add('f_scatter')
+    if wind_norm == 'physical':
+        valid_frozen.add('log_fopa')
 
     if 'log_f' in frozen:
         raise ValueError("Freezing log_f is not supported. Use --likelihood chi2/jitter.")
@@ -343,6 +409,8 @@ def build_param_spec(
         likelihood=likelihood,
         orbital_period_s=float(orbital_period_s),
         K_kepler=_compute_kepler_prefactor(orbital_period_s),
+        wind_norm=wind_norm,
+        fit_fopacity=fit_fopacity,
     )
 
 
@@ -401,6 +469,15 @@ LIKELIHOOD_TYPES = {
 
 JITTER_PRIOR = {'mean': -3.0, 'std': 2.0, 'min': -10.0, 'max': 0.0}
 
+# log10 of the effective-opacity factor, used only with --wind-norm physical.
+# It rescales the Mdot-derived column to the *effective* photoelectric column,
+# absorbing wind ionization (a hyper-ionized wind has far less opacity than its
+# mass column implies), clumping, and the departure of a He-rich WR wind from
+# the solar abundances assumed by the TBabs flux_vs_nH table. Centered near
+# -1.5 because Clark & Crowther's Mdot predicts N_H ~ 20-50e22 out of eclipse
+# against an observed ~0.75e22.
+FOPACITY_PRIOR = {'mean': -1.5, 'std': 1.0, 'min': -4.0, 'max': 0.5}
+
 SAMPLER_TYPES = {
     'emcee': 'emcee Ensemble Sampler (stretch moves)',
     'zeus': 'zeus Ensemble Slice Sampler',
@@ -416,6 +493,9 @@ def get_param_config(
     fit_scatter: bool = False,
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
+    kepler_mtot: bool = False,
+    wind_norm: str = 'lam',
+    fit_fopacity: bool = False,
 ):
     """Return (param_names, param_labels) for the active MCMC vector.
 
@@ -432,11 +512,14 @@ def get_param_config(
         likelihood=likelihood,
         reparam=reparam,
         kepler=kepler,
+        kepler_mtot=kepler_mtot,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
         fit_scatter=fit_scatter,
         frozen=frozen,
         orbital_period_s=orbital_period_s,
+        wind_norm=wind_norm,
+        fit_fopacity=fit_fopacity,
     )
     return list(spec.active_names), list(spec.active_labels)
 
@@ -450,6 +533,7 @@ def get_active_priors(
     fit_scatter: bool = False,
     scatter_prior: Optional[Dict[str, float]] = None,
     frozen: Optional[Dict[str, float]] = None,
+    fit_fopacity: bool = False,
 ) -> Dict:
     """Build the merged prior dict covering geometry + jitter + shape params.
 
@@ -461,6 +545,11 @@ def get_active_priors(
     out = dict(base_priors)
     if likelihood == 'jitter':
         out.setdefault('log_f', dict(JITTER_PRIOR))
+    if fit_fopacity:
+        prior = dict(FOPACITY_PRIOR)
+        if shape_prior_overrides and 'log_fopa' in shape_prior_overrides:
+            prior.update(shape_prior_overrides['log_fopa'])
+        out['log_fopa'] = prior
     if fit_wind_shape:
         for name in WIND_SHAPE_FIT.get(wind_model, []):
             prior = dict(WIND_SHAPE_PRIORS[name])
@@ -584,12 +673,14 @@ class DirectLightCurveModel:
         i0: float,
         obs_phases: np.ndarray,
         wind_params: Dict[str, float] = None,
+        f_opacity: Optional[float] = None,
     ) -> np.ndarray:
         """Evaluate model by running simulate_lightcurve.
 
         ``wind_params`` overrides the default fixed shape parameters when
         provided. R_star is auto-filled from R for beta_law / confinement
-        if not present.
+        if not present. ``f_opacity`` is only used when the run is in
+        ``wind_norm='physical'`` mode.
         """
         if wind_params is None:
             wp = dict(self.wind_params_default)
@@ -611,6 +702,14 @@ class DirectLightCurveModel:
                 lam=self.sim_params.get('lam', 0.589537),
                 wind_model=self.wind_model,
                 wind_params=wp,
+                wind_norm=self.sim_params.get('wind_norm', 'lam'),
+                mdot=self.sim_params.get('mdot', 4.0e-6),
+                v_inf=self.sim_params.get('v_inf', 1750.0),
+                mu_wind=self.sim_params.get('mu_wind', MU_WIND_DEFAULT),
+                f_opacity=(
+                    self.sim_params.get('f_opacity', 1.0)
+                    if f_opacity is None else float(f_opacity)
+                ),
                 verbose=False,
             )
         except Exception as e:
@@ -677,6 +776,14 @@ def _resolve_geom(
         q = mrh / mtot
         d1 = a * q
         d2 = a * (1.0 - q)
+    elif mode == 'kepler_mtot':
+        mtot = _theta_value(theta, 'M_tot', names, frozen)
+        q = _theta_value(theta, 'q_m', names, frozen)
+        if mtot is None or q is None or mtot <= 0:
+            return np.nan, np.nan, np.nan, np.nan, np.nan
+        a = float(param_spec.K_kepler) * mtot ** (1.0 / 3.0)
+        d1 = a * q
+        d2 = a * (1.0 - q)
     else:
         raise ValueError(f"Unknown parameter mode '{mode}'")
 
@@ -727,6 +834,28 @@ def _resolve_scatter(
     return 0.0
 
 
+def _resolve_fopacity(
+    theta: np.ndarray,
+    active_names: Optional[List[str]],
+    param_spec: Optional[ParamSpec],
+) -> Optional[float]:
+    """Resolve the effective-opacity factor from active or frozen parameters.
+
+    Returns None when the run is not in physical-normalization mode, so the
+    caller leaves simulate_lightcurve on its configured default.
+    """
+    if param_spec is None or param_spec.wind_norm != 'physical':
+        return None
+    names = list(active_names or [])
+    if param_spec.active_names:
+        names = list(param_spec.active_names)
+    if 'log_fopa' in names:
+        return float(10.0 ** theta[names.index('log_fopa')])
+    if 'log_fopa' in param_spec.frozen:
+        return float(10.0 ** param_spec.frozen['log_fopa'])
+    return None
+
+
 def _evaluate_model(
     theta,
     model,
@@ -763,9 +892,14 @@ def _evaluate_model(
         frozen=(param_spec.frozen if param_spec is not None else None),
     )
 
+    f_opacity = _resolve_fopacity(
+        np.asarray(theta, dtype=float), active_names, param_spec
+    )
+
     try:
         model_flux = model.evaluate(
             d1, d2, r, R, i0, obs_phase, wind_params=wind_params,
+            f_opacity=f_opacity,
         )
     except TypeError:
         # Backward compat with any model.evaluate() that doesn't accept
@@ -786,8 +920,14 @@ def _evaluate_model(
     return model_flux
 
 
-def _default_priors(reparam: bool = False, kepler: bool = False) -> Dict:
+def _default_priors(
+    reparam: bool = False,
+    kepler: bool = False,
+    kepler_mtot: bool = False,
+) -> Dict:
     """The prior dict for a parameterization, as a fresh copy."""
+    if kepler_mtot:
+        return copy.deepcopy(KEPLER_MTOT_PRIORS)
     if kepler:
         return copy.deepcopy(KEPLER_PRIORS)
     if reparam:
@@ -1380,6 +1520,30 @@ def compute_statistics(
             ('d1', a_samples * q_samples),
             ('d2', a_samples * (1.0 - q_samples)),
         ]
+    elif mode == 'kepler_mtot':
+        frozen = (param_spec.frozen if param_spec is not None else {})
+
+        def _col(name):
+            if name in param_names:
+                return samples[:, param_names.index(name)]
+            if name in frozen:
+                return np.full(len(samples), float(frozen[name]))
+            raise ValueError(f"Could not resolve '{name}' for kepler_mtot stats.")
+
+        mtot = _col('M_tot')
+        q_samples = _col('q_m')
+        K = _compute_kepler_prefactor(orbital_period_s)
+        a_samples = K * np.power(mtot, 1.0 / 3.0)
+        # M_X and M_RH are *derived* here, and only M_tot is informed by the
+        # light curve: q_m is exactly unidentifiable, so its posterior is its
+        # prior and the split inherits that width.
+        derived = [
+            ('a', a_samples),
+            ('M_RH', q_samples * mtot),
+            ('M_X', (1.0 - q_samples) * mtot),
+            ('d1', a_samples * q_samples),
+            ('d2', a_samples * (1.0 - q_samples)),
+        ]
     else:
         derived = []
 
@@ -1421,6 +1585,23 @@ def compute_statistics(
                 q_map = mrh_map / mtot_map
                 stats['a']['map'] = a_map
                 stats['q']['map'] = q_map
+                stats['d1']['map'] = a_map * q_map
+                stats['d2']['map'] = a_map * (1.0 - q_map)
+            elif mode == 'kepler_mtot':
+                frozen = (param_spec.frozen if param_spec is not None else {})
+
+                def _map_val(name):
+                    if name in param_names:
+                        return float(map_sample[param_names.index(name)])
+                    return float(frozen[name])
+
+                mtot_map = _map_val('M_tot')
+                q_map = _map_val('q_m')
+                a_map = _compute_kepler_prefactor(orbital_period_s) * (
+                    mtot_map ** (1.0 / 3.0))
+                stats['a']['map'] = a_map
+                stats['M_RH']['map'] = q_map * mtot_map
+                stats['M_X']['map'] = (1.0 - q_map) * mtot_map
                 stats['d1']['map'] = a_map * q_map
                 stats['d2']['map'] = a_map * (1.0 - q_map)
             stats['_map_meta'] = {
@@ -1659,7 +1840,11 @@ def compute_chi2_for_samples(
                     idx_logf = active_names.index('log_f')
                     f = np.exp(sample_params[idx_logf])
                     sigma2 = obs_err2 + (f * model_flux) ** 2
-                    sigma2 = np.maximum(sigma2, np.finfo(float).eps)
+                    # Positivity guard only. An absolute floor of eps (2.2e-16)
+                    # is enormous next to a flux variance of order 1e-25 and
+                    # clamped every bin, deflating chi2_eff by ~9 orders of
+                    # magnitude. sigma2 is a sum of squares, so tiny suffices.
+                    sigma2 = np.maximum(sigma2, np.finfo(float).tiny)
                     chi2_eff = np.sum((obs_flux - model_flux) ** 2 / sigma2)
                     red_chi2_eff = chi2_eff / dof if dof > 0 else np.nan
             else:
@@ -1735,6 +1920,39 @@ def print_results(stats: Dict, band: str, wind_model: str, param_names: List[str
     print('='*60)
 
 
+def _point_estimate_theta(
+    stats: Dict,
+    param_names: List[str],
+    param_spec: Optional[ParamSpec] = None,
+    reparam: bool = False,
+) -> Tuple[np.ndarray, str]:
+    """Posterior point estimate in active-parameter order, plus its label.
+
+    Prefers the MAP point (one sample) over per-parameter medians: medians of
+    nonlinear combinations are not the combinations of medians, so a median
+    point would violate d1 + d2 = a and d1/(d1+d2) = q. The MAP point does not.
+    Frozen parameters are filled from *param_spec*.
+    """
+    use_map = all(
+        ('map' in stats[p]) for p in
+        (PARAM_NAMES if not reparam else ['r', 'R', 'i0', 'd1', 'd2'])
+        if p in stats
+    )
+    point_key = 'map' if use_map else 'median'
+
+    def value(name: str) -> float:
+        if name in stats and point_key in stats[name]:
+            return float(stats[name][point_key])
+        if param_spec is not None and name in param_spec.frozen:
+            return float(param_spec.frozen[name])
+        raise KeyError(
+            f"Missing '{name}' in statistics for best-fit plotting. "
+            f"If this parameter is frozen, pass param_spec with frozen values."
+        )
+
+    return np.array([value(n) for n in param_names], dtype=float), point_key
+
+
 def plot_best_fit(
     model,
     obs_phase: np.ndarray,
@@ -1794,32 +2012,9 @@ def plot_best_fit(
     if param_names is None:
         param_names = PARAM_NAMES
 
-    # Prefer the MAP point (one sample) over per-param medians: medians of
-    # nonlinear combinations are not the combinations of medians, so a median
-    # curve would violate d1 + d2 = a and d1/(d1+d2) = q. The MAP point does not.
-    use_map = all(
-        ('map' in stats[p]) for p in (PARAM_NAMES if not reparam else
-                                       ['r', 'R', 'i0', 'd1', 'd2'])
-        if p in stats
-    )
-    point_key = 'map' if use_map else 'median'
-
-    def _value_from_stats_or_frozen(name: str) -> float:
-        if name in stats and point_key in stats[name]:
-            return float(stats[name][point_key])
-        if param_spec is not None and name in param_spec.frozen:
-            return float(param_spec.frozen[name])
-        raise KeyError(
-            f"Missing '{name}' in statistics for best-fit plotting. "
-            f"If this parameter is frozen, pass param_spec with frozen values."
-        )
-
-    # Point-estimate theta in active-parameter order, evaluated through
-    # _evaluate_model — the same entry point the likelihood uses.
-    theta_best = np.array(
-        [_value_from_stats_or_frozen(name) for name in param_names],
-        dtype=float,
-    )
+    # Evaluated through _evaluate_model — the same entry point the likelihood uses.
+    theta_best, point_key = _point_estimate_theta(
+        stats, param_names, param_spec=param_spec, reparam=reparam)
 
     def _eval_at(phases: np.ndarray) -> np.ndarray:
         out = _evaluate_model(
@@ -1871,7 +2066,9 @@ def plot_best_fit(
     if likelihood == 'jitter' and 'log_f' in stats and point_key in stats['log_f']:
         f_best = float(np.exp(stats['log_f'][point_key]))
         sigma2 = obs_err ** 2 + (f_best * obs_model) ** 2
-        sigma2 = np.maximum(sigma2, np.finfo(float).eps)
+        # Positivity guard only -- see the note in the per-sample chi2 path; an
+        # absolute eps floor swamps a flux variance of order 1e-25.
+        sigma2 = np.maximum(sigma2, np.finfo(float).tiny)
         chi2_eff = np.sum((obs_flux - obs_model) ** 2 / sigma2)
     chi2 = chi2_obs
     n_phys = len(param_names) - (1 if 'log_f' in param_names else 0)
@@ -1921,7 +2118,331 @@ def plot_best_fit(
 
     print(f"Best-fit plot saved to: {output_path}")
 
+    # Companion text dump of the drawn curve, so the best-fit model light curve
+    # is usable outside the plot (overplotting, further analysis) without
+    # re-deriving the point estimate from the chain.
+    model_txt_path = re.sub(r'\.png$', '', str(output_path)) + "_model.txt"
+    try:
+        _write_bestfit_model_txt(
+            model_txt_path,
+            overlay_phase=overlay_phase,
+            model_flux=model_flux,
+            obs_phase=obs_phase,
+            obs_flux=obs_flux,
+            obs_err=obs_err,
+            obs_model=obs_model,
+            theta_best=theta_best,
+            param_names=param_names,
+            param_spec=param_spec,
+            stats=stats,
+            point_key=point_key,
+            band=band,
+            wind_model=wind_model,
+            red_chi2=red_chi2,
+            dof=dof,
+            best_phase_shift=(best_phase_shift if fit_phase_shift else 0.0),
+            f_best=f_best,
+            red_chi2_eff=red_chi2_eff,
+            f_scatter_best=f_scatter_best,
+        )
+        print(f"Best-fit model light curve saved to: {model_txt_path}")
+    except Exception as e:
+        warnings.warn(f"Could not write best-fit model light curve: {e}")
+
     return red_chi2
+
+
+def _write_bestfit_model_txt(
+    path: str,
+    *,
+    overlay_phase: np.ndarray,
+    model_flux: np.ndarray,
+    obs_phase: np.ndarray,
+    obs_flux: np.ndarray,
+    obs_err: np.ndarray,
+    obs_model: np.ndarray,
+    theta_best: np.ndarray,
+    param_names: List[str],
+    param_spec: Optional[ParamSpec],
+    stats: Dict,
+    point_key: str,
+    band: str,
+    wind_model: str,
+    red_chi2: float,
+    dof: int,
+    best_phase_shift: float,
+    f_best: Optional[float],
+    red_chi2_eff: float,
+    f_scatter_best: float,
+) -> None:
+    """Write the best-fit model light curve, with a reproducible header.
+
+    Two blocks: the dense model curve on the plotting grid, then the observed
+    bins with the model evaluated at their phases and the normalized residual.
+    Both are plain whitespace-delimited tables under ``#`` comments, so
+    ``np.genfromtxt(..., names=True)`` reads either after selecting its rows.
+    """
+    frozen = dict(param_spec.frozen) if param_spec is not None else {}
+    mode = param_spec.mode if param_spec is not None else 'phys'
+
+    d1, d2, r_val, R_val, i0_val = _resolve_geom(
+        np.asarray(theta_best, dtype=float),
+        active_names=list(param_names), param_spec=param_spec,
+    )
+    wind_params = _resolve_shape(
+        theta=np.asarray(theta_best, dtype=float), R_value=R_val,
+        active_names=list(param_names), wind_model=wind_model,
+        fit_wind_shape=(param_spec.fit_wind_shape if param_spec else False),
+        frozen=frozen,
+    )
+    f_opacity = _resolve_fopacity(
+        np.asarray(theta_best, dtype=float), list(param_names), param_spec)
+
+    order = np.argsort(np.asarray(overlay_phase, dtype=float))
+    mp = np.asarray(overlay_phase, dtype=float)[order]
+    mf = np.asarray(model_flux, dtype=float)[order]
+    # The model grid spans phase 0 and 1 inclusive, so wrapping it through the
+    # phase shift leaves a redundant abscissa that would break downstream
+    # interpolation. The two copies differ only at bit level, hence the
+    # tolerance -- it is orders of magnitude below the ~1/360 grid spacing, so
+    # it can only ever catch the wrap duplicate.
+    if mp.size > 1:
+        keep = np.concatenate(([True], np.diff(mp) > 1e-9))
+        mp, mf = mp[keep], mf[keep]
+
+    with open(path, 'w') as f:
+        f.write(f"# Best-fit model light curve -- {band.upper()} band, "
+                f"{WIND_MODELS.get(wind_model, wind_model)}\n")
+        f.write(f"# point_estimate: {'MAP' if point_key == 'map' else 'median'}\n")
+        f.write(f"# parameterization: {mode}\n")
+        if param_spec is not None:
+            f.write(f"# wind_norm: {param_spec.wind_norm}\n")
+        f.write(f"# chi2/dof: {red_chi2:.6g}  (dof = {dof})\n")
+        if f_best is not None:
+            f.write(f"# jitter f: {f_best:.6g}")
+            if np.isfinite(red_chi2_eff):
+                f.write(f"   chi2_eff/dof: {red_chi2_eff:.6g}")
+            f.write("\n")
+        f.write(f"# phase_shift applied to model: {best_phase_shift:.6f}\n")
+        f.write("#\n# Sampled parameters at this point estimate:\n")
+        for name, val in zip(param_names, np.asarray(theta_best, dtype=float)):
+            f.write(f"#   {name} = {val:.8g}\n")
+        if frozen:
+            f.write("# Frozen parameters:\n")
+            for name, val in sorted(frozen.items()):
+                f.write(f"#   {name} = {float(val):.8g}\n")
+        f.write("# Derived geometry:\n")
+        for name, val in (('d1', d1), ('d2', d2), ('a', d1 + d2),
+                          ('q', d1 / (d1 + d2) if (d1 + d2) else np.nan),
+                          ('r', r_val), ('R', R_val), ('i0_deg', i0_val)):
+            f.write(f"#   {name} = {float(val):.8g}\n")
+        for extra in ('M_X', 'M_RH', 'M_tot'):
+            if extra in stats and point_key in stats[extra]:
+                f.write(f"#   {extra} = {float(stats[extra][point_key]):.8g}\n")
+        if wind_params:
+            f.write("# Wind shape parameters:\n")
+            for name, val in sorted(wind_params.items()):
+                f.write(f"#   {name} = {float(val):.8g}\n")
+        if f_opacity is not None:
+            f.write(f"#   f_opacity = {float(f_opacity):.8g}\n")
+        f.write(f"#   f_scatter = {float(f_scatter_best):.8g}\n")
+        f.write("#\n")
+        f.write("# --- BLOCK 1: dense model curve (phase already shifted to the "
+                "observed frame) ---\n")
+        f.write("phase model_flux\n")
+        for p_val, flux_val in zip(mp, mf):
+            f.write(f"{p_val:.8f} {flux_val:.8e}\n")
+
+        obs_phase = np.asarray(obs_phase, dtype=float)
+        obs_model = np.asarray(obs_model, dtype=float)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            resid = (np.asarray(obs_flux, dtype=float) - obs_model) / np.asarray(
+                obs_err, dtype=float)
+        o = np.argsort(obs_phase)
+        f.write("#\n# --- BLOCK 2: observed bins vs model ---\n")
+        f.write("phase obs_flux obs_err model_flux resid_sigma\n")
+        for idx in o:
+            f.write(f"{obs_phase[idx]:.8f} {float(obs_flux[idx]):.8e} "
+                    f"{float(obs_err[idx]):.8e} {obs_model[idx]:.8e} "
+                    f"{resid[idx]:.6f}\n")
+
+
+def plot_geometry_diagnostics(
+    stats: Dict,
+    samples: np.ndarray,
+    band: str,
+    wind_model: str,
+    output_dir: str,
+    suffix: str,
+    param_names: List[str],
+    reparam: bool = False,
+    fit_wind_shape: bool = False,
+    param_spec: Optional[ParamSpec] = None,
+    sim_params: Optional[Dict] = None,
+    dth: float = 5.0,
+    flux_csv_path: Optional[str] = None,
+    n_profile_draws: int = 300,
+    verbose: bool = True,
+) -> Optional[Dict[str, str]]:
+    """Geometry figures for the posterior point estimate.
+
+    Three plots, each answering a question the light-curve fit alone does not:
+
+    1. ``*_geometry_orbit.png`` -- projected orbit against the companion disk,
+       plus a to-scale top-down view. The eclipse width constrains a
+       *combination* of (a, R, i0), so this is where an implausible but
+       well-fitting parameter set becomes obvious (e.g. a "companion" larger
+       than its own orbit, or a dip that is pure absorption with no geometric
+       eclipse at all).
+    2. ``*_geometry_phase.png`` -- projected separation against the R+/-r
+       eclipse thresholds, sky-plane components, N_H(phase) and the band flux.
+       Turns the eclipse from an emergent light-curve feature into a stated
+       geometric condition with visible margin.
+    3. ``*_wind_profile.png`` -- g(r) with a posterior credible band. The shape
+       parameters are only interpretable jointly (Rb and p trade off strongly),
+       so the constraint is much clearer on g(r) than in a corner plot. The
+       band of radii the line of sight actually probes is shaded: the profile
+       inside the minimum impact parameter is unconstrained by these data.
+
+    Returns a dict of the figures written, or None if the point estimate could
+    not be resolved / the simulation failed.
+    """
+    try:
+        theta_best, point_key = _point_estimate_theta(
+            stats, param_names, param_spec=param_spec, reparam=reparam)
+    except KeyError as e:
+        warnings.warn(f"Skipping geometry plots: {e}")
+        return None
+
+    d1, d2, r, R, i0 = _resolve_geom(
+        theta_best, reparam=reparam, active_names=param_names, param_spec=param_spec)
+    frozen = dict(param_spec.frozen) if param_spec is not None else {}
+    wind_params = _to_wind_params(
+        theta_best, param_names, wind_model, R,
+        fit_wind_shape=fit_wind_shape, frozen=frozen)
+    # Same additive floor the likelihood and plot_best_fit apply, so the flux
+    # panel here shows the curve that was actually fitted.
+    f_scatter = _resolve_scatter(theta_best, param_names, param_spec)
+
+    sim_params = sim_params or {}
+    if verbose:
+        shape_txt = ", ".join(f"{k}={v:.4g}" for k, v in sorted(wind_params.items()))
+        print(f"\nGeometry diagnostics at the {point_key} point estimate:")
+        print(f"  d1={d1:.4f}  d2={d2:.4f}  a={d1 + d2:.4f}  "
+              f"r={r:.6g}  R={R:.4f}  i0={i0:.4f} deg")
+        print(f"  wind_params: {shape_txt}")
+        if f_scatter:
+            print(f"  f_scatter:   {f_scatter:.6g} (additive floor)")
+
+    # One simulate_lightcurve call gives every geometry column we need.
+    try:
+        sim_df = simulate_lightcurve(
+            r=r, R=R, d1=d1, d2=d2, i0=i0,
+            gma0=sim_params.get('gma0', -90.0),
+            dth=dth,
+            d2h=sim_params.get('d2h', 6.0),
+            dz=sim_params.get('dz', 0.5),
+            flux_method="interpolate" if flux_csv_path else "legacy",
+            flux_csv_path=flux_csv_path,
+            lam=sim_params.get('lam', 0.589537),
+            wind_model=wind_model,
+            wind_params=wind_params,
+            scattered_flux=f_scatter,
+            verbose=False,
+        )
+    except Exception as e:
+        warnings.warn(f"Skipping geometry plots: simulate_lightcurve failed: {e}")
+        return None
+
+    written: Dict[str, str] = {}
+    band_label = band.upper()
+
+    orbit_path = os.path.join(output_dir, f"{suffix}_geometry_orbit.png")
+    try:
+        plot_orbit_geometry(sim_df, R=R, r=r, d1=d1, d2=d2, i0=i0,
+                            output_path=orbit_path, band=band_label,
+                            verbose=verbose)
+        written['orbit'] = orbit_path
+    except Exception as e:
+        warnings.warn(f"Orbit-geometry plot failed: {e}")
+
+    phase_path = os.path.join(output_dir, f"{suffix}_geometry_phase.png")
+    try:
+        plot_geometry_vs_phase(sim_df, R=R, r=r, band=band_label,
+                               flux_column=f"nfl_{band.lower()}",
+                               output_path=phase_path, verbose=verbose)
+        written['phase'] = phase_path
+    except Exception as e:
+        warnings.warn(f"Geometry-vs-phase plot failed: {e}")
+
+    # --- wind profile with a posterior band ---------------------------------
+    # Radii probed: the line of sight starting at the compact object has, by
+    # construction, an impact parameter relative to the companion centre equal
+    # to the sky-projected separation l3. So the profile inside min(l3) is never
+    # sampled, which is exactly the honest statement to put on the figure.
+    probed = None
+    if 'l3' in sim_df.columns:
+        l3 = sim_df['l3'].to_numpy(dtype=float)
+        if 'is_eclipsed' in sim_df.columns:
+            keep = ~sim_df['is_eclipsed'].to_numpy(dtype=bool)
+            l3 = l3[keep] if np.any(keep) else l3
+        l3 = l3[np.isfinite(l3)]
+        if l3.size:
+            probed = (float(np.min(l3)), float(np.max(l3)))
+
+    r_lo = max(1e-3, 0.5 * min(float(R), probed[0] if probed else float(R)))
+    r_hi = max(4.0 * float(R), (probed[1] * 3.0 if probed else 10.0 * float(R)))
+    if wind_params.get('Rb'):
+        r_hi = max(r_hi, 2.0 * float(wind_params['Rb']))
+    r_grid = np.logspace(np.log10(r_lo), np.log10(r_hi), 240)
+
+    g_rows: List[np.ndarray] = []
+    draws = np.atleast_2d(np.asarray(samples, dtype=float)) if samples is not None else None
+    if draws is not None and draws.size and draws.shape[1] == len(param_names):
+        n = min(int(n_profile_draws), draws.shape[0])
+        idx = (np.random.choice(draws.shape[0], size=n, replace=False)
+               if n < draws.shape[0] else np.arange(draws.shape[0]))
+        for k in idx:
+            th = draws[k]
+            try:
+                _, _, _, R_k, _ = _resolve_geom(
+                    th, reparam=reparam, active_names=param_names,
+                    param_spec=param_spec)
+                wp_k = _to_wind_params(th, param_names, wind_model, R_k,
+                                      fit_wind_shape=fit_wind_shape, frozen=frozen)
+                g_rows.append(np.asarray(
+                    evaluate_g_profile(r_grid, wind_model, wp_k), dtype=float))
+            except Exception:
+                continue
+    if not g_rows:
+        try:
+            g_rows.append(np.asarray(
+                evaluate_g_profile(r_grid, wind_model, wind_params), dtype=float))
+        except Exception as e:
+            warnings.warn(f"Wind-profile plot failed: {e}")
+            return written or None
+
+    shape_keys = WIND_SHAPE_FIT.get(wind_model, ())
+    summary = "\n".join(
+        f"{k:>7s} = {wind_params[k]:.4g}" + ("" if k in shape_keys and fit_wind_shape
+                                             else "  (fixed)")
+        for k in WIND_MODEL_PARAM_KEYS.get(wind_model, ())
+        if k in wind_params
+    )
+    profile_path = os.path.join(output_dir, f"{suffix}_wind_profile.png")
+    try:
+        plot_wind_profile(
+            r_grid, np.vstack(g_rows), R=R, probed_range=probed,
+            mark_radii={k: wind_params[k] for k in ('Rb', 'H', 'ell')
+                        if k in wind_params},
+            wind_model=WIND_MODELS.get(wind_model, wind_model),
+            band=band_label, shape_summary=summary or None,
+            output_path=profile_path, verbose=verbose)
+        written['wind_profile'] = profile_path
+    except Exception as e:
+        warnings.warn(f"Wind-profile plot failed: {e}")
+
+    return written or None
 
 
 def print_diagnostics(sampler, sampler_type: str = 'emcee',
@@ -2307,16 +2828,22 @@ def run_single_fit(
     fit_scatter = bool(getattr(args, 'fit_scatter', False))
     frozen_params = dict(getattr(args, 'frozen_params', {}) or {})
     orbital_period_s = float(getattr(args, 'orbital_period', ORBITAL_PERIOD))
+    wind_norm = sim_params.get('wind_norm', getattr(args, 'wind_norm', 'lam'))
+    fit_fopacity = bool(getattr(args, 'fit_fopacity', False))
+    kepler_mtot = bool(getattr(args, 'kepler_mtot', False))
 
     param_spec = build_param_spec(
         likelihood=likelihood,
         reparam=reparam,
         kepler=kepler,
+        kepler_mtot=kepler_mtot,
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
         fit_scatter=fit_scatter,
         frozen=frozen_params,
         orbital_period_s=orbital_period_s,
+        wind_norm=wind_norm,
+        fit_fopacity=fit_fopacity,
     )
 
     # Active priors include geometry + (optional) jitter + (optional) shape.
@@ -2329,6 +2856,7 @@ def run_single_fit(
         fit_scatter=fit_scatter,
         scatter_prior=scatter_prior,
         frozen=param_spec.frozen,
+        fit_fopacity=fit_fopacity,
     )
 
     print(f"\n{'#'*60}")
@@ -2453,6 +2981,19 @@ def run_single_fit(
             **_smooth_plot_kwargs(smoothed, args),
         )
         stats['reduced_chi2'] = red_chi2
+
+        if not getattr(args, 'no_geometry_plots', False):
+            plot_geometry_diagnostics(
+                stats, samples, band, wind_model, args.output_dir, suffix,
+                param_names=active_names,
+                reparam=reparam,
+                fit_wind_shape=fit_wind_shape,
+                param_spec=param_spec,
+                sim_params=sim_params,
+                dth=args.dth,
+                flux_csv_path=args.flux_csv,
+                verbose=not bool(getattr(args, 'quiet', False)),
+            )
 
     try:
         log_prob = sampler.get_log_prob(discard=args.n_burn, flat=True)
@@ -2670,6 +3211,19 @@ def replot_from_existing(
         )
         stats['reduced_chi2'] = red_chi2
 
+        if not getattr(args, 'no_geometry_plots', False):
+            plot_geometry_diagnostics(
+                stats, samples, band, wind_model, args.output_dir, suffix,
+                param_names=active_names,
+                reparam=(saved_mode == 'reparam'),
+                fit_wind_shape=saved_fit_wind_shape,
+                param_spec=spec_for_replot,
+                sim_params=sim_params,
+                dth=args.dth,
+                flux_csv_path=args.flux_csv,
+                verbose=not bool(getattr(args, 'quiet', False)),
+            )
+
     compute_bic_flag = bool(getattr(args, 'compute_bic', False))
     if HAS_ARVIZ or compute_bic_flag:
         if os.path.exists(chain_path):
@@ -2839,7 +3393,56 @@ def main():
         help="Use raw 100s data without phase binning. Usually best paired with "
              "--likelihood jitter."
     )
-    
+
+    # Wind column-density normalization
+    norm_group = parser.add_argument_group(
+        'Wind Normalization',
+        "How the wind LOS integral is converted into an absolute N_H."
+    )
+    norm_group.add_argument(
+        "--wind-norm",
+        type=str,
+        choices=['lam', 'physical'],
+        default='lam',
+        help="'lam' (default, backward compatible): rescale so mean(fl)=lam; "
+             "the model then depends only on ratios (R/a, r/a, Rb/a) and the "
+             "absolute scale -- hence M_X and M_RH -- is set entirely by the "
+             "priors. 'physical': fix the density from --mdot/--v-inf so the "
+             "column carries real units, the eclipse emerges from wind opacity "
+             "rather than the geometric cutoff, and the scale degeneracy is "
+             "(partially) broken."
+    )
+    norm_group.add_argument(
+        "--mdot",
+        type=float,
+        default=4.0e-6,
+        help="WR mass-loss rate in Msun/yr for --wind-norm physical. "
+             "Default 4e-6 (Clark & Crowther 2004, clumping-corrected)."
+    )
+    norm_group.add_argument(
+        "--v-inf",
+        type=float,
+        default=1750.0,
+        help="Wind terminal velocity in km/s for --wind-norm physical. "
+             "Default 1750 (Clark & Crowther 2004)."
+    )
+    norm_group.add_argument(
+        "--mu-wind",
+        type=float,
+        default=MU_WIND_DEFAULT,
+        help=f"Mean mass per hydrogen-equivalent nucleus, converting the wind "
+             f"mass column to the N_H that the TBabs flux_vs_nH table expects. "
+             f"Default {MU_WIND_DEFAULT}."
+    )
+    norm_group.add_argument(
+        "--fit-fopacity",
+        action="store_true",
+        help="Fit log10(f_opacity), the effective-opacity factor that absorbs "
+             "wind ionization, clumping and WR abundance departures. Requires "
+             "--wind-norm physical. Strongly recommended in that mode: the "
+             "Mdot-derived column overpredicts the observed N_H by ~1-2 dex."
+    )
+
     # MCMC options
     parser.add_argument(
         "--sampler",
@@ -2863,6 +3466,18 @@ def main():
         help="Reparameterize (d1, d2) as (a, q) where a = d1+d2 (orbital separation) "
              "and q = d1/(d1+d2) (mass-ratio proxy). Decorrelates the two distance "
              "parameters for faster MCMC convergence."
+    )
+    parser.add_argument(
+        "--kepler-mtot",
+        action="store_true",
+        help="Kepler mode reparameterized as (M_tot, q_m) with q_m = M_RH/M_tot, "
+             "instead of (M_X, M_RH). Preferred when fitting masses: the light "
+             "curve constrains only M_tot (via a = K*M_tot^(1/3)), while q_m is "
+             "*exactly* unidentifiable, so sampling (M_X, M_RH) lays a flat "
+             "direction diagonally across both axes and mixes badly. Here the "
+             "flat direction is axis-aligned, q_m's posterior equals its prior, "
+             "and M_X / M_RH are reported as derived quantities. Freeze q_m to "
+             "drop the dead dimension. Mutually exclusive with --reparam/--kepler."
     )
     parser.add_argument(
         "--kepler",
@@ -2978,6 +3593,14 @@ def main():
         type=str,
         default="mcmc_results",
         help="Directory to save output files"
+    )
+    parser.add_argument(
+        "--no-geometry-plots",
+        action="store_true",
+        help="Skip the binary-geometry figures (projected orbit / eclipse diagram, "
+             "geometry vs phase, and the wind profile with its posterior band). "
+             "They cost one extra simulate_lightcurve call (~60 ms) plus a cheap "
+             "analytic profile evaluation per draw."
     )
     parser.add_argument(
         "--no-plots",
@@ -3104,11 +3727,18 @@ def main():
         ("d2", None, DEFAULT_PRIORS, "d2 (companion distance from COM)"),
         ("r", None, DEFAULT_PRIORS, "r (compact object/disk radius)"),
         ("R", None, DEFAULT_PRIORS, "R (companion star radius)"),
-        ("i0", None, DEFAULT_PRIORS, "i0 (orbital inclination, degrees)"),
+        ("i0", None, DEFAULT_PRIORS,
+         "i0 (orbital inclination, degrees from the orbital-plane normal; "
+         "90 = edge-on, 0 = face-on)"),
         ("a", None, REPARAM_PRIORS, "a = d1+d2 (orbital separation, --reparam only)"),
         ("q", None, REPARAM_PRIORS, "q = d1/(d1+d2) (mass-ratio proxy, --reparam only)"),
         ("MX", "prior_M_X", KEPLER_PRIORS, "compact-object mass M_X (Msun, --kepler only)"),
         ("MRH", "prior_M_RH", KEPLER_PRIORS, "companion mass M_RH (Msun, --kepler only)"),
+        ("Mtot", "prior_M_tot", KEPLER_MTOT_PRIORS,
+         "total mass M_tot (Msun, --kepler-mtot only); sets a = K*M_tot^(1/3)"),
+        ("qm", "prior_q_m", KEPLER_MTOT_PRIORS,
+         "mass ratio q_m = M_RH/M_tot (--kepler-mtot only); unidentifiable by "
+         "the light curve, so this prior IS the posterior"),
     ):
         d = prior_defs[dest[len("prior_"):] if dest else flag]
         prior_group.add_argument(
@@ -3175,8 +3805,14 @@ def main():
     if args.counts_per_bin is not None and args.counts_per_bin <= 0:
         parser.error("--counts-per-bin must be > 0.")
 
-    if args.reparam and getattr(args, 'kepler', False):
-        parser.error("--reparam and --kepler are mutually exclusive.")
+    _mode_flags = [
+        ('--reparam', bool(args.reparam)),
+        ('--kepler', bool(getattr(args, 'kepler', False))),
+        ('--kepler-mtot', bool(getattr(args, 'kepler_mtot', False))),
+    ]
+    _on = [name for name, on in _mode_flags if on]
+    if len(_on) > 1:
+        parser.error(f"{', '.join(_on)} are mutually exclusive.")
     if getattr(args, "smooth_sigma", 0.0) <= 0:
         parser.error("--smooth-sigma must be > 0.")
     if getattr(args, "smooth_n_mc", 0) < 0:
@@ -3199,14 +3835,26 @@ def main():
         'gma0': args.gma0,
         'd2h': args.d2h,
         'dz': args.dz,
+        'wind_norm': getattr(args, 'wind_norm', 'lam'),
+        'mdot': getattr(args, 'mdot', 4.0e-6),
+        'v_inf': getattr(args, 'v_inf', 1750.0),
+        'mu_wind': getattr(args, 'mu_wind', MU_WIND_DEFAULT),
     }
+    wind_norm = getattr(args, 'wind_norm', 'lam')
+    fit_fopacity = bool(getattr(args, 'fit_fopacity', False))
+    if fit_fopacity and wind_norm != 'physical':
+        parser.error("--fit-fopacity requires --wind-norm physical.")
 
     # Build custom geometry priors
     reparam = getattr(args, 'reparam', False)
     kepler = bool(getattr(args, 'kepler', False))
-    priors = _default_priors(reparam, kepler)
+    kepler_mtot = bool(getattr(args, 'kepler_mtot', False))
+    priors = _default_priors(reparam, kepler, kepler_mtot)
     base_names, _ = get_mode_name_label(
-        'kepler' if kepler else ('reparam' if reparam else 'phys'))
+        'kepler_mtot' if kepler_mtot
+        else 'kepler' if kepler
+        else 'reparam' if reparam
+        else 'phys')
     priors.update(_parse_prior_overrides(parser, args, base_names))
 
     # Wind-shape overrides are always parsed; they are only applied when
@@ -3240,6 +3888,9 @@ def main():
             fit_scatter=fit_scatter,
             frozen=frozen_params,
             orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
+            wind_norm=wind_norm,
+            fit_fopacity=fit_fopacity,
+            kepler_mtot=kepler_mtot,
         )
     except Exception as e:
         parser.error(str(e))
@@ -3256,6 +3907,7 @@ def main():
             if fit_scatter else None
         ),
         frozen=None,
+        fit_fopacity=fit_fopacity,
     )
     for sname in WIND_SHAPE_FIT.get(args.wind_model, []):
         _check_priors.setdefault(sname, dict(WIND_SHAPE_PRIORS[sname]))
@@ -3425,10 +4077,20 @@ def main():
             active_names, _ = get_param_config(
                 likelihood, reparam=reparam,
                 kepler=kepler,
+                kepler_mtot=kepler_mtot,
                 wind_model=args.wind_model, fit_wind_shape=fit_wind_shape,
                 fit_scatter=fit_scatter,
                 frozen=getattr(args, 'frozen_params', {}),
                 orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
+                wind_norm=wind_norm,
+                fit_fopacity=fit_fopacity,
+            )
+            # Derived rows to print per mode. kepler_mtot reports the masses as
+            # derived, since only M_tot is informed by the light curve.
+            derived_names = (
+                ('a', 'M_X', 'M_RH', 'd1', 'd2') if kepler_mtot
+                else ('d1', 'd2') if (reparam or kepler)
+                else ()
             )
             for key, stats in all_results.items():
                 band, wind_model = key
@@ -3462,8 +4124,8 @@ def main():
                         if ('mean' in s) and ('std' in s):
                             f.write(f"  [mean={_fmt_val(s['mean'])}, std={_fmt_val(s['std'])}]")
                         f.write("\n")
-                if reparam or kepler:
-                    for derived in ('d1', 'd2'):
+                if derived_names:
+                    for derived in derived_names:
                         if derived in stats:
                             s = stats[derived]
                             f.write(f"  {derived} (derived): {_fmt_val(s['median'])} "
@@ -3485,14 +4147,15 @@ def main():
                     for param in active_names:
                         if param in stats and 'map' in stats[param]:
                             f.write(f"  {param}: {_fmt_val(stats[param]['map'])}\n")
-                    if reparam or kepler:
-                        for derived in ('d1', 'd2'):
+                    if derived_names:
+                        for derived in derived_names:
                             if derived in stats and 'map' in stats[derived]:
                                 f.write(
                                     f"  {derived} (derived): "
                                     f"{_fmt_val(stats[derived]['map'])}\n"
                                 )
-                    if (reparam or kepler) and all(k in stats for k in ('a', 'q', 'd1', 'd2')):
+                    if (reparam or kepler) and all(
+                            k in stats for k in ('a', 'q', 'd1', 'd2')):
                         a_map = stats['a']['map']
                         d1_map = stats['d1']['map']
                         d2_map = stats['d2']['map']
@@ -3532,6 +4195,21 @@ def main():
                                 f"  autocorr_time_steps: min={np.min(tau_vals):.2f}, "
                                 f"median={np.median(tau_vals):.2f}, max={np.max(tau_vals):.2f}\n"
                             )
+                        # Per-parameter tau, so a single badly-mixing dimension
+                        # is attributable instead of hidden in the max.
+                        n_steps_run = run_meta.get('n_steps')
+                        f.write("  autocorr_time_steps per parameter:\n")
+                        for pname, tau_v in diag['autocorr_time'].items():
+                            tau_f = float(tau_v)
+                            if not np.isfinite(tau_f) or tau_f <= 0:
+                                f.write(f"    {pname}: n/a\n")
+                                continue
+                            note = ""
+                            if n_steps_run:
+                                n_tau = float(n_steps_run) / tau_f
+                                note = f"  ({n_tau:.1f} tau in chain"
+                                note += ", OK)" if n_tau >= 50 else ", <50 -> unconverged)"
+                            f.write(f"    {pname}: {tau_f:.2f}{note}\n")
                     if diag.get('effective_independent_samples') is not None:
                         f.write(
                             f"  effective_independent_samples: "
