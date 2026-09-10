@@ -2082,8 +2082,10 @@ def main():
         "--dz",
         type=float,
         default=0.5,
+        # NOTE: argparse runs every help string through `% params`, so a literal
+        # percent sign must be escaped as %% or --help raises ValueError.
         help="Step size along the line of sight (solar radii). Default 0.5 gives "
-             "<0.1% truncation error for typical r^-2-like wind profiles with "
+             "<0.1%% truncation error for typical r^-2-like wind profiles with "
              "impact parameter b~d. Use smaller (e.g. 0.1) for very compact winds.",
     )
     parser.add_argument(
