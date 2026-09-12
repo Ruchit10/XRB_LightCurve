@@ -137,9 +137,9 @@ def get_band_display_name(band: str) -> Tuple[str, str]:
 def detect_flux_columns(df: pd.DataFrame) -> List[str]:
     """Detect available flux columns in simulation DataFrame.
 
-    Looks for columns matching `nfl_{band}` (normalized flux per band,
-    scaled by lam). With the unified wind model there is a single flux
-    column per band (no `_av` / `_cv` split).
+    Looks for columns matching `nfl_{band}` (absorbed flux per band). With
+    the unified wind model there is a single flux column per band (no
+    `_av` / `_cv` split).
 
     Note: the unscaled `flx` and scaled `fl` column-density columns are
     excluded — they are not per-band flux values.
@@ -1115,9 +1115,10 @@ def fit_simulation(
 
     Only the **phase shift** (x-direction) is fitted. There is deliberately no
     multiplicative flux scale: the model's absolute normalization is already
-    fixed by ``lam`` (the orbit-averaged nH from the spectral fit) together with
-    the XSPEC ``flux vs nH`` table, so a free y-scale would silently absorb an
-    error in that normalization instead of exposing it. The only y-direction
+    fixed by the wind mass-loss rate (via the physical column-density
+    normalization) together with the XSPEC ``flux vs nH`` table, so a free
+    y-scale would silently absorb an error in that normalization instead of
+    exposing it. The only y-direction
     freedom is the *additive* ``scatter`` floor, which is supplied by the caller
     (measured at mid-eclipse) rather than fitted here. This matches
     ``mcmc_lightcurve_fit.py``, which likewise fits a per-sample phase shift and

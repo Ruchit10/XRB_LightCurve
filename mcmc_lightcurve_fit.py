@@ -7,7 +7,6 @@ binary system parameters by fitting model light curves to observed Chandra data.
 
 WIND MODELS (selected via --wind-model):
 - smooth_pl   : Smoothly broken power-law density profile (Rb, p, Delta)
-- beta_law    : CAK beta-law velocity-based density (R_star, beta, H)
 - confinement : Inner-confinement / compression amplification (R_star, fconf, ell)
 
 GEOMETRY parameters (always fit):
@@ -21,32 +20,35 @@ GEOMETRY parameters (always fit):
 WIND-SHAPE parameters (added with --fit-wind-shape; the set depends on the
 chosen --wind-model):
 - smooth_pl   : Rb (break radius), p (inner slope). Delta is fixed at 2.
-- beta_law    : beta (CAK exponent). H is fixed; R_star is tied to R.
 - confinement : fconf (compression amplitude), ell (compression scale).
                 R_star is tied to R.
+
+The wind column density is normalized physically, from --mdot / --v-inf, so
+N_H carries real units and the light curve constrains the absolute scale of the
+system rather than only ratios such as R/a. --fit-fopacity adds the effective
+photoelectric-opacity factor as a free parameter and is strongly recommended.
 
 MCMC fitting uses direct ``simulate_lightcurve`` evaluations (~60 ms per LC
 with the Gauss-Legendre mega-kernel). This avoids interpolation artifacts from
 precomputed grids and keeps the likelihood physically faithful for every sample.
 
 Simulation parameters (passed to simulate_lightcurve):
-- lam:  Target mean nH in 1e22 cm^-2 units (fixes overall normalization)
-- gma0: Starting phase angle
-- d2h:  Angular cell size for polar grid
-- dz:   Step size along line of sight (legacy fallback path only)
+- gma0:  Starting phase angle
+- d2h:   Angular cell size for polar grid
+- mdot / v_inf / mu_wind: absolute wind density normalization
 
 Usage:
     # Geometry-only fit, smooth_pl wind, default shape params
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
-        --wind-model smooth_pl
+        --wind-model smooth_pl --fit-fopacity
 
     # Geometry + wind-shape fit (smooth_pl: + Rb, p)
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
-        --wind-model smooth_pl --fit-wind-shape
+        --wind-model smooth_pl --fit-wind-shape --fit-fopacity
 
-    # beta-law wind with shape fit (adds beta)
+    # Confinement wind with shape fit (adds fconf, ell)
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
-        --wind-model beta_law --fit-wind-shape
+        --wind-model confinement --fit-wind-shape --fit-fopacity
 
     # Use zeus sampler / jitter likelihood
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
@@ -228,7 +230,7 @@ KEPLER_PARAM_LABELS = [
 # separation a = d1 + d2 = K * M_tot^(1/3); the split of a about the centre of
 # mass cancels out of every geometry expression (l and z_start both depend on
 # d1 + d2 alone). q_m is therefore *exactly* unidentifiable -- verified to
-# floating-point round-off under both wind_norm='lam' and 'physical'.
+# floating-point round-off under the physical wind normalization.
 #
 # Sampling (M_X, M_RH) lays that flat direction diagonally across both axes,
 # which is why --kepler mixes so badly (autocorrelation ~700-1500 steps) and
@@ -273,7 +275,6 @@ class ParamSpec:
     likelihood: str = 'chi2'
     orbital_period_s: float = float(ORBITAL_PERIOD)
     K_kepler: float = 0.0
-    wind_norm: str = 'lam'
     fit_fopacity: bool = False
 
 
@@ -325,7 +326,6 @@ def build_param_spec(
     fit_scatter: bool = False,
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
-    wind_norm: str = 'lam',
     fit_fopacity: bool = False,
     kepler_mtot: bool = False,
 ) -> ParamSpec:
@@ -350,12 +350,6 @@ def build_param_spec(
         names.append('f_scatter')
         labels.append(r'$f_\mathrm{scat}$')
     if fit_fopacity:
-        if wind_norm != 'physical':
-            raise ValueError(
-                "--fit-fopacity requires --wind-norm physical; under the 'lam' "
-                "normalization the column scale is fixed by lam and f_opacity "
-                "has no effect."
-            )
         names.append('log_fopa')
         labels.append(r'$\log_{10} f_\mathrm{opa}$')
     if fit_wind_shape:
@@ -372,8 +366,7 @@ def build_param_spec(
     # Allow freezing shape parameters even when fit_wind_shape is off.
     valid_frozen.update(WIND_SHAPE_FIT.get(wind_model, []))
     valid_frozen.add('f_scatter')
-    if wind_norm == 'physical':
-        valid_frozen.add('log_fopa')
+    valid_frozen.add('log_fopa')
 
     if 'log_f' in frozen:
         raise ValueError("Freezing log_f is not supported. Use --likelihood chi2/jitter.")
@@ -409,27 +402,23 @@ def build_param_spec(
         likelihood=likelihood,
         orbital_period_s=float(orbital_period_s),
         K_kepler=_compute_kepler_prefactor(orbital_period_s),
-        wind_norm=wind_norm,
         fit_fopacity=fit_fopacity,
     )
 
 
-# Wind model descriptions (matches xrb_lightcurve.WIND_MODEL_IDS keys,
-# excluding broken_pl which is a special case of smooth_pl).
+# Wind model descriptions (matches xrb_lightcurve.WIND_MODEL_IDS keys).
 WIND_MODELS = {
     'smooth_pl':   'Smoothly Broken Power-Law Wind',
-    'beta_law':    'CAK Beta-Law (Velocity-Based) Wind',
     'confinement': 'Inner-Confinement / Compression Wind',
 }
 
 # Per-model wind-shape parameters that become free MCMC dimensions when the
 # user passes --fit-wind-shape. The remaining keys in WIND_SHAPE_FIXED are
-# always passed to simulate_lightcurve as constants. R_star (for beta_law /
-# confinement) is *tied* to the geometry parameter R and is therefore not
-# listed here; it is filled in by _to_wind_params().
+# always passed to simulate_lightcurve as constants. R_star (for confinement)
+# is *tied* to the geometry parameter R and is therefore not listed here; it is
+# filled in by _to_wind_params().
 WIND_SHAPE_FIT = {
     'smooth_pl':   ['Rb', 'p'],
-    'beta_law':    ['beta'],
     'confinement': ['fconf', 'ell'],
 }
 
@@ -437,7 +426,6 @@ WIND_SHAPE_FIT = {
 # fitted (poor identifiability or strong degeneracy).
 WIND_SHAPE_FIXED = {
     'smooth_pl':   {'Delta': 2.0},
-    'beta_law':    {'H': 1.0},
     'confinement': {},
 }
 
@@ -445,7 +433,6 @@ WIND_SHAPE_FIXED = {
 WIND_SHAPE_LABELS = {
     'Rb':    r'$R_b$ (R$_\odot$)',
     'p':     r'$p$',
-    'beta':  r'$\beta$',
     'fconf': r'$f_\mathrm{conf}$',
     'ell':   r'$\ell$ (R$_\odot$)',
 }
@@ -456,10 +443,13 @@ WIND_SHAPE_LABELS = {
 WIND_SHAPE_PRIORS = {
     'Rb':    {'mean': 5.0, 'std': 3.0,  'min': 0.5, 'max': 30.0},
     'p':     {'mean': 4.0, 'std': 1.0,  'min': 2.0, 'max': 8.0},
-    'beta':  {'mean': 0.8, 'std': 0.3,  'min': 0.3, 'max': 2.0},
     'fconf': {'mean': 5.0, 'std': 5.0,  'min': 0.0, 'max': 50.0},
     'ell':   {'mean': 1.0, 'std': 0.7,  'min': 0.1, 'max': 10.0},
 }
+
+# Names of every wind-shape parameter across all models; used for CLI prior
+# overrides so the flag list cannot drift from WIND_SHAPE_FIT.
+ALL_WIND_SHAPE_NAMES = tuple(WIND_SHAPE_PRIORS)
 
 # Likelihood configuration
 LIKELIHOOD_TYPES = {
@@ -494,7 +484,6 @@ def get_param_config(
     frozen: Optional[Dict[str, float]] = None,
     orbital_period_s: float = ORBITAL_PERIOD,
     kepler_mtot: bool = False,
-    wind_norm: str = 'lam',
     fit_fopacity: bool = False,
 ):
     """Return (param_names, param_labels) for the active MCMC vector.
@@ -518,7 +507,6 @@ def get_param_config(
         fit_scatter=fit_scatter,
         frozen=frozen,
         orbital_period_s=orbital_period_s,
-        wind_norm=wind_norm,
         fit_fopacity=fit_fopacity,
     )
     return list(spec.active_names), list(spec.active_labels)
@@ -576,7 +564,7 @@ def _to_wind_params(
 
     Pulls fittable shape values from *theta* using their position in
     *active_names*; fills in fixed shape values from WIND_SHAPE_FIXED; and
-    ties R_star to the geometry R for the beta_law / confinement models.
+    ties R_star to the geometry R for the confinement model.
     """
     wp: Dict[str, float] = dict(WIND_SHAPE_FIXED.get(wind_model, {}))
 
@@ -595,29 +583,10 @@ def _to_wind_params(
         else:
             wp[name] = float(WIND_SHAPE_PRIORS[name]['mean'])
 
-    if wind_model in ('beta_law', 'confinement'):
+    if wind_model == 'confinement':
         wp['R_star'] = float(R_value)
 
     return wp
-
-
-# =============================================================================
-# Data Loading and Phase Binning
-# =============================================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 # =============================================================================
 # Direct Model (SLOW - for comparison/debugging)
@@ -678,15 +647,14 @@ class DirectLightCurveModel:
         """Evaluate model by running simulate_lightcurve.
 
         ``wind_params`` overrides the default fixed shape parameters when
-        provided. R_star is auto-filled from R for beta_law / confinement
-        if not present. ``f_opacity`` is only used when the run is in
-        ``wind_norm='physical'`` mode.
+        provided. R_star is auto-filled from R for the confinement model if
+        not present.
         """
         if wind_params is None:
             wp = dict(self.wind_params_default)
         else:
             wp = dict(wind_params)
-        if self.wind_model in ('beta_law', 'confinement') and 'R_star' not in wp:
+        if self.wind_model == 'confinement' and 'R_star' not in wp:
             wp['R_star'] = float(R)
 
         try:
@@ -696,13 +664,10 @@ class DirectLightCurveModel:
                 i0=i0,
                 dth=self.dth,
                 d2h=self.sim_params.get('d2h', 6.0),
-                dz=self.sim_params.get('dz', 0.5),
                 flux_method=self.flux_method,
                 flux_csv_path=self.flux_csv_path,
-                lam=self.sim_params.get('lam', 0.589537),
                 wind_model=self.wind_model,
                 wind_params=wp,
-                wind_norm=self.sim_params.get('wind_norm', 'lam'),
                 mdot=self.sim_params.get('mdot', 4.0e-6),
                 v_inf=self.sim_params.get('v_inf', 1750.0),
                 mu_wind=self.sim_params.get('mu_wind', MU_WIND_DEFAULT),
@@ -841,10 +806,10 @@ def _resolve_fopacity(
 ) -> Optional[float]:
     """Resolve the effective-opacity factor from active or frozen parameters.
 
-    Returns None when the run is not in physical-normalization mode, so the
-    caller leaves simulate_lightcurve on its configured default.
+    Returns None when f_opacity is neither sampled nor frozen, so the caller
+    leaves simulate_lightcurve on its configured default.
     """
-    if param_spec is None or param_spec.wind_norm != 'physical':
+    if param_spec is None:
         return None
     names = list(active_names or [])
     if param_spec.active_names:
@@ -1663,12 +1628,11 @@ def load_existing_results(
 
     # Geometry block depends on the *saved* run's parameterization. Frozen
     # params are never sampled, so their absence from the CSV is expected.
-    if kepler:
-        geom_names, saved_mode = KEPLER_PARAM_NAMES, 'kepler'
-    elif reparam:
-        geom_names, saved_mode = REPARAM_PARAM_NAMES, 'reparam'
+    if param_spec is not None:
+        saved_mode = param_spec.mode
     else:
-        geom_names, saved_mode = PARAM_NAMES, 'phys'
+        saved_mode = 'kepler' if kepler else ('reparam' if reparam else 'phys')
+    geom_names, _ = get_mode_name_label(saved_mode)
     frozen_names = set((param_spec.frozen if param_spec is not None else {}) or {})
     missing_geom = [
         p for p in geom_names
@@ -1677,12 +1641,19 @@ def load_existing_results(
     if missing_geom:
         present = [c for c in samples_df.columns if c != 'log_prob']
         hint = ""
+        mode_flags = {
+            'reparam': '--reparam',
+            'kepler': '--kepler',
+            'kepler_mtot': '--kepler-mtot',
+            'phys': 'none of --reparam / --kepler / --kepler-mtot',
+        }
         for mode, names in (('phys', PARAM_NAMES), ('reparam', REPARAM_PARAM_NAMES),
-                            ('kepler', KEPLER_PARAM_NAMES)):
+                            ('kepler', KEPLER_PARAM_NAMES),
+                            ('kepler_mtot', KEPLER_MTOT_PARAM_NAMES)):
             if mode != saved_mode and all(n in samples_df.columns for n in names):
-                flag = {'reparam': '--reparam', 'kepler': '--kepler', 'phys': 'neither --reparam nor --kepler'}[mode]
-                hint = (f" The columns look like '{mode}' mode — rerun with {flag} "
-                        f"(or let --replot restore it from the saved run config).")
+                hint = (f" The columns look like '{mode}' mode — rerun with "
+                        f"{mode_flags[mode]} (or let --replot restore it from the "
+                        f"saved run config).")
                 break
         print(
             f"Error: samples file has no column for geometry parameter(s) "
@@ -2215,8 +2186,6 @@ def _write_bestfit_model_txt(
                 f"{WIND_MODELS.get(wind_model, wind_model)}\n")
         f.write(f"# point_estimate: {'MAP' if point_key == 'map' else 'median'}\n")
         f.write(f"# parameterization: {mode}\n")
-        if param_spec is not None:
-            f.write(f"# wind_norm: {param_spec.wind_norm}\n")
         f.write(f"# chi2/dof: {red_chi2:.6g}  (dof = {dof})\n")
         if f_best is not None:
             f.write(f"# jitter f: {f_best:.6g}")
@@ -2334,20 +2303,28 @@ def plot_geometry_diagnostics(
         if f_scatter:
             print(f"  f_scatter:   {f_scatter:.6g} (additive floor)")
 
-    # One simulate_lightcurve call gives every geometry column we need.
+    # One simulate_lightcurve call gives every geometry column we need. It has
+    # to use the *same* normalization the likelihood used, or the N_H and flux
+    # panels would describe a different model than the one that was fitted.
+    f_opacity = _resolve_fopacity(theta_best, param_names, param_spec)
     try:
         sim_df = simulate_lightcurve(
             r=r, R=R, d1=d1, d2=d2, i0=i0,
             gma0=sim_params.get('gma0', -90.0),
             dth=dth,
             d2h=sim_params.get('d2h', 6.0),
-            dz=sim_params.get('dz', 0.5),
-            flux_method="interpolate" if flux_csv_path else "legacy",
+            flux_method="interpolate",
             flux_csv_path=flux_csv_path,
-            lam=sim_params.get('lam', 0.589537),
             wind_model=wind_model,
             wind_params=wind_params,
             scattered_flux=f_scatter,
+            mdot=sim_params.get('mdot', 4.0e-6),
+            v_inf=sim_params.get('v_inf', 1750.0),
+            mu_wind=sim_params.get('mu_wind', MU_WIND_DEFAULT),
+            f_opacity=(
+                sim_params.get('f_opacity', 1.0)
+                if f_opacity is None else float(f_opacity)
+            ),
             verbose=False,
         )
     except Exception as e:
@@ -2433,7 +2410,7 @@ def plot_geometry_diagnostics(
     try:
         plot_wind_profile(
             r_grid, np.vstack(g_rows), R=R, probed_range=probed,
-            mark_radii={k: wind_params[k] for k in ('Rb', 'H', 'ell')
+            mark_radii={k: wind_params[k] for k in ('Rb', 'ell')
                         if k in wind_params},
             wind_model=WIND_MODELS.get(wind_model, wind_model),
             band=band_label, shape_summary=summary or None,
@@ -2828,7 +2805,6 @@ def run_single_fit(
     fit_scatter = bool(getattr(args, 'fit_scatter', False))
     frozen_params = dict(getattr(args, 'frozen_params', {}) or {})
     orbital_period_s = float(getattr(args, 'orbital_period', ORBITAL_PERIOD))
-    wind_norm = sim_params.get('wind_norm', getattr(args, 'wind_norm', 'lam'))
     fit_fopacity = bool(getattr(args, 'fit_fopacity', False))
     kepler_mtot = bool(getattr(args, 'kepler_mtot', False))
 
@@ -2842,7 +2818,6 @@ def run_single_fit(
         fit_scatter=fit_scatter,
         frozen=frozen_params,
         orbital_period_s=orbital_period_s,
-        wind_norm=wind_norm,
         fit_fopacity=fit_fopacity,
     )
 
@@ -3140,11 +3115,13 @@ def replot_from_existing(
         likelihood=getattr(args, 'likelihood', 'chi2'),
         reparam=(saved_mode == 'reparam'),
         kepler=(saved_mode == 'kepler'),
+        kepler_mtot=(saved_mode == 'kepler_mtot'),
         wind_model=wind_model,
         fit_wind_shape=fit_wind_shape,
         fit_scatter=bool(getattr(args, 'fit_scatter', False)),
         frozen=saved_frozen,
         orbital_period_s=saved_orbital_period_s,
+        fit_fopacity=bool(getattr(args, 'fit_fopacity', False)),
     )
 
     samples, stats, loaded_names = load_existing_results(
@@ -3333,9 +3310,9 @@ def main():
         action="store_true",
         help=(
             "Add the wind-shape parameters of the chosen --wind-model as free "
-            "MCMC dimensions (smooth_pl: Rb, p; beta_law: beta; "
-            "confinement: fconf, ell). Override priors via --prior-Rb, --prior-p, "
-            "--prior-beta, --prior-fconf, --prior-ell."
+            "MCMC dimensions (smooth_pl: Rb, p; confinement: fconf, ell). "
+            "Override priors via --prior-Rb, --prior-p, --prior-fconf, "
+            "--prior-ell."
         ),
     )
     
@@ -3397,33 +3374,23 @@ def main():
     # Wind column-density normalization
     norm_group = parser.add_argument_group(
         'Wind Normalization',
-        "How the wind LOS integral is converted into an absolute N_H."
-    )
-    norm_group.add_argument(
-        "--wind-norm",
-        type=str,
-        choices=['lam', 'physical'],
-        default='lam',
-        help="'lam' (default, backward compatible): rescale so mean(fl)=lam; "
-             "the model then depends only on ratios (R/a, r/a, Rb/a) and the "
-             "absolute scale -- hence M_X and M_RH -- is set entirely by the "
-             "priors. 'physical': fix the density from --mdot/--v-inf so the "
-             "column carries real units, the eclipse emerges from wind opacity "
-             "rather than the geometric cutoff, and the scale degeneracy is "
-             "(partially) broken."
+        "How the wind LOS integral is converted into an absolute N_H. The "
+        "density is fixed from --mdot / --v-inf, so the column carries real "
+        "units, the eclipse emerges from wind opacity rather than a geometric "
+        "cutoff, and the overall scale degeneracy is (partially) broken."
     )
     norm_group.add_argument(
         "--mdot",
         type=float,
         default=4.0e-6,
-        help="WR mass-loss rate in Msun/yr for --wind-norm physical. "
+        help="WR mass-loss rate in Msun/yr, setting the absolute wind density. "
              "Default 4e-6 (Clark & Crowther 2004, clumping-corrected)."
     )
     norm_group.add_argument(
         "--v-inf",
         type=float,
         default=1750.0,
-        help="Wind terminal velocity in km/s for --wind-norm physical. "
+        help="Wind terminal velocity in km/s. "
              "Default 1750 (Clark & Crowther 2004)."
     )
     norm_group.add_argument(
@@ -3438,9 +3405,9 @@ def main():
         "--fit-fopacity",
         action="store_true",
         help="Fit log10(f_opacity), the effective-opacity factor that absorbs "
-             "wind ionization, clumping and WR abundance departures. Requires "
-             "--wind-norm physical. Strongly recommended in that mode: the "
-             "Mdot-derived column overpredicts the observed N_H by ~1-2 dex."
+             "wind ionization, clumping and WR abundance departures. Strongly "
+             "recommended: the Mdot-derived column overpredicts the observed "
+             "N_H by ~1-2 dex."
     )
 
     # MCMC options
@@ -3497,7 +3464,9 @@ def main():
         default=None,
         metavar="NAME=VAL[,NAME=VAL,...]",
         help="Freeze selected free parameters at fixed values and remove them from sampling. "
-             "Supported names: d1,d2,a,q,r,R,i0,M_X,M_RH,f_scatter,Rb,p,beta,fconf,ell. "
+             "Supported names: d1,d2,a,q,r,R,i0,M_X,M_RH,M_tot,q_m,f_scatter,"
+             "log_fopa,Rb,p,fconf,ell. Freezing log_fopa pins the effective "
+             "opacity at 10**VALUE (e.g. --freeze log_fopa=-1.7). "
              "log_f cannot be frozen."
     )
     parser.add_argument(
@@ -3686,14 +3655,6 @@ def main():
         'Parameters passed to the underlying simulate_lightcurve function'
     )
     sim_group.add_argument(
-        "--lam",
-        type=float,
-        default=0.589537,
-        help="Target mean nH (in 1e22 cm^-2 units). The raw wind LOS integral "
-             "is rescaled so that mean(fl) = lam, which sets the absolute "
-             "flux normalization (and is fixed from spectral fits)."
-    )
-    sim_group.add_argument(
         "--gma0",
         type=float,
         default=-90.0,
@@ -3705,13 +3666,7 @@ def main():
         default=6.0,
         help="Angular cell size (degrees) for the polar grid in surface integral"
     )
-    sim_group.add_argument(
-        "--dz",
-        type=float,
-        default=0.1,
-        help="Step size along line of sight (solar radii)"
-    )
-    
+
     # ==========================================================================
     # Prior customization
     # ==========================================================================
@@ -3757,7 +3712,7 @@ def main():
         'Override default priors for wind-shape parameters '
         '(only active with --fit-wind-shape)',
     )
-    for sname in ('Rb', 'p', 'beta', 'fconf', 'ell'):
+    for sname in ALL_WIND_SHAPE_NAMES:
         prior_def = WIND_SHAPE_PRIORS[sname]
         shape_prior_group.add_argument(
             f"--prior-{sname}",
@@ -3831,19 +3786,13 @@ def main():
 
     # Build simulation parameters dict
     sim_params = {
-        'lam': args.lam,
         'gma0': args.gma0,
         'd2h': args.d2h,
-        'dz': args.dz,
-        'wind_norm': getattr(args, 'wind_norm', 'lam'),
         'mdot': getattr(args, 'mdot', 4.0e-6),
         'v_inf': getattr(args, 'v_inf', 1750.0),
         'mu_wind': getattr(args, 'mu_wind', MU_WIND_DEFAULT),
     }
-    wind_norm = getattr(args, 'wind_norm', 'lam')
     fit_fopacity = bool(getattr(args, 'fit_fopacity', False))
-    if fit_fopacity and wind_norm != 'physical':
-        parser.error("--fit-fopacity requires --wind-norm physical.")
 
     # Build custom geometry priors
     reparam = getattr(args, 'reparam', False)
@@ -3860,7 +3809,7 @@ def main():
     # Wind-shape overrides are always parsed; they are only applied when
     # --fit-wind-shape and the param is in WIND_SHAPE_FIT[wind_model].
     shape_prior_overrides = _parse_prior_overrides(
-        parser, args, ('Rb', 'p', 'beta', 'fconf', 'ell'), kind="shape param ")
+        parser, args, ALL_WIND_SHAPE_NAMES, kind="shape param ")
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -3888,7 +3837,6 @@ def main():
             fit_scatter=fit_scatter,
             frozen=frozen_params,
             orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
-            wind_norm=wind_norm,
             fit_fopacity=fit_fopacity,
             kepler_mtot=kepler_mtot,
         )
@@ -4082,7 +4030,6 @@ def main():
                 fit_scatter=fit_scatter,
                 frozen=getattr(args, 'frozen_params', {}),
                 orbital_period_s=float(getattr(args, 'orbital_period', ORBITAL_PERIOD)),
-                wind_norm=wind_norm,
                 fit_fopacity=fit_fopacity,
             )
             # Derived rows to print per mode. kepler_mtot reports the masses as

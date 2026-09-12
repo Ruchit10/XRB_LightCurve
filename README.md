@@ -1,145 +1,82 @@
-# XRB Lightcurve Simulation - Python Version
+# XRB Lightcurve — wind-absorption modelling for eclipsing X-ray binaries
 
-This is a Python implementation of the XRB (X-Ray Binary) Lightcurve simulation, migrated from the original R code. The simulation calculates column densities for eclipsing binary systems as the compact object eclipses its companion star.
+Forward model and inference stack for the X-ray light curve of an eclipsing
+high-mass X-ray binary, developed for **IC 10 X-1**. The compact object orbits
+inside the companion's stellar wind; the observed modulation is the combination
+of a geometric eclipse and phase-dependent photoelectric absorption in that
+wind.
 
-## Features
+Originally ported from R; the numerical core is a Numba-parallel
+Gauss-Legendre quadrature over the line of sight.
 
-- **Vectorized Operations**: Uses NumPy for efficient array operations instead of nested loops
-- **Command Line Interface**: Full argparse support with all parameters configurable
-- **Flexible Output**: Configurable output file with default naming
-- **Modular Design**: Clean, well-documented functions for each component
-- **Type Hints**: Full type annotations for better code maintainability
+---
+
+## What the model does
+
+For each orbital phase the code
+
+1. builds a polar grid across the projected emitter disk,
+2. integrates the wind density along the line of sight from every grid cell,
+3. converts each cell's column density `N_H` to a band flux using an XSPEC
+   `flux vs nH` table, and
+4. area-averages the result.
+
+Step 3 is done **per cell, before averaging**. The `N_H → flux` map is strongly
+nonlinear, so `⟨F(N)⟩ ≠ F(⟨N⟩)` wherever the column varies steeply across the
+disk — during ingress/egress and throughout the eclipse core, where the
+surviving flux is dominated by the least-absorbed cells.
+
+### Wind column normalization
+
+The density normalization `n₀` is fixed **physically**, from the mass-loss rate
+and terminal velocity, by matching the asymptotic `r⁻²` limit of the profile to
+a spherical constant-velocity wind:
+
+```
+n₀ = Ṁ / (4π R_sun² v_inf μ m_H C)
+```
+
+so `N_H` carries real units. The eclipse therefore emerges from wind opacity
+rather than from a geometric cutoff, and `R` means the true photospheric radius.
+
+Because a WR wind is hyper-ionized, clumped, and He-rich rather than
+solar-abundance, its *effective* photoelectric opacity is far below what its
+mass column implies. The dimensionless factor `--f-opacity` absorbs that
+difference; for IC 10 X-1 it lands around 0.01–0.03. In MCMC runs, fit it with
+`--fit-fopacity` rather than guessing.
+
+### Wind density profiles
+
+Two dimensionless profiles `g(r)`, selected with `--wind-model`:
+
+| Model | Parameters | Form |
+|-------|-----------|------|
+| `smooth_pl` (default) | `Rb`, `p`, `Delta` | smoothly broken power law: inner slope `p`, outer `r⁻²`, break at `Rb` with smoothness `Delta` |
+| `confinement` | `R_star`, `fconf`, `ell` | `r⁻²` wind with an exponential inner overdensity of amplitude `fconf` and scale `ell` |
+
+For `confinement`, `R_star` is tied to the geometric companion radius `R`.
+
+---
 
 ## Installation
 
-1. Ensure you have Python 3.7+ installed
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Usage
-
-### Basic Usage (Default Parameters)
-
 ```bash
-python xrb_lightcurve.py
+pip install -r requirements.txt
 ```
 
-This will run the simulation with default parameters and save results to `xrb_lightcurve_output.csv`.
+Python 3.9+. **Numba is required** — the mega-kernel is the only LOS
+integrator and the only path that produces the per-cell columns the flux
+conversion needs. `emcee` is required for MCMC; `zeus`, `arviz`, `corner` and
+`tqdm` are optional.
 
-### Custom Parameters
+---
 
-```bash
-python xrb_lightcurve.py --r 0.001 --R 2.0 --d1 11.0 --d2 8.0 --gma0 -90.0 --i0 64.0 --dth 1.0 --output my_results.csv
-```
+## Pipeline
 
-### Available Parameters
+### 1. Flux vs nH table (upstream of everything)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--r` | 0.001 | Radius of smaller star B (compact object) in solar radii |
-| `--R` | 2.0 | Radius of larger star A (companion) in solar radii |
-| `--d1` | 11.0 | Distance of star B from COM in solar radii |
-| `--d2` | 8.0 | Distance of star A from COM in solar radii |
-| `--gma0` | -90.0 | Starting phase angle in degrees |
-| `--i0` | 64.0 | Orbital inclination in degrees, measured from the orbital-plane normal (standard astronomical convention: 90 = edge-on, 0 = face-on) |
-| `--dth` | 1.0 | Orbital increment in degrees |
-| `--d2h` | 6.0 | Angular cell size for polar grid (degrees) |
-| `--dz` | 0.1 | Step size along line of sight (solar radii) |
-| `--n_jobs` | 1 | Number of parallel workers (1 = serial) |
-| `--flux_method` | legacy | Method for nH to flux conversion (see below) |
-| `--flux_csv` | None | Path to flux vs nH CSV file (required for interpolate/refit) |
-| `--lam` | 0.589537 | Scaling parameter for nH (in 1e22 cm^-2 units) |
-| `--lam2` | 0.589537 | Scaling parameter for constant velocity wind |
-| `--output` | xrb_lightcurve_output.csv | Output file name for results |
-
-### Flux Conversion Methods
-
-The simulation computes column densities, which are then converted to observable fluxes. Three methods are available:
-
-1. **legacy** (default): Uses hardcoded exponential fits derived from earlier XSPEC modeling:
-- Hard band (2.0-7.0 keV): `flux = 9.524 * exp(-0.057 * nH)` (legacy coefficients; update via XSPEC CSV for exact band)
-   - Soft band (0.3-2 keV): `flux = 9.3923 * exp(-2.5062 * nH)`
-   - Where nH is in units of 1e22 cm^-2
-
-2. **interpolate**: Directly interpolates from CSV file generated by `compute_flux_vs_nH.py`:
-   - Requires `--flux_csv` pointing to a CSV with columns: `nH_1e22`, `flux_soft_ph`, `flux_hard_ph`
-   - Uses log-log interpolation for smooth behavior
-   - Most accurate but requires XSPEC-generated CSV file
-
-3. **refit**: Fits new exponential functions to CSV data:
-   - Requires `--flux_csv` as above
-   - Fits `A * exp(-B * nH)` to the CSV data
-   - Combines accuracy of XSPEC with simplicity of exponential form
-   - Prints fitted coefficients for reference
-
-### Examples
-
-**Basic simulation with default (legacy) flux conversion:**
-```bash
-python xrb_lightcurve.py
-```
-
-**High-resolution simulation:**
-```bash
-python xrb_lightcurve.py --dth 0.5 --output high_res_simulation.csv
-```
-
-**Different binary configuration:**
-```bash
-python xrb_lightcurve.py --r 0.002 --R 3.0 --d1 15.0 --d2 10.0 --output large_binary.csv
-```
-
-**Using XSPEC-computed flux via interpolation:**
-```bash
-python xrb_lightcurve.py --flux_method interpolate --flux_csv data_flux_vs_nH.csv --output xspec_interp_results.csv
-```
-
-**Fitting new exponentials to XSPEC data:**
-```bash
-python xrb_lightcurve.py --flux_method refit --flux_csv data_flux_vs_nH.csv --output xspec_refit_results.csv
-```
-
-**Custom nH scaling:**
-```bash
-python xrb_lightcurve.py --lam 1.0 --lam2 1.0 --output custom_nh_scale.csv
-```
-
-## Output
-
-The simulation generates a CSV file with the following columns:
-
-- `deg`: Phase angle in degrees
-- `ph`: Phase angle in radians
-- `phase`: Normalized phase (0-1)
-- `A2`: Area calculations
-- `flx`: Column density integral (atoms/solar_radius^4) - accelerated wind
-- `flx2`: Column density integral (atoms/solar_radius^4) - constant velocity wind
-- `icd`: Integrated column density
-- `time`: Time calculations
-- `l3`, `L3`, `h3`: Geometric parameters
-- `fl`, `fl2`: Hydrogen column density nH in units of 1e22 cm^-2
-- `nfl_hard_av`, `nfl_hard_cv`: Hard band (2.0-7.0 keV) photon fluxes (photons/cm^2/s)
-- `nfl_soft_av`, `nfl_soft_cv`: Soft band (0.3-2 keV) photon fluxes (photons/cm^2/s)
-- `pho_count_hard_av`, `pho_count_soft_av`: Photon counts (only in legacy mode)
-
-### Understanding Units
-
-The key unit conversions in the simulation:
-
-1. **Geometric column density (`flx`)**: Computed from the wind integral with units of atoms/(solar radius)^4
-2. **Scaled nH (`fl`)**: `fl = flx * lam`, where `lam` is chosen so `mean(fl) = 0.589537` by default
-   - Units: 1e22 cm^-2
-   - Example: `fl = 1.0` means nH = 1.0 × 10^22 cm^-2
-3. **Photon flux**: Converted from nH using one of the three methods (legacy/interpolate/refit)
-   - Units: photons/cm^2/s
-   - Hard band: 2.0-7.0 keV
-   - Soft band: 0.3-2 keV
-
-### Generating Flux vs nH CSV
-
-To generate a CSV file for use with `--flux_method interpolate` or `--flux_method refit`, use the companion script:
+Light curves are generated from column densities, so an XSPEC-derived
+`flux vs nH` table is required first:
 
 ```bash
 python compute_flux_vs_nH.py \
@@ -149,47 +86,140 @@ python compute_flux_vs_nH.py \
     --nH_min 1e20 --nH_max 1e24 --nH_points 60
 ```
 
-This requires XSPEC to be available in your Python environment.
+Requires XSPEC (PyXspec) in the environment. The CSV carries `nH_1e22` plus
+`flux_{band}_ph` / `flux_{band}_erg` columns; bands are auto-detected downstream.
 
-## Code Structure
+### 2. Generate a model light curve
 
-### Main Functions
+```bash
+python xrb_lightcurve.py \
+    --flux_csv data_flux_vs_nH.csv \
+    --wind-model smooth_pl \
+    --R 2.0 --r 0.001 --d1 11.0 --d2 8.0 --i0 78.0 \
+    --f-opacity 0.02 \
+    --output sim_broad.csv
+```
 
-1. **`simulate_lightcurve()`**: Main simulation function
-2. **`create_grid()`**: Creates polar grid for wind integral calculations
-3. **`density_function()`**: Calculates wind density along line of sight
-4. **`wind_los_integral()`**: Calculates column integral along line of sight
+### 3. Fit
 
-### Key Improvements Over R Version
+Single-model χ² fit against observed data:
 
-1. **Vectorization**: Uses NumPy arrays and vectorized operations instead of loops
-2. **Modularity**: Each component is a separate, well-documented function
-3. **Error Handling**: Better handling of edge cases and empty arrays
-4. **Type Safety**: Full type hints for better code maintainability
-5. **Command Line Interface**: Easy parameter configuration via argparse
-6. **Flexible Output**: Configurable output file with default naming
+```bash
+python chandra_phase_analysis.py \
+    --data-dir data/IC_10_X1_LC/Broad_with_flux/ \
+    --sim-file sim_broad.csv --obs-column FLUX \
+    --fit --fit-phase-shift --output fit_broad.png --write-model
+```
 
-## Performance
+Full posterior via MCMC:
 
-The Python version is significantly faster than the R version due to:
-- Vectorized operations using NumPy
-- Reduced nested loops
-- More efficient array handling
-- Better memory management
+```bash
+python mcmc_lightcurve_fit.py \
+    --band broad --flux-csv data_flux_vs_nH.csv \
+    --data-dir data/IC_10_X1_LC_CIAO/broad/single/ \
+    --obs-column flux_t --time-column t_raw --n-phase-bins 150 \
+    --wind-model smooth_pl --fit-wind-shape --fit-fopacity \
+    --reparam --sampler zeus --likelihood jitter \
+    --n-walkers 32 --n-steps 5000 --n-burn 500
+```
 
-## Dependencies
+See `rkp_run_w_mcmc_cmds.sh` for the full worked sequence, and
+`python <script>.py --help` for every option.
 
-- `numpy>=1.21.0`: For numerical computations and array operations
-- `pandas>=1.3.0`: For data manipulation and CSV output
+Only the **phase shift** is fitted in the x-direction and only an *additive*
+scattered-flux floor in the y-direction. There is deliberately no
+multiplicative flux scale: the absolute normalization is already set by Ṁ and
+the XSPEC table, so a free y-scale would silently absorb an error in that
+normalization instead of exposing it.
+
+---
+
+## `xrb_lightcurve.py` parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--r` | 0.001 | Radius of the compact object / accretion disk (R☉) |
+| `--R` | 2.0 | Companion photospheric radius (R☉) |
+| `--d1` | 11.0 | Compact-object distance from the COM (R☉) |
+| `--d2` | 8.0 | Companion distance from the COM (R☉) |
+| `--gma0` | -90.0 | Starting phase angle (degrees) |
+| `--i0` | 64.0 | Inclination from the orbital-plane normal (90 = edge-on, 0 = face-on) |
+| `--dth` | 1.0 | Orbital increment (degrees) |
+| `--d2h` | 6.0 | Angular cell size of the polar grid (degrees) |
+| `--flux_csv` | *required* | Flux vs nH CSV from `compute_flux_vs_nH.py` |
+| `--flux_method` | `interpolate` | `interpolate` or `refit` (see below) |
+| `--flux_type` | `erg` | `erg` (erg/cm²/s) or `ph` (photons/cm²/s) |
+| `--wind-model` | `smooth_pl` | `smooth_pl` or `confinement` |
+| `--Rb`, `--p`, `--Delta` | 5.0, 4.0, 2.0 | `smooth_pl` shape parameters (`Delta` matches the value the MCMC holds fixed) |
+| `--fconf`, `--ell` | 10.0, 0.5 | `confinement` shape parameters |
+| `--mdot` | 4e-6 | WR mass-loss rate (M☉/yr), Clark & Crowther (2004) |
+| `--v-inf` | 1750.0 | Wind terminal velocity (km/s) |
+| `--mu-wind` | 1.4 | Mean mass per hydrogen-equivalent nucleus |
+| `--f-opacity` | 1.0 | Effective-opacity factor (see above) |
+| `--output` | `xrb_lightcurve_output.csv` | Output CSV |
+
+### Flux conversion methods
+
+1. **`interpolate`** (default) — log-log interpolation of the XSPEC table.
+   Most faithful to the spectral model.
+2. **`refit`** — fits `A·exp(−B·nH)` to the same table and uses the analytic
+   form. Cheaper and smoother, at the cost of a small systematic error where
+   the true curve departs from a single exponential. Fitted coefficients are
+   printed.
+
+---
+
+## Output columns
+
+| Column | Meaning |
+|--------|---------|
+| `deg`, `ph`, `phase` | Phase angle in degrees / radians, and normalized phase (0–1) |
+| `time` | Time since the reference epoch (s) |
+| `flx` | Dimensionless mean wind LOS integral ∫g(r)dz, r in R☉ |
+| `fl` | Absolute column density `N_H` (10²² cm⁻²) |
+| `icd`, `A2` | Area-weighted column sum and total emitter area (integration diagnostics) |
+| `l3`, `L3`, `h3` | Sky-plane separation and its in-plane / out-of-plane components (R☉) |
+| `is_eclipsed` | Per-phase geometric eclipse flag |
+| `nfl_{band}` | Absorbed band flux, area-averaged over the emitter disk |
+
+`fl = flx × f_opacity × n₀ × R_sun / 10²²`, and `nfl_{band}` is the per-cell
+flux conversion averaged over the disk (**not** the conversion of `fl`).
+
+---
+
+## Repository layout
+
+| Path | Role |
+|------|------|
+| `xrb_lightcurve.py` | Forward model — generates model light curves |
+| `compute_flux_vs_nH.py` | XSPEC flux vs nH table (upstream of the model) |
+| `mcmc_lightcurve_fit.py` | Full MCMC posterior inference |
+| `chandra_phase_analysis.py` | Single-model χ² fit, CLI front end |
+| `plot_results.py` | Standalone plots from a simulation CSV |
+| `utils/utils.py` | Data loading, phase binning, smoothing, χ² fit |
+| `utils/plot_utils.py` | All plotting routines, shared by both fit scripts |
+| `notebooks/` | Exploratory analysis |
+| `legacy_r_code/` | Original R implementation, kept for reference |
+| `changes_tracked.md` | Development history |
+
+---
 
 ## Troubleshooting
 
-**Memory Issues**: For very high-resolution simulations (small `dth` values), consider reducing the grid resolution or using a larger `dth` value.
+**`ImportError: numba is required`** — install Numba; there is no pure-Python
+fallback integrator.
 
-**Convergence Issues**: If the simulation doesn't converge, try adjusting the geometric parameters (`r`, `R`, `d1`, `d2`) to more physically reasonable values.
+**Extrapolation warnings** — model columns fell outside the CSV's `nH` range.
+Regenerate the table with a wider `--nH_min` / `--nH_max`.
 
-**Output File Issues**: Ensure you have write permissions in the output directory.
+**Model flux orders of magnitude too low** — `f_opacity` is probably at its
+default of 1.0. The Clark & Crowther mass-loss rate overpredicts the observed
+`N_H` for IC 10 X-1 by ~1.5–2 dex; use `--f-opacity 0.02` or fit it.
+
+**Poor MCMC mixing in mass mode** — use `--kepler-mtot` rather than `--kepler`.
+The light curve constrains only `M_tot`; `q_m` is exactly unidentifiable, and
+sampling `(M_X, M_RH)` lays that flat direction diagonally across both axes.
 
 ## License
 
-This code is provided as-is for educational and research purposes. 
+Provided as-is for educational and research purposes.

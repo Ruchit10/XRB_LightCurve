@@ -38,9 +38,10 @@ fitting, and inference stack since the original R port.
 29. [Phase 28 — Physical Wind Normalization & Per-Cell Flux Conversion](#phase-28--physical-wind-normalization--per-cell-flux-conversion)
 30. [Phase 29 — Mass Reparameterization & Error-Column Fix](#phase-29--mass-reparameterization--error-column-fix)
 31. [Phase 30 — Physical Norm in the Single-Model CLI, Model-LC Dump & χ²_eff Fix](#phase-30--physical-norm-in-the-single-model-cli-model-lc-dump--χ_eff-fix)
-32. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
-33. [Current File Inventory](#current-file-inventory)
-34. [Current Status & Quick Commands](#current-status--quick-commands)
+32. [Phase 31 — Release Trim: `lam`, Wind Models and Flux Methods](#phase-31--release-trim-lam-wind-models-and-flux-methods)
+33. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
+34. [Current File Inventory](#current-file-inventory)
+35. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -1779,6 +1780,131 @@ per-sample χ² path and the best-fit overlay. Now reads 1.19 on a smoke run.
 
 ---
 
+## Phase 31 — Release Trim: `lam`, Wind Models and Flux Methods
+
+Publication-readiness pass. Removes every alternative that the physical wind
+normalization superseded, so there is exactly one supported path through the
+code. **`xrb_lightcurve.py`: 2354 → 1196 lines.**
+
+### Removed: the `lam` normalization
+
+`--lam` and `--wind-norm` are gone; the physical `Mdot`/`v_inf` normalization
+(Phase 28) is now the only mode. Rationale: under `lam` the orbit-averaged
+column was pinned to a spectral-fit constant, which discarded the absolute
+scale and left the light curve dependent only on ratios (`R/a`, `r/a`,
+`Rb/a`) — so `M_X`, `M_RH` and `R` were prior artifacts rather than
+measurements. `simulate_lightcurve` now always takes `mdot`, `v_inf`,
+`mu_wind`, `f_opacity`; `ParamSpec.wind_norm` is deleted.
+
+Consequently deleted as unreachable (~300 lines): `compute_surface_density`,
+`compute_wind_normalization_constants`, `wind_density_posterior`,
+`wind_normalization_constants_posterior` — all existed only to back out `n_0`
+*from* `lam`, whereas `n_0` is now an input via `wind_density_norm_from_mdot`.
+
+`--fit-fopacity` no longer requires a mode flag, and `log_fopa` is
+unconditionally freezable (`--freeze log_fopa=-1.7`).
+
+### Removed: the fixed-`Rmax` / trapezoid LOS path
+
+`--Rmax`, `--converge-rmax`, `--n_jobs` and `--dz` are gone, along with
+`_wind_los_profile_numba`, `create_grid`, `density_function`,
+`wind_los_integral`, `_id_to_name`, `_unpack_params`, the per-phase Python
+loop and the joblib branch (~450 lines).
+
+Rationale: any `Rmax` disabled the mega-kernel, which is the *only* path that
+returns per-cell columns — and without those the nonlinear `nH → flux`
+conversion silently degrades to converting the mean column, badly understating
+eclipse-core leakage (the hazard already noted in Phase 30). The Gauss-Legendre
+quadrature integrates the full `z`-tail anyway, so the cutoff was never needed.
+
+**Numba is now a hard requirement**; the module raises `ImportError` at import
+rather than falling back to a degraded integrator.
+
+### Removed: `broken_pl` and `beta_law` wind models
+
+`WIND_MODEL_IDS` is renumbered to `{smooth_pl: 0, confinement: 1}`;
+`_g_profile` / `evaluate_g_profile` / `wind_asymptotic_coefficient` /
+`default_wind_params` trimmed to match. On the MCMC side `beta` drops out of
+`WIND_SHAPE_FIT` / `WIND_SHAPE_FIXED` / `WIND_SHAPE_LABELS` /
+`WIND_SHAPE_PRIORS`, and `--prior-beta` is gone. `broken_pl` was always a
+special case of `smooth_pl`, and `beta_law` was never used in a production fit.
+
+New `ALL_WIND_SHAPE_NAMES` is derived from `WIND_SHAPE_PRIORS`, so the
+`--prior-<name>` flag list can no longer drift from the registry (it was
+hardcoded twice before).
+
+### Removed: `--flux_method legacy`
+
+`interpolate` (log-log interpolation of the XSPEC table) is now the default and
+`refit` the only alternative. `--flux_csv` becomes **required**. The hardcoded
+`nfl_hard = 9.524·e^{-0.057 nH}` / `nfl_soft = 9.3923·e^{-2.5062 nH}`
+coefficients predated the XSPEC pipeline and were not tied to any band
+definition in current use; the same stale constants are dropped from
+`fit_exponential_to_csv`'s exception fallback.
+
+### Bugs found and fixed during the review
+
+- **`plot_geometry_diagnostics` ignored the wind normalization.** It called
+  `simulate_lightcurve` without `wind_norm` / `mdot` / `v_inf` / `f_opacity`,
+  so under physical mode every `*_geometry_phase.png` plotted an `N_H(φ)` and
+  band flux from a *different* model than the one that was fitted. Now resolves
+  `f_opacity` from the point estimate and passes the full normalization.
+- **`--replot` dropped `fit_fopacity` and `kepler_mtot`.** `build_param_spec`
+  was called without either, so a `kepler_mtot` run replotted as `phys` mode
+  and `log_fopa` was mishandled. Both are now passed through.
+- **`load_existing_results` had no `kepler_mtot` branch**, falling through to
+  `PARAM_NAMES` and failing the geometry-column check. Now derives the geometry
+  block from `param_spec.mode` via `get_mode_name_label`, and its "columns look
+  like X mode" hint covers all four modes.
+- **`--Delta` default inconsistency fixed** (a `known rough edge` in
+  PROJECT.md): the `xrb_lightcurve.py` CLI defaulted to `1.0` while
+  `default_wind_params` and `WIND_SHAPE_FIXED` used `2.0`, so CLI-generated
+  models used a different break sharpness than the MCMC fitted. CLI now
+  defaults to `2.0`.
+- **`plot_wind_profile` marked the removed `H` radius**; now marks `Rb`/`ell`.
+- **`--freeze` help** advertised the deleted `beta` and omitted `log_fopa`.
+
+### Docs and support files
+
+- `README.md` rewritten — it still documented the R port and removed API
+  (`--lam2`, `flx2`/`fl2`, `nfl_*_av`/`_cv`, `pho_count_*`) and never mentioned
+  the MCMC script.
+- `requirements.txt` completed (`numba`, `zeus-mcmc`, `arviz`, `astropy`).
+- `rkp_run_w_mcmc_cmds.sh` rewritten; it referenced flags removed long ago
+  (`--lam2`, `--load-grid`, `--no-grid`, `--wind-model av/cv`, `--n-workers`,
+  `--compute-waic`) and had broken line continuations. One-time destructive
+  steps are commented out so it cannot clobber the gitignored XSPEC table.
+- `utils/test_flux_methods.py` rewritten around `interpolate`/`refit`; it was
+  built on the deleted legacy mode and could not import from `utils/`.
+- `PROJECT.md` updated throughout.
+
+### Verification (conda env `henv`)
+
+- **Physical-mode output is bit-identical to `HEAD`** — `max_rel_diff = 0.0`
+  across all 16 output columns for both `smooth_pl` and `confinement`,
+  comparing against `git show HEAD:xrb_lightcurve.py` run with
+  `--wind-norm physical --converge-rmax`. This is the key regression check:
+  the trim changed no numerics.
+- `xrb_lightcurve.py` CLI, `utils/test_flux_methods.py` (both methods),
+  a full MCMC fit (reparam + jitter + `--fit-wind-shape` + `--fit-fopacity`)
+  through every plot, `--replot` of that run, a `--kepler-mtot` fit and its
+  replot, a `confinement` + `--freeze log_fopa=-1.7,ell=0.5` fit, and
+  `chandra_phase_analysis.py --fit --write-model` all run clean.
+- `--replot` reproduces the original run's `chi2/dof` exactly.
+- `pack_wind_params` and `build_param_spec` both reject `beta_law` /
+  `broken_pl` rather than silently accepting them.
+- Repo-wide grep confirms no `lam` / `wind_norm` / `beta_law` / `broken_pl` /
+  `Rmax` / `n_jobs` / `legacy` references remain in tracked Python or shell.
+
+### Not updated
+
+The notebooks still use the removed API — `xrb_model_analysis_single_15803.ipynb`
+calls the deleted `compute_surface_density`. Untracked scripts
+(`utils/benchmark_mcmc_performance.py`, `chandra_analysis_combined_flux.py`)
+also still pass `--lam` and were left alone as legacy.
+
+---
+
 ## Side Investigation — Reference Epoch Recalibration
 
 Plan: `reference_epoch_recalibration_ae1cf98a.plan.md`.
@@ -1854,9 +1980,9 @@ scripts, not part of the package API: `add_flux_simple.py`,
 `README_CONVERSION_TOOLS.md`.
 Reference PDFs: `Wind_Density.pdf` (profile equations),
 `stu2151.pdf` (Laycock et al. 2015 ephemeris).
-**Stale:** `README.md`, `MIGRATION_SUMMARY.md` — still describe the original
-R→Python port and removed API (`--lam2`, `flx2`/`fl2`, `nfl_*_av`/`_cv`,
-`pho_count_*`).
+`README.md` rewritten in Phase 31 as the user-facing overview.
+**Stale:** `MIGRATION_SUMMARY.md` — still describes the original R→Python port
+and removed API (`--lam2`, `flx2`/`fl2`, `nfl_*_av`/`_cv`, `pho_count_*`).
 
 ### Plans (`.cursor/plans/`)
 `unified_wind_model_77726ced` (Phase 7),
@@ -1884,20 +2010,23 @@ API, data layout, outputs, and known rough edges). Summary:
 
 **Environment:** `henv` conda env (heasoft/XSPEC + python deps including
 `numba`, `emcee`, `zeus-mcmc`, `arviz`, `corner`, `astropy`, `scipy>=1.12`).
-`requirements.txt` is incomplete — it predates the numba/arviz/zeus additions.
+`numba` is a hard requirement — `xrb_lightcurve.py` raises `ImportError`
+without it.
 
 **Working spectral model:** TBabs × powerlaw, nH = 0.75×10²² cm⁻²,
 Γ = 1.86, χ²_red = 1.52.
 
-**Default forward model:** `smooth_pl` wind, single `nfl_{band}` flux column,
-Gauss-Legendre mega-kernel (~60 ms per light curve). Note `Rb=5, p=4` throughout,
-but `Delta` defaults to `1.0` on the `xrb_lightcurve.py` CLI and `2.0` in
-`default_wind_params` / `WIND_SHAPE_FIXED`.
+**Default forward model:** `smooth_pl` wind (`Rb=5, p=4, Delta=2` everywhere),
+single `nfl_{band}` flux column, Gauss-Legendre mega-kernel (~60 ms per light
+curve), physical `Mdot`-based column normalization with per-cell flux
+conversion. Wind models: `smooth_pl` / `confinement`. Flux methods:
+`interpolate` (default) / `refit`.
 
 **MCMC defaults:** `phys` mode (`d1, d2, r, R, i0`), `chi2` likelihood,
 `emcee`, 50 fixed-width phase bins, per-sample phase-shift alignment **on**,
-direct evaluator (no grid path exists), `--wind-norm lam`. Parameterizations:
+direct evaluator (no grid path exists). Parameterizations:
 `phys` / `--reparam` / `--kepler` / `--kepler-mtot` (mutually exclusive).
+`--fit-fopacity` is strongly recommended.
 
 ```bash
 # Build/refresh the XSPEC flux-vs-nH table
@@ -1909,16 +2038,9 @@ python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec --model tbabs \
 python utils/add_flux_simple.py \
     data/IC_10_X1_LC/Broad_converted/ data/IC_10_X1_LC/Broad_with_flux/ 1.500509e-11
 
-# Simulate one light curve
-python xrb_lightcurve.py --flux_method interpolate \
-    --flux_csv flux_vs_nH_tbabs_broad.csv \
-    --wind-model smooth_pl --Rb 5 --p 4 --Delta 1 \
-    --i0 12.0 --lam 0.572385 --output sim_broad.csv
-
-# Simulate one light curve with the physical wind normalization (no MCMC
-# needed). R is the true photosphere here and the eclipse comes from wind
-# opacity; leave --Rmax unset so the per-cell mega-kernel path is used.
-python xrb_lightcurve.py --wind-norm physical \
+# Simulate one light curve. R is the true photosphere and the eclipse comes
+# from wind opacity; f_opacity rescales the Mdot-derived column.
+python xrb_lightcurve.py \
     --mdot 4e-6 --v-inf 1750 --f-opacity 0.03 \
     --r 1.4 --R 2.0 --d1 12.2 --d2 8.1 --i0 82 --dth 1 --d2h 6 \
     --wind-model smooth_pl --Rb 12 --p 6.7 --Delta 2 \
@@ -1963,17 +2085,17 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
     --reparam --freeze q=0.5,Rb=6.0 --n-steps 2000 \
     --output-dir mcmc_results/broad/frozen
 
-# MCMC: physical wind normalization + mass reparameterization.
+# MCMC: mass reparameterization with the wind shape fitted.
 # R is the true photosphere here, not the effective eclipsing radius, and the
-# eclipse is produced by wind opacity. Keep d2h small: physical mode averages
-# flux *per emitter cell*, and d2h=30 gives only 13 azimuthal cells, which
+# eclipse is produced by wind opacity. Keep d2h small: flux is averaged
+# *per emitter cell*, and d2h=30 gives only 13 azimuthal cells, which
 # under-resolves the eclipse-core leakage.
 python mcmc_lightcurve_fit.py --band broad \
     --flux-csv ./analyses/flux_vs_nH_tbabs_600bin_15803_broad.csv \
     --data-dir data/IC_10_X1_LC_CIAO/broad/single/ \
     --obs-column flux_t --time-column t_raw \
     --wind-model smooth_pl --kepler-mtot --fit-wind-shape --fit-scatter \
-    --wind-norm physical --fit-fopacity --mdot 4e-6 --v-inf 1750 \
+    --fit-fopacity --mdot 4e-6 --v-inf 1750 \
     --likelihood jitter --counts-per-bin 100 \
     --sampler zeus --n-walkers 24 --n-steps 30000 --n-burn 3000 \
     --n-threads 4 --dth 5.0 --d2h 6.0 --scatter-eclipse-phase 0.4 0.6 \
@@ -1992,23 +2114,23 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
 ```
 
 **Interpreting `M_X` / `M_RH`:** the light curve is independent of `q` in
-*every* mode, and under the default `--wind-norm lam` it is scale-invariant as
-well — so with `--kepler` both masses are set entirely by their priors and must
-not be quoted as measurements. Prefer `--kepler-mtot`, which samples
-`(M_tot, q_m)`: under `--wind-norm physical`, `M_tot` is a weak measurement
-(`a` to ±10–15%, so `M_tot ∝ a³` to ~±35%) while the split remains the `q_m`
-prior. See [Phase 28](#phase-28--physical-wind-normalization--per-cell-flux-conversion)
-and [Phase 29](#phase-29--mass-reparameterization--error-column-fix).
+*every* mode, so with `--kepler` the split between the two masses is set
+entirely by the priors and must not be quoted as a measurement. Prefer
+`--kepler-mtot`, which samples `(M_tot, q_m)`: with the physical normalization
+`M_tot` is a weak measurement (`a` to ±10–15%, so `M_tot ∝ a³` to ~±35%) while
+the split remains the `q_m` prior.
+See [Phase 28](#phase-28--physical-wind-normalization--per-cell-flux-conversion),
+[Phase 29](#phase-29--mass-reparameterization--error-column-fix) and
+[Phase 31](#phase-31--release-trim-lam-wind-models-and-flux-methods).
 
 **`--data-dir` resolves `{band}/single` before `{band}/`.** Pass the band
 directory explicitly to control which observations are fitted.
 
-**Uncommitted work in progress** (branch `add_generic_wind`): Phase 19 —
-Gaussian smoothing, `f_scatter`, and residual panels — is implemented in
-`chandra_phase_analysis.py`, `mcmc_lightcurve_fit.py`, `xrb_lightcurve.py`, and
-`xrb_toy_wind_models.ipynb` but not yet committed.
+**Notebooks are stale.** They have not been updated for the Phase 31 removals;
+`notebooks/xrb_model_analysis_single_15803.ipynb` calls the deleted
+`compute_surface_density`.
 
 ---
 
-**Last Updated:** September 9, 2026  
+**Last Updated:** September 12, 2026  
 **Maintainer:** R. Panchal

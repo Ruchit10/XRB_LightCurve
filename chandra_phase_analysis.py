@@ -229,8 +229,9 @@ def main() -> None:
         action="store_true",
         help="Optimize the model phase shift to minimize χ². By default the "
              "shift is held at 0. Flux is never rescaled: the model's absolute "
-             "normalization comes from --lam and the XSPEC flux-vs-nH table, and "
-             "the only y-direction freedom is the additive --scatter floor. "
+             "normalization is fixed by the wind mass-loss rate and the XSPEC "
+             "flux-vs-nH table, and the only y-direction freedom is the "
+             "additive --scatter floor. "
              "(--rescale is accepted as a deprecated alias.)",
     )
     

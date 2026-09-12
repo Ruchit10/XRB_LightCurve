@@ -356,9 +356,10 @@ def plot_phase(
 
     A thin adapter over :func:`plot_lightcurve_fit`: it interpolates *sim_df* at
     the requested *shift* and additive *scatter*, then delegates all drawing.
-    The model overlay is shown at its native flux normalization (set by ``lam``
-    and the XSPEC flux-vs-nH table); the only y-direction adjustment is the
-    additive *scatter* floor. There is no multiplicative scale factor — see
+    The model overlay is shown at its native flux normalization (set by the
+    wind mass-loss rate and the XSPEC flux-vs-nH table); the only y-direction
+    adjustment is the additive *scatter* floor. There is no multiplicative
+    scale factor — see
     :func:`utils.utils.fit_simulation`.
 
     Parameters
@@ -608,7 +609,7 @@ def plot_trace(sampler, band: str, wind_model: str, output_path: str,
 #                companion centre. (L3, h3) are Cartesian components and
 #                l3 = sqrt(L3^2 + h3^2) is the projected separation -- exactly
 #                the quantity the eclipse test compares against R +/- r.
-#   fl           lam-normalized column density N_H (1e22 cm^-2)
+#   fl           absolute wind column density N_H (1e22 cm^-2)
 #   is_eclipsed  per-phase geometric eclipse flag
 # Two panels of the old plot_results.plot_geometric_parameters are deliberately
 # not reproduced: "Time vs Phase" is linear by construction, and A2 is the
@@ -824,7 +825,7 @@ def plot_geometry_vs_phase(
         _shade_eclipse(ax_nh, phase, eclipsed, label=None)
         ax_nh.plot(phase, fl, '-', color='C4', lw=2)
         ax_nh.axhline(float(np.nanmean(fl)), color='0.4', ls='--', lw=1.0,
-                      label=f'orbit mean = {np.nanmean(fl):.4g} (= $\\lambda$)')
+                      label=f'orbit mean = {np.nanmean(fl):.4g}')
         ax_nh.set_ylabel('$N_H$ ($10^{22}$ cm$^{-2}$)')
         ax_nh.set_title('Wind column density along the line of sight', fontsize=11)
         ax_nh.legend(fontsize=8, loc='best')
@@ -967,7 +968,7 @@ def plot_simulation_bands(
 ) -> None:
     """Grid of per-band model light curves from a simulation DataFrame.
 
-    One panel for the raw wind LOS integral and the lam-scaled column density
+    One panel for the raw wind LOS integral and the absolute column density
     (when present), then one per detected ``nfl_{band}`` column.
     """
     bands = detect_energy_bands(sim_df)

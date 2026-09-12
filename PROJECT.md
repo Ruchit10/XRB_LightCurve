@@ -128,16 +128,17 @@ no fitting.
 ### Wind density profiles
 
 Every profile is expressed as a **dimensionless** shape function `g(r)`
-(`r` in solar radii). Absolute amplitude is not part of `g`; it is absorbed by
-the `lam` normalization step (below). Registry: `WIND_MODEL_IDS`,
+(`r` in solar radii). Absolute amplitude is not part of `g`; it is supplied by
+the physical normalization step (below). Registry: `WIND_MODEL_IDS`,
 `WIND_MODEL_PARAM_KEYS`.
 
 | `wind_model`  | id | Parameters             | Form |
 | ------------- | -- | ---------------------- | ---- |
-| `broken_pl`   | 0  | `Rb, p`                | Piecewise power law: `(r/Rb)^-p` inside `Rb`, `(r/Rb)^-2` outside. |
-| `smooth_pl`   | 1  | `Rb, p, Delta`         | **Default.** Smoothly broken PL: `(r/Rb)^-2 · [1 + (Rb/r)^Δ]^((p-2)/Δ)`. |
-| `beta_law`    | 2  | `R_star, beta, H`      | CAK velocity law: `g = 1/(r²·v(r))` with `v ∝ (1-e^{-(r-R★)/H})(1-R★/r)^β`. |
-| `confinement` | 3  | `R_star, fconf, ell`   | `1/r²` with inner exponential compression: `[1 + f_conf·e^{-(r-R★)/ℓ}]/r²`. |
+| `smooth_pl`   | 0  | `Rb, p, Delta`         | **Default.** Smoothly broken PL: `(r/Rb)^-2 · [1 + (Rb/r)^Δ]^((p-2)/Δ)`. |
+| `confinement` | 1  | `R_star, fconf, ell`   | `1/r²` with inner exponential compression: `[1 + f_conf·e^{-(r-R★)/ℓ}]/r²`. |
+
+Both relax to a constant-velocity `r⁻²` wind at large radius, which is what
+lets `wind_asymptotic_coefficient()` tie `g` to a physical mass-loss rate.
 
 Two implementations kept in lockstep:
 
@@ -151,11 +152,11 @@ Two implementations kept in lockstep:
 keys), so nothing dict-shaped enters the hot loop.
 `default_wind_params(wind_model, R)` supplies sensible starting values.
 
-### LOS integration kernels
+### LOS integration kernel
 
-**Fast path — `_simulate_phases_numba`** (`@njit(cache=True, parallel=True)`).
-A single "mega-kernel" that computes *all* phases in one call, with `prange`
-over phases. Per phase it:
+**`_simulate_phases_numba`** (`@njit(cache=True, parallel=True)`) is the only
+integrator. A single "mega-kernel" computes *all* phases in one call, with
+`prange` over phases. Per phase it:
 
 1. Computes orbital geometry (`l`, `L`, `h`, `z_start`).
 2. Runs the eclipse test. Gating is on `sin(gma) > 0` so an emitter *in front of*
@@ -166,7 +167,9 @@ over phases. Per phase it:
    10 radial cells) inline — trig tables precomputed once per call — masks cells
    blocked by the companion, forms segments from consecutive unmasked cells, and
    integrates each segment's LOS column.
-4. Reduces to `flx = Σ(los·A)/ΣA`, `icd = Σ(los·A)`, `A2 = ΣA`.
+4. Reduces to `flx = Σ(los·A)/ΣA`, `icd = Σ(los·A)`, `A2 = ΣA`, and also returns
+   the **per-cell** column and area arrays that the nonlinear `nH → flux`
+   conversion needs.
 
 **Quadrature — `_los_gl_quadrature`.** The LOS integral
 `∫_{-∞}^{z_start} g(√(b²+z²)) dz` is evaluated by 16-point Gauss-Legendre
@@ -178,15 +181,14 @@ quadrature under the substitution `u = arctan(z/b)`:
 
 This maps the slowly decaying `r^-2` tail onto a bounded, smooth integrand on a
 finite interval, so 16 fixed nodes give high accuracy for any profile and any
-impact parameter — no `Rmax` heuristic, no special-casing `b` vs `Rb`. Nodes and
-weights are module constants (`_GL16_X`, `_GL16_W`).
+impact parameter — the full `z`-tail is always integrated, with no cutoff radius
+to choose and no special-casing of `b` vs `Rb`. Nodes and weights are module
+constants (`_GL16_X`, `_GL16_W`).
 
-**Legacy path — `_wind_los_profile_numba`** (fixed-step trapezoid in `z`, with
-adaptive convergence stopping or a hard `Rmax` cutoff). Reached only via the
-standalone `wind_los_integral()` helper, or when `Rmax` is set explicitly
-without `converge_rmax`. `create_grid()` / `density_function()` /
-`wind_los_integral()` remain as the debuggable, per-phase Python API (plus a
-vectorized NumPy fallback when Numba is unavailable).
+**Numba is a hard requirement.** The module raises `ImportError` at import if it
+is missing. There is no trapezoid fallback: the mega-kernel is also the only
+path that returns per-cell columns, and converting the *mean* column instead
+badly understates eclipse-core leakage.
 
 Performance: one full `simulate_lightcurve` call is **≈ 60 ms** on a laptop,
 which is what makes direct-evaluation MCMC feasible.
@@ -196,21 +198,20 @@ which is what makes direct-evaluation MCMC feasible.
 ```python
 simulate_lightcurve(
     r=0.001, R=2.0, d1=11.0, d2=8.0, gma0=-90.0, i0=64.0,
-    dth=1.0, d2h=6.0, dz=0.5,
-    flux_method="legacy", flux_csv_path=None, flux_type="erg",
-    lam=0.589537,
-    Rmax=None, converge_rmax=False,
+    dth=1.0, d2h=6.0,
+    flux_method="interpolate", flux_csv_path=None, flux_type="erg",
     wind_model="smooth_pl", wind_params=None,
     scattered_flux=0.0,
-    verbose=False, n_jobs=1,
+    mdot=4.0e-6, v_inf=1750.0, mu_wind=1.4, f_opacity=1.0,
+    verbose=False,
 ) -> pd.DataFrame
 ```
 
 **Inclination convention.** `i0` is the standard astronomical inclination:
 degrees from the orbital-plane normal, so `i0 = 90°` is edge-on (eclipses
 possible) and `i0 = 0°` is face-on (the orbit lies in the plane of the sky and
-never eclipses). The geometry kernels (`_simulate_phases_numba`,
-`wind_los_integral`) instead measure `incl` from the *line of sight*, because
+never eclipses). The geometry kernel (`_simulate_phases_numba`) instead measures
+`incl` from the *line of sight*, because
 that is the angle appearing directly in `h = a·sin(γ)·sin(incl)` (sky-plane) and
 `z = a·sin(γ)·cos(incl)` (along the LOS). `simulate_lightcurve` bridges the two
 with `inclination_to_internal_rad(i0) = (90 − i0)·π/180`, at the input boundary
@@ -226,13 +227,20 @@ Output columns:
 | `flx` | Raw dimensionless mean LOS integral `⟨∫g dz⟩`. |
 | `icd` | Area-weighted (unnormalized) column integral. |
 | `is_eclipsed` | Bool — geometric total eclipse. |
-| `fl` | Scaled column density in `10²² cm⁻²`, normalized so `mean(fl) = lam`. |
+| `fl` | Absolute column density `N_H` in `10²² cm⁻²`. |
 | `nfl_{band}` | Band flux after `nH → flux` conversion (one column per band). |
 
-**Normalization.** `fl = flx · lam/mean(flx)`, i.e. the orbit-averaged column is
-pinned to `lam` (taken from the spectral fit). This is why `g(r)` needs no
-absolute scale, and why `lam` is held fixed in MCMC — wind *shape* is constrained
-by the light-curve shape, wind *amplitude* by the spectrum.
+**Normalization.** `fl = flx · f_opacity · n₀ · R_sun / 1e22`, with `n₀` fixed
+from `mdot`/`v_inf` (see below). The column therefore carries real units, so the
+light curve constrains the *absolute* scale of the system rather than only
+ratios such as `R/a`, the eclipse emerges from wind opacity instead of a
+geometric cutoff, and `R` means the true photosphere.
+
+**Per-cell flux conversion.** `nfl_{band}` is `⟨F(N)⟩` over the emitter disk,
+*not* `F(⟨N⟩ ) = F(fl)`. The `nH → flux` map is strongly nonlinear, and during
+ingress/egress and in the eclipse core the column varies by orders of magnitude
+across the disk, so the surviving flux is dominated by the least-absorbed cells.
+This is why the kernel returns per-cell columns and areas.
 
 **Eclipse flux.** During eclipse all `nfl_*` are forced to `0`. (Without this
 they would collapse to *maximum* flux, since `flx = 0 ⇒ e⁰ = 1`.)
@@ -245,11 +253,13 @@ distort an additive constant.
 
 ### Flux conversion (`--flux_method`)
 
-- `legacy` — hardcoded exponentials (`nfl_hard = 9.524·e^{-0.057 fl}`,
-  `nfl_soft = 9.3923·e^{-2.5062 fl}`).
-- `interpolate` — log-log interpolation of the XSPEC `flux vs nH` CSV
-  (recommended). Bands auto-detected from `flux_{band}_{ph|erg}` columns.
-- `refit` — refit `A·e^{-B·nH}` to the CSV per band.
+`--flux_csv` is required for both methods.
+
+- `interpolate` — **default.** Log-log interpolation of the XSPEC `flux vs nH`
+  CSV. Bands auto-detected from `flux_{band}_{ph|erg}` columns.
+- `refit` — refit `A·e^{-B·nH}` to the CSV per band. Cheaper and smoother, at
+  the cost of a small systematic error where the true curve departs from a
+  single exponential.
 
 `_FLUX_CACHE` (module-level, keyed by `(abs csv path, flux_type)`) caches the
 cleaned/sorted arrays and the prebuilt `interp1d` objects, plus a per-band
@@ -257,30 +267,35 @@ exponential-fit cache — so an MCMC run reads and prepares the CSV once, not on
 per likelihood call. `verbose=False` also suppresses the per-call "detected
 bands" print and the extrapolation `UserWarning`.
 
-### Physical back-calculation helpers
+### Physical wind normalization
 
-Constants: `R_SUN_CM`, `M_H_G`, `M_SUN_G`, `KM_TO_CM`.
+Constants: `R_SUN_CM`, `M_H_G`, `M_SUN_G`, `KM_TO_CM`, `YEAR_S`,
+`MU_WIND_DEFAULT = 1.4`.
 
-Since the simulation only ever needs `g(r)`, the physical amplitude has to be
-recovered afterwards from `lam`:
+The absolute density is an **input**, derived from the mass-loss rate. Far from
+the star every supported profile relaxes to `g(r) → C/r²`; matching that limit
+to a spherical constant-velocity wind
+`n(r) = Ṁ / (4π (r R_sun)² v_inf μ m_H)` gives
 
 ```
-n_0 = (lam · 1e22) / (R_sun · mean(flx))        [cm^-3]
+n_0 = Mdot / (4π · R_sun² · v_inf · μ · m_H · C)   [cm^-3]
 n(r) = n_0 · g(r)
 ```
 
-- `compute_surface_density(sim_df, lam, R_star, wind_model, wind_params)` →
-  `n(R_star)` in cm⁻³.
-- `compute_wind_normalization_constants(lam, flx_mean, wind_model, wind_params, v_inf=None, mu=1.4)`
-  → per-model constants: for `smooth_pl` the break density
-  (`n_break_cm3`, `rho_b_g_cm3`); for `beta_law`/`confinement` the surface
-  density plus the `Mdot/v_inf` prefactor (`mdot_over_vinf_g_per_cm`), and — if
-  `v_inf` is supplied in km/s — `mdot_g_s` and `mdot_msun_yr`. `v_inf` is *not*
-  a fitted parameter (it was absorbed into `n_0` by the `lam` normalization), so
-  the caller must supply it to get a mass-loss rate.
-- `wind_density_posterior(...)` and
-  `wind_normalization_constants_posterior(...)` propagate MCMC samples through
-  the above and return `{samples, median, p16, p84}` per constant.
+- `wind_asymptotic_coefficient(wind_model, wind_params)` → `C`: `Rb²` for
+  `smooth_pl`, `1.0` for `confinement`.
+- `wind_density_norm_from_mdot(mdot_msun_yr, v_inf_kms, wind_model, wind_params, mu)`
+  → `n_0`, called once per `simulate_lightcurve`.
+
+`mu_wind = 1.4` converts the wind *mass* column into the equivalent-hydrogen
+column the solar-abundance TBabs table expects.
+
+**`f_opacity`.** A WR wind is hyper-ionized, clumped and He-rich, so its
+effective photoelectric opacity is far below what its mass column implies.
+`f_opacity` multiplies the Ṁ-derived column to absorb that difference. The
+Clark & Crowther (2004) Ṁ overpredicts the observed `N_H` for IC 10 X-1 by
+~1.5–2 dex, so values of ~0.01–0.03 are expected. In MCMC it is fitted as
+`log10 f_opa` (`--fit-fopacity`) rather than assumed.
 
 ---
 
@@ -366,8 +381,8 @@ Shared by both the single-model and MCMC plot paths:
 - **`fit_simulation(obs_df, sim_df, sim_column, fit_phase_shift=False, scatter=0.0)`**
   — χ² against an interpolated (wrap-around-safe) model curve. **Only the phase
   shift (x-direction) is fitted; there is no multiplicative flux scale.** The
-  model's absolute normalization is already fixed by `lam` + the XSPEC
-  flux-vs-nH table, so a free y-scale would silently absorb an error in that
+  model's absolute normalization is already fixed by the wind mass-loss rate
+  and the XSPEC flux-vs-nH table, so a free y-scale would silently absorb an error in that
   normalization instead of exposing it; the only y-direction freedom is the
   *additive* `scatter` floor, supplied by the caller (measured at mid-eclipse)
   rather than fitted. This matches `mcmc_lightcurve_fit.py`, which likewise
@@ -490,14 +505,15 @@ dimensions:
 
 | `--wind-model` | Free         | Fixed         | Tied to geometry |
 | -------------- | ------------ | ------------- | ---------------- |
-| `smooth_pl`    | `Rb, p`      | `Delta`       | — |
-| `beta_law`     | `beta`       | `H = 1.0`     | `R_star = R` |
+| `smooth_pl`    | `Rb, p`      | `Delta = 2.0` | — |
 | `confinement`  | `fconf, ell` | —             | `R_star = R` |
 
 Registries: `WIND_MODELS`, `WIND_SHAPE_FIT`, `WIND_SHAPE_FIXED`,
-`WIND_SHAPE_LABELS`, `WIND_SHAPE_PRIORS`. `broken_pl` is not offered here since
-`smooth_pl` generalizes it. Priors are overridable via
-`--prior-Rb/-p/-beta/-fconf/-ell` using `mean,std,min,max`.
+`WIND_SHAPE_LABELS`, `WIND_SHAPE_PRIORS`, `ALL_WIND_SHAPE_NAMES`. Priors are
+overridable via `--prior-Rb/-p/-fconf/-ell` using `mean,std,min,max`.
+
+`--fit-fopacity` additionally promotes `log10 f_opacity` to a free dimension
+(prior `FOPACITY_PRIOR`, centred at `-1.5`).
 
 ### Likelihoods
 
@@ -615,11 +631,11 @@ All three live in `utils/plot_utils.py`.
   - **`*_geometry_phase.png`** — projected separation `l3(φ)` against the
     `R ± r` thresholds with the eclipse shaded, the sky-plane components
     (`h > 0` ⇒ emitter behind, which is what gates the eclipse test),
-    `N_H(φ)` with its orbit mean (should equal `lam`), and the band flux. Turns
+    `N_H(φ)` with its orbit mean, and the band flux. Turns
     the eclipse from an emergent light-curve feature into a stated geometric
     condition with visible margin.
   - **`*_wind_profile.png`** — `g(r)` with 68/95% posterior credible bands, an
-    `r⁻²` reference, the companion surface, characteristic radii (`Rb`/`H`/`ell`)
+    `r⁻²` reference, the companion surface, characteristic radii (`Rb`/`ell`)
     and — the important part — the band of radii the line of sight actually
     probes. That band is `[min l3, max l3]`: the LOS impact parameter relative
     to the companion centre *equals* the projected separation, so the profile
@@ -649,7 +665,7 @@ All three live in `utils/plot_utils.py`.
 **Every option not given explicitly is restored from `*_run_config.json`**, so
 `python mcmc_lightcurve_fit.py --replot` on its own reproduces the original
 band, wind model, `--flux-csv`, `--data-dir`, `--obs-column`/`--time-column`,
-binning, `--lam`/`--dth`/`--d2h`, priors and model flags. This matters because
+binning, `--dth`/`--d2h`, the wind normalization, priors and model flags. This matters because
 those options change the *observed arrays*: replotting with different binning
 silently reports a χ²/dof for a dataset the posterior never saw. Explicit flags
 always win over the saved values, so a single option can be overridden in place
@@ -748,7 +764,7 @@ python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec --model tbabs \
 python xrb_lightcurve.py --flux_method interpolate \
     --flux_csv flux_vs_nH_tbabs_broad.csv \
     --wind-model smooth_pl --Rb 5 --p 4 --Delta 1 \
-    --i0 78.0 --lam 0.572385 --output sim_broad.csv
+    --i0 78.0 --f-opacity 0.02 --output sim_broad.csv
 
 # 3. Fold the data and χ²-fit that one model (phase shift free; flux never rescaled)
 python chandra_phase_analysis.py \
@@ -826,7 +842,7 @@ Conda env `henv` (heasoft/XSPEC + Python deps). Beyond
 - **`arviz`** — convergence summaries (optional; degrades gracefully).
 - **`zeus-mcmc`** — `--sampler zeus` (optional).
 - **`astropy`** — FITS conversion utilities.
-- **`joblib`** — only the legacy per-phase parallel path.
+- **`numba`** — **required**; the module raises `ImportError` without it.
 - **XSPEC Python (`pyxspec`)** — `compute_flux_vs_nH.py`, `xspec_fit_mcmc.py`,
   `compute_count_to_flux_factor.py`.
 
@@ -876,10 +892,11 @@ are standalone data-prep scripts, not part of the package API:
 | [changes_tracked.md](changes_tracked.md) | Full change log, including removed features. |
 | [mcmc_chi2_jitter_explanation.md](mcmc_chi2_jitter_explanation.md) | Likelihood/jitter math and emcee-vs-zeus internals. |
 | [PERFORMANCE_VALIDATION_REPORT.md](PERFORMANCE_VALIDATION_REPORT.md) | Benchmark harness and parity thresholds. |
-| `Wind_Density.pdf` | Source equations for the four wind profiles. |
+| `Wind_Density.pdf` | Source equations for the wind profiles (includes `broken_pl` / `beta_law`, both since removed). |
 | `stu2151.pdf` | Laycock et al. 2015 — ephemeris and eclipse properties. |
 | `FLUX_INTEGRATION_SUMMARY.md`, `FLUX_METHODS_QUICKREF.md`, `XSPEC_CONVERSION_GUIDE.md`, `FITS_CONVERSION_README.md`, `QUICK_START_FLUX_CONVERSION.md`, `CONVERSION_WORKFLOW.md`, `README_CONVERSION_TOOLS.md` | Flux-conversion and FITS-pipeline guides. |
-| [README.md](README.md), [MIGRATION_SUMMARY.md](MIGRATION_SUMMARY.md) | **Stale** — describe the original R→Python port. |
+| [README.md](README.md) | User-facing overview: pipeline, parameters, output columns. |
+| [MIGRATION_SUMMARY.md](MIGRATION_SUMMARY.md) | **Stale** — describes the original R→Python port. |
 
 ### Plans (`.cursor/plans/`)
 One `*.plan.md` per feature increment: `unified_wind_model`,
@@ -902,16 +919,11 @@ One `*.plan.md` per feature increment: `unified_wind_model`,
   orbital-plane normal, so those chains store the complement of what the model
   expects. New run configs carry `"inclination_convention":
   "i0-from-orbital-normal"` and `--replot` warns when the stamp is absent; the
-  fix is to refit. The notebooks and `rkp_run_w_mcmc_cmds.sh` still pass
-  old-convention `--i0` / `--prior-i0` values.
-- **`Delta` default is inconsistent.** `xrb_lightcurve.py --Delta` defaults to
-  `1.0`, but `default_wind_params("smooth_pl")` and
-  `mcmc_lightcurve_fit.WIND_SHAPE_FIXED['smooth_pl']` both use `2.0` (and the
-  MCMC module docstring says "Delta is fixed at 2"). CLI runs and MCMC runs
-  therefore use different break sharpness unless `--Delta` is passed explicitly.
-- **`dz` default differs** between `xrb_lightcurve.py` (`0.5`) and the MCMC
-  simulation group (`0.1`). Low impact: `dz` only affects the legacy
-  trapezoid path, not the Gauss-Legendre mega-kernel used in practice.
+  fix is to refit. The notebooks still pass old-convention `--i0` /
+  `--prior-i0` values (`rkp_run_w_mcmc_cmds.sh` has been updated).
+- **The notebooks have not been updated** for the `lam` / `broken_pl` /
+  `beta_law` / `legacy` removals. `notebooks/xrb_model_analysis_single_15803.ipynb`
+  in particular calls the deleted `compute_surface_density`.
 - **Reference epoch is unresolved.** Laycock et al. define `T0` as the
   *mid-eclipse* time of ObsID 07082 at **phase 0.5**, whereas
   `frac((t-T0)/P)` puts it at phase 0.0. A recalibration study
@@ -919,11 +931,8 @@ One `*.plan.md` per feature increment: `unified_wind_model`,
   `278800407.267`, which sits commented out beside `REF_EPOCH`. In practice the
   MCMC's per-sample phase-shift search absorbs the offset, so this mostly
   affects the interpretability of plotted phases.
-- **`README.md` and `MIGRATION_SUMMARY.md` are stale**, documenting removed
-  API (`--lam2`, `flx2`/`fl2`, `nfl_*_av`/`_cv`, `pho_count_*`).
-- **`rkp_run_w_mcmc_cmds.sh` contains dead flags** from earlier versions
-  (`--wind-model av`, `--load-grid`, `--no-grid`, `--lam2`, `--compute-waic`,
-  `--n-workers`). Use the [workflow examples](#typical-workflows) above instead.
+- **`MIGRATION_SUMMARY.md` is stale**, documenting removed API
+  (`--lam2`, `flx2`/`fl2`, `nfl_*_av`/`_cv`, `pho_count_*`).
 - **Some referenced helper files are absent** from the working tree:
   `find_reference_epoch.py`, `compare_absorption_models.xcm` (which
   `compare_models.sh` invokes), `xspec_get_conversion_factors_tbabs.xcm`,
@@ -931,8 +940,6 @@ One `*.plan.md` per feature increment: `unified_wind_model`,
 - **`.gitignore` excludes `*.csv`, `*.txt`, `*.png`**, so data, XSPEC tables,
   and figures are not version-controlled — inputs must be regenerated or copied
   in on a fresh clone.
-- **`requirements.txt` is incomplete** (missing `numba`, `arviz`, `zeus-mcmc`,
-  `astropy`).
 - **`chandra_analysis_combined_flux.py` is an unmigrated fork.** It still
   carries its own older copies of `detect_flux_columns`, `validate_sim_columns`,
   `fit_simulation`, `plot_phase` and `plot_multi_column_fits`, has no `scatter`

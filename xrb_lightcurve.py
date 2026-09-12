@@ -15,43 +15,34 @@ import numpy as np
 import pandas as pd
 import math
 import os
-import sys
 import warnings
 from typing import Tuple, List, Optional, Dict, Callable
 from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
 
 try:
-    import numba
     from numba import njit, prange
-    HAS_NUMBA = True
-except ImportError:
-    HAS_NUMBA = False
-
-    def njit(*args, **kwargs):                    # noqa: E303
-        """No-op decorator when numba is not installed."""
-        def _decorator(func):
-            return func
-        if args and callable(args[0]):
-            return args[0]
-        return _decorator
-
-    prange = range  # type: ignore[assignment]
+except ImportError as exc:  # pragma: no cover - environment guard
+    raise ImportError(
+        "numba is required: the Gauss-Legendre mega-kernel is the only LOS "
+        "integrator, and it is also the only path that returns the per-cell "
+        "columns needed for the nonlinear N_H -> flux conversion. "
+        "Install with: pip install numba"
+    ) from exc
 
 # =============================================================================
 # Wind density profiles
 # =============================================================================
 #
 # Each wind model defines a dimensionless density profile g(r) with r in solar
-# radii. The absolute scale of g is arbitrary — the simulation either normalizes
-# the wind LOS integral so that mean(fl) = lam (wind_norm="lam", the historical
-# behavior), or fixes it from Mdot/v_inf (wind_norm="physical").
+# radii. The absolute scale of g is arbitrary; the simulation fixes it from
+# Mdot / v_inf (see wind_density_norm_from_mdot), so the column density carries
+# real units and the light curve is sensitive to the absolute size of the
+# system rather than only to ratios such as R/a.
 #
 # Supported models (Wind_Density.pdf):
-#   0 broken_pl   — piecewise power law; params (Rb, p)
-#   1 smooth_pl   — smoothly broken power law; params (Rb, p, Delta)
-#   2 beta_law    — velocity-based (exponential + CAK beta-law); params (R_star, beta, H)
-#   3 confinement — inner confinement / compression; params (R_star, fconf, ell)
+#   0 smooth_pl   — smoothly broken power law; params (Rb, p, Delta)
+#   1 confinement — inner confinement / compression; params (R_star, fconf, ell)
 
 # Physical constants. Defined here rather than beside the column-density
 # helpers below because they are used as default argument values.
@@ -67,16 +58,12 @@ YEAR_S = 3.1558e7  # 1 Julian year in s
 MU_WIND_DEFAULT = 1.4
 
 WIND_MODEL_IDS: Dict[str, int] = {
-    "broken_pl": 0,
-    "smooth_pl": 1,
-    "beta_law": 2,
-    "confinement": 3,
+    "smooth_pl": 0,
+    "confinement": 1,
 }
 
 WIND_MODEL_PARAM_KEYS: Dict[str, Tuple[str, ...]] = {
-    "broken_pl": ("Rb", "p"),
     "smooth_pl": ("Rb", "p", "Delta"),
-    "beta_law": ("R_star", "beta", "H"),
     "confinement": ("R_star", "fconf", "ell"),
 }
 
@@ -127,15 +114,6 @@ def _g_profile(r, model_id, p1, p2, p3, p4):
         return 0.0
 
     if model_id == 0:
-        # broken_pl: Rb=p1, p=p2
-        Rb = p1
-        p_slope = p2
-        x = r / Rb
-        if x <= 1.0:
-            return x ** (-p_slope)
-        return x ** (-2.0)
-
-    if model_id == 1:
         # smooth_pl: Rb=p1, p=p2, Delta=p3
         Rb = p1
         p_slope = p2
@@ -148,21 +126,7 @@ def _g_profile(r, model_id, p1, p2, p3, p4):
         exponent = (p_slope - 2.0) / Delta
         return base * (bracket ** exponent)
 
-    if model_id == 2:
-        # beta_law: R_star=p1, beta=p2, H=p3
-        R_star = p1
-        beta = p2
-        H = p3
-        if r <= R_star:
-            return 0.0
-        u1 = 1.0 - math.exp(-(r - R_star) / H)
-        u2 = (1.0 - R_star / r) ** beta
-        v = u1 * u2
-        if v <= 0.0:
-            return 0.0
-        return 1.0 / (r * r * v)
-
-    if model_id == 3:
+    if model_id == 1:
         # confinement: R_star=p1, fconf=p2, ell=p3
         R_star = p1
         fconf = p2
@@ -189,41 +153,16 @@ def evaluate_g_profile(
     if model_id == 0:
         Rb = p1
         p_slope = p2
-        x = np.where(r > 0.0, r / Rb, np.inf)
-        return np.where(x <= 1.0, x ** (-p_slope), x ** (-2.0))
-
-    if model_id == 1:
-        Rb = p1
-        p_slope = p2
         Delta = p3
-        if Delta <= 0.0:
-            x = np.where(r > 0.0, r / Rb, np.inf)
-            return x ** (-2.0)
         x = np.where(r > 0.0, r / Rb, np.inf)
+        if Delta <= 0.0:
+            return x ** (-2.0)
         base = x ** (-2.0)
         bracket = 1.0 + (1.0 / x) ** Delta
         exponent = (p_slope - 2.0) / Delta
         return base * (bracket ** exponent)
 
-    if model_id == 2:
-        R_star = p1
-        beta = p2
-        H = p3
-        out = np.zeros_like(r)
-        mask = r > R_star
-        if np.any(mask):
-            rr = r[mask] if r.ndim > 0 else np.array([float(r)])
-            u1 = 1.0 - np.exp(-(rr - R_star) / H)
-            u2 = np.where(rr > R_star, (1.0 - R_star / rr) ** beta, 0.0)
-            v = u1 * u2
-            inner = np.where(v > 0.0, 1.0 / (rr * rr * v), 0.0)
-            if r.ndim > 0:
-                out[mask] = inner
-                return out
-            return inner[0]
-        return out
-
-    if model_id == 3:
+    if model_id == 1:
         R_star = p1
         fconf = p2
         ell = p3
@@ -235,23 +174,19 @@ def evaluate_g_profile(
 
 
 # =============================================================================
-# Numba-accelerated LOS integration kernels
+# Numba-accelerated LOS integration kernel
 # =============================================================================
 #
-# Two LOS integration paths exist:
-#
-#  1) `_wind_los_profile_numba`  — original adaptive trapezoid in z. Used by
-#     the standalone `wind_los_integral` for backwards compatibility / debug.
-#
-#  2) `_simulate_phases_numba`   — fast mega-kernel that, for each phase,
-#     builds the polar emitter grid inline and integrates every cell's LOS
-#     using fixed-node Gauss-Legendre quadrature with the substitution
-#     u = arctan(z/b). This collapses the slowly-decaying r^{-2} tail to a
-#     bounded smooth integrand on a finite interval, so 16 GL nodes per cell
-#     give >10 digits of accuracy for any wind profile and any impact
-#     parameter (no special-casing of b vs Rb). The whole 360-phase loop
-#     runs under one numba @njit(parallel=True) call with prange over phases,
-#     eliminating per-phase Python overhead and per-call thread launches.
+# `_simulate_phases_numba` is a mega-kernel that, for each phase, builds the
+# polar emitter grid inline and integrates every cell's LOS using fixed-node
+# Gauss-Legendre quadrature with the substitution u = arctan(z/b). This
+# collapses the slowly-decaying r^{-2} tail to a bounded smooth integrand on a
+# finite interval, so 16 GL nodes per cell give >10 digits of accuracy for any
+# wind profile and any impact parameter (no special-casing of b vs Rb), and the
+# full z-tail is always integrated — there is no cutoff radius to choose. The
+# whole 360-phase loop runs under one numba @njit(parallel=True) call with
+# prange over phases, eliminating per-phase Python overhead and per-call thread
+# launches.
 
 # Pre-computed 16-point Gauss-Legendre nodes/weights on [-1, 1].
 # Generated once via numpy.polynomial.legendre.leggauss(16).
@@ -331,8 +266,8 @@ def _simulate_phases_numba(
         consecutive valid (i.e. unmasked) cell pair within the same theta
         ring, build the segment (av_x, av_th, av_db, A_seg) and integrate
         its LOS column with `_los_gl_quadrature`.
-      - Reduce per-phase to mean(lw)/sum(A) etc., matching the legacy
-        `_compute_one_phase` outputs.
+      - Reduce per-phase to the area-weighted mean column mean(lw)/sum(A),
+        alongside the raw sums and the per-cell arrays.
     """
     n_phases = gma_values.shape[0]
     flx_out = np.zeros(n_phases)
@@ -412,7 +347,7 @@ def _simulate_phases_numba(
 
         # Walk the polar grid in (i_th, i_r) flat order, tracking the previous
         # unmasked cell so that consecutive unmasked cells within the same
-        # theta ring (dx > 0) form a segment — matches the legacy create_grid.
+        # theta ring (dx > 0) form an annular-sector segment.
         prev_is_set = False
         prev_r = 0.0
         prev_th = 0.0
@@ -470,373 +405,9 @@ def _simulate_phases_numba(
         cell_col_out, cell_area_out, cell_count_out,
     )
 
-
-@njit(cache=True, parallel=True)
-def _wind_los_profile_numba(
-    av_db,
-    A,
-    z_start,
-    dz,
-    model_id,
-    p1,
-    p2,
-    p3,
-    p4,
-    Rmax,
-    converge_rmax,
-    eps_rel,
-    min_steps,
-    r_cap,
-):
-    """
-    Generic LOS integral of a user-selected dimensionless density profile g(r).
-
-    For each cell i, integrates g(sqrt(b^2 + z^2)) along z using a fixed-step
-    trapezoidal rule starting at z = z_start and stepping by -dz.
-
-    - converge_rmax: adaptive stopping once the per-step contribution falls
-      below `eps_rel * integral_so_far` (after `min_steps` steps and once a
-      positive running integral is accumulated). The max-contribution test is
-      also applied so that the integrator does not terminate before it has
-      crossed the peak of the integrand (important when the LOS starts far in
-      front of or behind the wind center). `r_cap` is a hard safety cap.
-    - otherwise: integrate from z = z_start down to z = -sqrt(Rmax^2 - b^2).
-
-    Returns (lw, los_arr) where lw = los * A, los_arr = unweighted integral.
-    """
-    N = len(av_db)
-    lw = np.zeros(N)
-    los_arr = np.zeros(N)
-
-    # Cell loop is embarrassingly parallel: each iteration only writes to its
-    # own (lw[i], los_arr[i]) slot. Numba parallel=True + prange dispatches
-    # cells across CPU threads.
-    for i in prange(N):
-        b = av_db[i]
-        if b < 1e-8:
-            b = 1e-8
-        b2 = b * b
-
-        integral = 0.0
-
-        if converge_rmax:
-            z = z_start
-            r0 = math.sqrt(b2 + z * z)
-            g_prev = _g_profile(r0, model_id, p1, p2, p3, p4)
-            max_contrib = 0.0
-            # Track integral as of when max_contrib was last updated; this lets
-            # the termination check compare the current step to how much
-            # integrand mass accumulated after the peak was seen.
-            integral_at_peak = 0.0
-            k = 0
-            while True:
-                k += 1
-                z -= dz
-                r_cur = math.sqrt(b2 + z * z)
-                g_cur = _g_profile(r_cur, model_id, p1, p2, p3, p4)
-                contrib = 0.5 * (g_prev + g_cur) * dz
-                integral += contrib
-                abs_contrib = abs(contrib)
-                if abs_contrib > max_contrib:
-                    max_contrib = abs_contrib
-                    integral_at_peak = integral
-                g_prev = g_cur
-
-                if r_cur > r_cap:
-                    break
-                if k > min_steps and integral > 0.0:
-                    # Terminate once the step contribution is a small fraction
-                    # of the integral accumulated since the peak. This handles
-                    # both (a) monotonic-tail starts (peak at step 1, integral
-                    # grows fast) and (b) peak-crossing starts (integral_at_peak
-                    # set when peak is passed, then tail fraction shrinks).
-                    denom = integral - integral_at_peak
-                    if denom <= 0.0:
-                        denom = integral
-                    if abs_contrib < eps_rel * denom:
-                        break
-        else:
-            t2 = Rmax * Rmax - b2
-            if t2 <= 0.0:
-                continue
-            t = math.sqrt(t2)
-            if abs(z_start) > t:
-                continue
-            end_k = int(math.floor((z_start + t) / dz))
-            r0 = math.sqrt(b2 + z_start * z_start)
-            g_prev = _g_profile(r0, model_id, p1, p2, p3, p4)
-            for k in range(1, end_k + 1):
-                z = z_start - dz * k
-                r_cur = math.sqrt(b2 + z * z)
-                g_cur = _g_profile(r_cur, model_id, p1, p2, p3, p4)
-                integral += 0.5 * (g_prev + g_cur) * dz
-                g_prev = g_cur
-
-        lw[i] = integral * A[i]
-        los_arr[i] = integral
-
-    return lw, los_arr
-
-
 # =============================================================================
-# Grid construction
+# Flux conversion (XSPEC flux-vs-nH table)
 # =============================================================================
-
-def create_grid(
-    r: float, l: float, R: float, gma: float, d2h: float = 6.0
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Create grid for wind integral of eclipsing binaries.
-
-    Args:
-        r: Radius of smaller star B (compact object)
-        l: Separation along viewing plane
-        R: Radius of larger star A (companion)
-        gma: Phase angle in radians
-        d2h: Angle size for polar grid cell (degrees)
-
-    Returns:
-        Tuple of (av_x, av_th, av_db, A) arrays
-    """
-    # Create polar grid
-    g1_r = np.linspace(r / 10, r, 10)
-    g1_th = np.linspace(0, 2 * np.pi, int(360 / d2h) + 1)
-
-    # Expand grid
-    g1_r_mesh, g1_th_mesh = np.meshgrid(g1_r, g1_th)
-    g1_r_flat = g1_r_mesh.flatten()
-    g1_th_flat = g1_th_mesh.flatten()
-
-    # Filter points based on conditions
-    # Only apply eclipse filtering when emitter is BEHIND companion (sin(gma) > 0)
-    # When emitter is in front (sin(gma) <= 0), no occultation is possible
-    if np.sin(gma) > 0:
-        # Calculate distance from center - filter out points blocked by companion
-        nn = np.sqrt(g1_r_flat**2 + l**2 - 2 * g1_r_flat * l * np.cos(g1_th_flat))
-        mask = nn >= R
-        g1_s_r = g1_r_flat[mask]
-        g1_s_th = g1_th_flat[mask]
-    else:
-        # Emitter is in front of companion - all points visible
-        g1_s_r = g1_r_flat
-        g1_s_th = g1_th_flat
-
-    if g1_s_r.size < 2:
-        return (
-            np.array([], dtype=float),
-            np.array([], dtype=float),
-            np.array([], dtype=float),
-            np.array([], dtype=float),
-        )
-
-    # Vectorized segment construction (adjacent pairs in flattened order)
-    x1 = g1_s_r[:-1]
-    x2 = g1_s_r[1:]
-    th1 = g1_s_th[:-1]
-    dx = x2 - x1
-    valid = dx > 0
-
-    if not np.any(valid):
-        return (
-            np.array([], dtype=float),
-            np.array([], dtype=float),
-            np.array([], dtype=float),
-            np.array([], dtype=float),
-        )
-
-    av_x = 0.5 * (x1[valid] + x2[valid])
-    av_th = 0.5 * (th1[valid] + (th1[valid] + (d2h * np.pi / 180.0)))
-    av_db = np.sqrt(av_x**2 + l**2 - 2.0 * av_x * l * np.cos(av_th))
-    A = 0.5 * (d2h * np.pi / 180.0) * ((x2[valid] ** 2) - (x1[valid] ** 2))
-
-    return av_x.astype(float), av_th.astype(float), av_db.astype(float), A.astype(float)
-
-
-def density_function(
-    d: float, l: float, gma: float, i: float
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Calculate wind density along the line of sight.
-
-    Args:
-        d: Separation between stars
-        l: Separation along viewing plane
-        gma: Phase angle in radians
-        i: Inclination angle in radians
-
-    Returns:
-        Tuple of (z5, colm) arrays
-    """
-    dz = 0.1
-    d4 = d
-    z4 = d * np.sin(gma) * np.cos(i)
-    t4 = np.sqrt((2 * d) ** 2 - l**2)
-
-    z5 = []
-    colm = []
-
-    while abs(z4) <= t4:
-        z5.append(z4)
-        colm.append(d4 ** (-2))
-        z4 = z4 - 0.1
-        d4 = np.sqrt(l**2 + z4**2)
-
-    return np.array(z5), np.array(colm)
-
-
-def wind_los_integral(
-    d: float,
-    d1: float,
-    d2: float,
-    gma: float,
-    i: float,
-    av_x: np.ndarray,
-    av_th: np.ndarray,
-    av_db: np.ndarray,
-    A: np.ndarray,
-    model_id: int,
-    p1: float,
-    p2: float,
-    p3: float,
-    p4: float,
-    dz: float = 0.5,
-    Rmax: Optional[float] = None,
-    converge_rmax: bool = False,
-    conv_eps_rel: float = 1e-4,
-    conv_min_steps: int = 50,
-    conv_r_cap_mult: float = 50.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Calculate wind column integral along the line of sight for a chosen density profile.
-
-    For each emitter cell, integrates the dimensionless profile g(r) along the
-    LOS using a fixed-step trapezoidal rule.
-
-    Args:
-        d: Separation between stars
-        d1: Distance of star B from COM
-        d2: Distance of star A from COM
-        gma: Phase angle in radians
-        i: Inclination angle in radians
-        av_x, av_th, av_db: Grid arrays
-        A: Area array
-        model_id, p1..p4: Packed wind profile parameters (see pack_wind_params).
-        dz: Step along line of sight (solar radii)
-        Rmax: Maximum radius (solar radii) for fixed-cutoff LOS integration.
-        converge_rmax: If True, ignore Rmax and integrate adaptively until tail
-            contributions become negligible.
-        conv_eps_rel: Relative convergence tolerance for adaptive stopping
-            (compared to max step contribution seen so far).
-        conv_min_steps: Minimum number of dz-steps before convergence check starts.
-        conv_r_cap_mult: Safety cap for adaptive integration, as multiple of d
-            (stop when r >= cap).
-
-    Returns:
-        Tuple of (lw, icd, A2) arrays where lw[i] = los[i] * A[i],
-        icd = los_values without area weight, A2 = A passed through.
-    """
-    if av_db is None or av_db.size == 0:
-        return (
-            np.array([], dtype=float),
-            np.array([], dtype=float),
-            np.array([], dtype=float),
-        )
-
-    # z start and bounds (identical for each cell within a phase)
-    z1 = d1 * np.sin(gma) * np.cos(i)
-    z2 = d2 * np.sin(gma) * np.cos(i)
-    z_start = z1 + z2
-
-    r_cap = float(conv_r_cap_mult) * float(d)
-    converge_flag = bool(converge_rmax) or (Rmax is None)
-    Rmax_use = float(Rmax) if Rmax is not None else 0.0
-
-    if HAS_NUMBA:
-        lw, los = _wind_los_profile_numba(
-            av_db.astype(np.float64),
-            A.astype(np.float64),
-            float(z_start),
-            float(dz),
-            int(model_id),
-            float(p1),
-            float(p2),
-            float(p3),
-            float(p4),
-            Rmax_use,
-            converge_flag,
-            float(conv_eps_rel),
-            int(conv_min_steps),
-            r_cap,
-        )
-        return lw, los, A.astype(np.float64)
-
-    # --- numpy fallback (vectorized fixed-step trapezoidal) ---
-    b = av_db.astype(float)
-    b_safe = np.maximum(b, 1e-8)
-    g_name = _id_to_name(int(model_id))
-    g_params = _unpack_params(int(model_id), float(p1), float(p2), float(p3), float(p4))
-
-    if converge_flag:
-        # Vectorized approximation of the adaptive path: integrate out to a
-        # fixed cap on every cell. Profiles in this code fall off at least as
-        # r^-2 so 200 solar radii already captures >99% of the LOS integral
-        # for realistic geometries; the `r_cap` passed in is only used as an
-        # upper bound here to cap memory usage in the numpy fallback.
-        z_max_extent = float(min(r_cap, 200.0))
-        max_steps = int(math.ceil((float(z_start) + z_max_extent) / float(dz)))
-        if max_steps < 2:
-            return (
-                np.zeros_like(b),
-                np.zeros_like(b),
-                A.astype(float),
-            )
-        k_arr = np.arange(max_steps + 1, dtype=float)
-        z_vals = float(z_start) - float(dz) * k_arr
-        r_grid = np.sqrt((b_safe ** 2)[:, None] + (z_vals[None, :]) ** 2)
-        g_vals = evaluate_g_profile(r_grid, g_name, g_params)
-        # Zero-out contributions past r_cap to tighten the tail
-        g_vals = np.where(r_grid <= r_cap, g_vals, 0.0)
-        inner = 0.5 * (g_vals[:, :-1] + g_vals[:, 1:])
-        los = float(dz) * np.sum(inner, axis=1)
-        lw = los * A.astype(float)
-        return lw.astype(float), los.astype(float), A.astype(float)
-
-    # Fixed-Rmax numpy fallback
-    t = np.sqrt(np.maximum((Rmax_use ** 2) - (b ** 2), 0.0))
-    valid_cells = (t > 0) & (np.abs(z_start) <= t)
-    end_k = np.floor((z_start + t) / dz).astype(int)
-    end_k = np.where(valid_cells, end_k, -1)
-    max_steps = int(end_k.max()) if end_k.size else -1
-    if max_steps < 0:
-        return (
-            np.zeros_like(b),
-            np.zeros_like(b),
-            A.astype(float),
-        )
-    k_arr = np.arange(max_steps + 1, dtype=float)
-    z_vals = z_start - dz * k_arr
-    r_grid = np.sqrt((b_safe ** 2)[:, None] + (z_vals[None, :]) ** 2)
-    step_mask = (k_arr[None, :] <= end_k[:, None]) & valid_cells[:, None]
-    g_vals = evaluate_g_profile(r_grid, g_name, g_params)
-    g_vals = np.where(step_mask, g_vals, 0.0)
-    inner = 0.5 * (g_vals[:, :-1] + g_vals[:, 1:])
-    los = float(dz) * np.sum(inner, axis=1)
-    lw = los * A.astype(float)
-    return lw.astype(float), los.astype(float), A.astype(float)
-
-
-def _id_to_name(model_id: int) -> str:
-    for name, mid in WIND_MODEL_IDS.items():
-        if mid == model_id:
-            return name
-    raise ValueError(f"Unknown wind model id: {model_id}")
-
-
-def _unpack_params(model_id: int, p1: float, p2: float, p3: float, p4: float) -> Dict[str, float]:
-    name = _id_to_name(model_id)
-    keys = WIND_MODEL_PARAM_KEYS[name]
-    vals = (p1, p2, p3, p4)[: len(keys)]
-    return dict(zip(keys, vals))
 
 
 def get_available_bands_from_csv(df: pd.DataFrame) -> List[str]:
@@ -999,79 +570,6 @@ def _interpolate_flux_from_context(
     return 10 ** log_flux
 
 
-def interpolate_flux_from_nh(
-    nh_1e22: np.ndarray,
-    df: pd.DataFrame,
-    band: str,
-    flux_type: str = "erg",
-    warn_extrapolation: bool = True,
-) -> np.ndarray:
-    """
-    Interpolate flux values for given nH array using CSV data.
-    
-    Args:
-        nh_1e22: Array of nH values in 1e22 cm^-2 units
-        df: DataFrame from load_flux_vs_nh_csv
-        band: Band name (e.g., "soft", "hard", "broad", "medium")
-        flux_type: Which flux column to use — "erg" (erg/cm^2/s, default) or
-                   "ph" (photons/cm^2/s)
-        
-    Returns:
-        Array of interpolated flux values in units determined by flux_type
-        
-    Raises:
-        ValueError: If band/flux_type column is not found in DataFrame
-    """
-    flux_col = f"flux_{band}_{flux_type}"
-
-    if flux_col not in df.columns:
-        available = get_available_bands_from_csv(df)
-        raise ValueError(
-            f"Column '{flux_col}' not found in CSV. "
-            f"Available bands: {available}. "
-            f"flux_type must be 'ph' or 'erg'."
-        )
-    
-    # Sort by nH for interpolation
-    df_sorted = df.sort_values("nH_1e22")
-    nh_csv = df_sorted["nH_1e22"].values
-    flux_csv = df_sorted[flux_col].values
-    
-    # Filter out NaN/invalid flux values
-    valid = np.isfinite(flux_csv) & (flux_csv > 0)
-    if not np.any(valid):
-        raise ValueError(f"No valid flux data for band '{band}'")
-    
-    nh_csv = nh_csv[valid]
-    flux_csv = flux_csv[valid]
-    
-    # Check range coverage
-    nh_min, nh_max = nh_csv.min(), nh_csv.max()
-    if warn_extrapolation and (
-        np.any(nh_1e22 < nh_min) or np.any(nh_1e22 > nh_max)
-    ):
-        warnings.warn(
-            f"Some nH values are outside CSV range [{nh_min:.3f}, {nh_max:.3f}] 1e22 cm^-2 for band '{band}'. "
-            f"Extrapolation will be used (fill_value='extrapolate')."
-        )
-    
-    # Create interpolator (log-log space for better behavior)
-    interp_func = interp1d(
-        np.log10(nh_csv),
-        np.log10(flux_csv),
-        kind="linear",
-        fill_value="extrapolate",
-        bounds_error=False,
-    )
-    
-    # Interpolate (handle edge cases)
-    nh_1e22 = np.asarray(nh_1e22)
-    nh_1e22_safe = np.clip(nh_1e22, 1e-6, 1e6)  # Avoid log10(0)
-    log_flux = interp_func(np.log10(nh_1e22_safe))
-    flux = 10 ** log_flux
-    
-    return flux
-
 
 def fit_exponential_to_csv(
     df: pd.DataFrame, band: str, flux_type: str = "erg"
@@ -1145,14 +643,6 @@ def fit_exponential_to_csv(
         return float(A), float(B)
         
     except Exception as e:
-        # Fallback legacy values are photon-flux-based; only apply for flux_type="ph"
-        if flux_type == "ph":
-            if band == "hard":
-                warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy ph values.")
-                return 9.524e-13, 0.057
-            elif band == "soft":
-                warnings.warn(f"Exponential fit failed for {band} band: {e}. Using legacy ph values.")
-                return 9.3923e-13, 2.5062
         raise ValueError(
             f"Exponential fit failed for {band} band (flux_type='{flux_type}'): {e}"
         ) from e
@@ -1163,14 +653,10 @@ def default_wind_params(wind_model: str, R: float) -> Dict[str, float]:
     Return sensible default parameters for a given wind model.
 
     `R` is the companion radius in solar radii, used as `R_star` for the
-    velocity-based and confinement models.
+    confinement model.
     """
-    if wind_model == "broken_pl":
-        return {"Rb": 5.0, "p": 4.0}
     if wind_model == "smooth_pl":
         return {"Rb": 5.0, "p": 4.0, "Delta": 2.0}
-    if wind_model == "beta_law":
-        return {"R_star": float(R), "beta": 1.0, "H": 1.0}
     if wind_model == "confinement":
         return {"R_star": float(R), "fconf": 10.0, "ell": 0.5}
     raise ValueError(f"Unknown wind_model '{wind_model}'")
@@ -1184,8 +670,8 @@ def inclination_to_internal_rad(i0_deg: float) -> float:
     is edge-on (eclipses possible) and ``i0 = 0 deg`` is face-on (the orbit lies
     in the plane of the sky and never eclipses).
 
-    The geometry kernels (``_simulate_phases_numba``, ``wind_los_integral``)
-    instead measure ``incl`` from the *line of sight*, so that
+    The geometry kernel (``_simulate_phases_numba``) instead measures ``incl``
+    from the *line of sight*, so that
     ``h = a sin(gma) sin(incl)`` is the sky-plane offset and
     ``z = a sin(gma) cos(incl)`` the offset along the line of sight. The two
     differ by the 90 deg complement applied here; nothing downstream changes.
@@ -1202,19 +688,13 @@ def simulate_lightcurve(
     i0: float = 64.0,
     dth: float = 1.0,
     d2h: float = 6.0,
-    dz: float = 0.5,
     verbose: bool = False,
-    n_jobs: int = 1,
-    flux_method: str = "legacy",
+    flux_method: str = "interpolate",
     flux_csv_path: Optional[str] = None,
     flux_type: str = "erg",
-    lam: float = 0.589537,
-    Rmax: Optional[float] = None,
-    converge_rmax: bool = False,
     wind_model: str = "smooth_pl",
     wind_params: Optional[Dict[str, float]] = None,
     scattered_flux: float = 0.0,
-    wind_norm: str = "lam",
     mdot: float = 4.0e-6,
     v_inf: float = 1750.0,
     mu_wind: float = MU_WIND_DEFAULT,
@@ -1235,327 +715,140 @@ def simulate_lightcurve(
             inclination_to_internal_rad(); the geometry itself is unchanged.
         dth: Orbital increment in degrees
         d2h: Angular cell size (degrees) for the polar grid used in the surface integral
-        dz: Step size along the line of sight (solar radii)
-        verbose: If True, prints per-phase progress
-        n_jobs: Number of parallel workers across phases (1 = serial)
+        verbose: If True, prints a one-line summary of the kernel call
         flux_method: Method for converting nH to flux. Options:
-            - "legacy": Use hardcoded exponential coefficients (default)
-            - "interpolate": Interpolate from CSV flux vs nH data
-            - "refit": Fit new exponentials to CSV data
-        flux_csv_path: Path to CSV file from compute_flux_vs_nH.py (required if flux_method != "legacy")
-        flux_type: Which flux column from the CSV to use — "erg" (erg/cm^2/s, default)
-            or "ph" (photons/cm^2/s). Only applies when flux_method is "interpolate" or "refit".
-        lam: Target mean nH in 1e22 cm^-2 units. The raw wind integral (flx) is
-            scaled so that mean(fl) = lam. Default 0.589537 (i.e., mean nH ≈ 5.9e21 cm^-2).
-        Rmax: Maximum radius (solar radii) used as a hard cutoff for LOS integration.
-            If None, the LOS integration uses adaptive convergence stopping (see converge_rmax).
-            Note: the CLI sets the default to 2*(d1+d2), reproducing the legacy cutoff.
-        converge_rmax: If True, ignore fixed Rmax and integrate adaptively until tail contributions are negligible.
-        wind_model: Name of the dimensionless wind density profile. One of
-            "broken_pl", "smooth_pl", "beta_law", "confinement". Default "smooth_pl".
+            - "interpolate": log-log interpolation of the CSV flux vs nH table
+              (default)
+            - "refit": fit exponentials A*exp(-B*nH) to the same CSV table
+        flux_csv_path: Path to CSV file from compute_flux_vs_nH.py (required)
+        flux_type: Which flux column from the CSV to use — "erg" (erg/cm^2/s,
+            default) or "ph" (photons/cm^2/s).
+        wind_model: Name of the dimensionless wind density profile, one of
+            "smooth_pl" or "confinement". Default "smooth_pl".
         wind_params: Dict of profile parameters (see WIND_MODEL_PARAM_KEYS).
             If None, uses defaults from default_wind_params(wind_model, R).
         scattered_flux: Constant additive flux offset applied to all ``nfl_*``
             columns after eclipse handling. Useful for modeling phase-invariant
             scattered flux floors.
+        mdot: WR mass-loss rate in Msun/yr, setting the absolute wind density.
+        v_inf: Wind terminal velocity in km/s.
+        mu_wind: Mean mass per hydrogen-equivalent nucleus, converting the wind
+            mass column into the N_H the solar-abundance TBabs table expects.
+        f_opacity: Effective-opacity factor applied to the Mdot-derived column,
+            absorbing wind photoionization, clumping and WR abundance
+            departures.
 
     Returns:
         DataFrame with simulation results. Key columns:
-            - flx: Raw (unscaled) mean wind LOS integral per phase
-            - fl: Scaled nH values (1e22 cm^-2 units), mean(fl) = lam
-            - nfl_{band}: Photon or energy flux per band (depending on flux_method)
-            
+            - flx: Raw dimensionless mean wind LOS integral per phase
+            - fl: Absolute column density N_H in 1e22 cm^-2
+            - nfl_{band}: Band flux, area-averaged over the emitter disk
+
     Notes:
-        - The column density integral (flx) has arbitrary units until scaled.
-        - The scaling factor is computed as lam / mean(flx), so mean(fl) = lam.
-        - fl values are in units of 1e22 cm^-2 (e.g., fl=1.0 means nH = 1.0e22 cm^-2).
+        - The density normalization n_0 is fixed from mdot / v_inf, so ``fl``
+          carries real units. The eclipse therefore emerges from wind opacity
+          rather than from a geometric cutoff, and ``R`` means the true
+          photosphere rather than an effective opaque radius.
+        - The nH -> flux conversion is nonlinear, so the band flux is computed
+          per emitter cell and only then area-averaged: <F(N)> != F(<N>) when
+          the column varies steeply across the disk, which it does during
+          ingress/egress and throughout the eclipse core.
     """
     # Convert angles to radians
     gma = gma0 * np.pi / 180
     # Only the input convention changes here: `i` is the internal angle from the
     # line of sight that every geometry expression below already assumes.
     i = inclination_to_internal_rad(i0)
-    d = d1 + d2
 
     # Wind profile parameter packing (done once per call)
     if wind_params is None:
         wind_params = default_wind_params(wind_model, R)
-    # For velocity-based and confinement profiles, auto-fill R_star from R
-    # if the caller omitted it.
-    if wind_model in ("beta_law", "confinement") and "R_star" not in wind_params:
+    # For the confinement profile, auto-fill R_star from R if the caller
+    # omitted it.
+    if wind_model == "confinement" and "R_star" not in wind_params:
         wind_params = dict(wind_params)
         wind_params["R_star"] = float(R)
     model_id, p1, p2, p3, p4 = pack_wind_params(wind_model, wind_params)
-
-    # Integration cutoff handling
-    # - If converge_rmax is enabled OR Rmax is None: use adaptive stopping
-    # - Otherwise: use fixed cutoff at Rmax
-    converge_rmax_use = bool(converge_rmax) or (Rmax is None)
-    Rmax_use: Optional[float] = None if Rmax is None else float(Rmax)
 
     # Prepare phase values
     n_iterations = int(360 / dth)
     gma_values = gma + (np.arange(n_iterations) * (dth * np.pi / 180.0))
 
-    # ------------------------------------------------------------------
-    # Fast path: mega-kernel that processes ALL phases inside one numba
-    # parallel call using Gauss-Legendre quadrature for the LOS integral.
-    # Requirements:
-    #   - numba available
-    #   - using adaptive integration limits (Rmax_use is None or
-    #     converge_rmax_use is True) — the GL quadrature integrates the
-    #     full z-tail, equivalent to converge_rmax=True. For legacy
-    #     fixed-Rmax behavior we fall back to the per-phase Python path.
-    # ------------------------------------------------------------------
-    use_mega_kernel = (
-        HAS_NUMBA
-        and (Rmax_use is None or converge_rmax_use)
+    # One numba parallel call covers every phase; the Gauss-Legendre quadrature
+    # integrates the full z-tail, so there is no cutoff radius to choose.
+    (flx_arr, icd_arr, A2_arr, l_arr, L_arr, h_arr, eclipsed_arr,
+     cell_col_arr, cell_area_arr, cell_count_arr) = _simulate_phases_numba(
+        gma_values.astype(np.float64),
+        float(r),
+        float(R),
+        float(d1),
+        float(d2),
+        float(i),
+        float(d2h),
+        int(model_id),
+        float(p1), float(p2), float(p3), float(p4),
+        _GL16_X, _GL16_W,
     )
+    if verbose:
+        print(f"Computed {n_iterations} phases via mega-kernel "
+              f"(GL quadrature, parallel over phases)")
 
-    cell_col_arr = None
-    cell_area_arr = None
-    cell_count_arr = None
-
-    if use_mega_kernel:
-        (flx_arr, icd_arr, A2_arr, l_arr, L_arr, h_arr, eclipsed_arr,
-         cell_col_arr, cell_area_arr, cell_count_arr) = (
-            _simulate_phases_numba(
-                gma_values.astype(np.float64),
-                float(r),
-                float(R),
-                float(d1),
-                float(d2),
-                float(i),
-                float(d2h),
-                int(model_id),
-                float(p1), float(p2), float(p3), float(p4),
-                _GL16_X, _GL16_W,
-            )
-        )
-        deg_arr = gma_values * (180.0 / np.pi)
-        time_arr = deg_arr * 348.42
-        phase_arr = (gma_values - (gma0 * np.pi / 180.0)) / (2.0 * np.pi)
-        if verbose:
-            print(f"Computed {n_iterations} phases via mega-kernel "
-                  f"(GL quadrature, parallel over phases)")
-        flx = np.asarray(flx_arr, dtype=float)
-        icd_vals = np.asarray(icd_arr, dtype=float)
-        A2_vals = np.asarray(A2_arr, dtype=float)
-        ph = np.asarray(gma_values, dtype=float)
-        deg = np.asarray(deg_arr, dtype=float)
-        phase = np.asarray(phase_arr, dtype=float)
-        time = np.asarray(time_arr, dtype=float)
-        l3 = np.asarray(l_arr, dtype=float)
-        L3 = np.asarray(L_arr, dtype=float)
-        h3 = np.asarray(h_arr, dtype=float)
-        is_eclipsed = np.asarray(eclipsed_arr, dtype=bool)
-        # Skip the per-phase python loop below
-        _skip_python_loop = True
-    else:
-        _skip_python_loop = False
-
-    # Worker to compute one phase
-    def _compute_one_phase(cur_gma: float):
-        h1 = d1 * np.sin(cur_gma) * np.sin(i)
-        h2 = d2 * np.sin(cur_gma) * np.sin(i)
-        L1 = d1 * np.cos(cur_gma)
-        L2 = d2 * np.cos(cur_gma)
-        l1 = np.sqrt(h1**2 + L1**2)
-        l2 = np.sqrt(h2**2 + L2**2)
-        h = h1 + h2
-        L = L1 + L2
-        l = l1 + l2
-
-        a = l**2 + r**2 - R**2
-        b = 2 * abs(l) * r
-        n = l / (R + r)
-
-        # Track if emitter is fully eclipsed (blocked by companion)
-        is_eclipsed = False
-
-        def _integrate(cur_gma_inner):
-            av_x, av_th, av_db, A_cells = create_grid(r, l, R, cur_gma_inner, d2h=d2h)
-            lw, icd_val, A2_val = wind_los_integral(
-                d,
-                d1,
-                d2,
-                cur_gma_inner,
-                i,
-                av_x,
-                av_th,
-                av_db,
-                A_cells,
-                model_id,
-                p1,
-                p2,
-                p3,
-                p4,
-                dz=dz,
-                Rmax=Rmax_use,
-                converge_rmax=converge_rmax_use,
-            )
-            if lw.size > 0:
-                flx_val = float(np.sum(lw) / np.sum(A_cells))
-                icd_val_sum = float(np.sum(lw))
-                A2_val_sum = float(np.sum(A_cells))
-            else:
-                flx_val = 0.0
-                icd_val_sum = 0.0
-                A2_val_sum = 0.0
-            return flx_val, icd_val_sum, A2_val_sum
-
-        # Only check for eclipse when emitter is BEHIND companion (sin(gma) > 0)
-        # When emitter is in front (sin(gma) <= 0), no occultation possible
-        if np.sin(cur_gma) > 0:
-            if n >= 1:
-                flx_i, icd_i, A2_i = _integrate(cur_gma)
-            else:
-                n2 = a / b
-                n3 = l / (R - r)
-                if abs(n3) <= 1:
-                    is_eclipsed = True
-                    flx_i = 0.0
-                    icd_i = 0.0
-                    A2_i = 0.0
-                else:
-                    flx_i, icd_i, A2_i = _integrate(cur_gma)
-        else:
-            flx_i, icd_i, A2_i = _integrate(cur_gma)
-
-        deg_i = cur_gma * 180.0 / np.pi
-        time_i = deg_i * 348.42
-        phase_i = (cur_gma - (gma0 * np.pi / 180.0)) / (2.0 * np.pi)
-        return (
-            flx_i,
-            icd_i,
-            A2_i,
-            cur_gma,
-            deg_i,
-            phase_i,
-            time_i,
-            l,
-            L,
-            h,
-            is_eclipsed,
-        )
-
-    # Compute phases, optionally in parallel (skipped if mega-kernel was used)
-    if not _skip_python_loop:
-        if n_jobs == 1:
-            results_list = []
-            for idx, cur_gma in enumerate(gma_values):
-                out = _compute_one_phase(cur_gma)
-                results_list.append(out)
-                if verbose:
-                    print(f"Phase: {out[4]:.2f} degrees")
-        else:
-            try:
-                from joblib import Parallel, delayed
-
-                results_list = Parallel(n_jobs=n_jobs, prefer="processes")(
-                    delayed(_compute_one_phase)(float(cur_gma)) for cur_gma in gma_values
-                )
-                if verbose:
-                    for out in results_list:
-                        print(f"Phase: {out[4]:.2f} degrees")
-            except Exception:
-                # Fallback to serial if joblib missing or errors
-                results_list = []
-                for idx, cur_gma in enumerate(gma_values):
-                    out = _compute_one_phase(cur_gma)
-                    results_list.append(out)
-                    if verbose:
-                        print(f"Phase: {out[4]:.2f} degrees")
-
-    if not _skip_python_loop:
-        # Unpack (now includes is_eclipsed flag)
-        flx, icd_vals, A2_vals, ph, deg, phase, time, l3, L3, h3, is_eclipsed = map(
-            np.asarray, zip(*results_list)
-        )
-
-    # Create results DataFrame
+    deg = gma_values * (180.0 / np.pi)
     results = pd.DataFrame(
         {
             "deg": deg,
-            "ph": ph,
-            "phase": phase,
-            "A2": A2_vals,
-            "flx": flx,
-            "icd": icd_vals,
-            "time": time,
-            "l3": l3,
-            "L3": L3,
-            "h3": h3,
-            "is_eclipsed": np.asarray(is_eclipsed, dtype=bool),
+            "ph": np.asarray(gma_values, dtype=float),
+            "phase": (gma_values - (gma0 * np.pi / 180.0)) / (2.0 * np.pi),
+            "A2": np.asarray(A2_arr, dtype=float),
+            "flx": np.asarray(flx_arr, dtype=float),
+            "icd": np.asarray(icd_arr, dtype=float),
+            "time": deg * 348.42,
+            "l3": np.asarray(l_arr, dtype=float),
+            "L3": np.asarray(L_arr, dtype=float),
+            "h3": np.asarray(h_arr, dtype=float),
+            "is_eclipsed": np.asarray(eclipsed_arr, dtype=bool),
         }
     )
 
     # ------------------------------------------------------------------
     # Column-density normalization.
     #
-    # "lam"      (default, backward compatible): rescale so mean(fl) = lam.
-    #            The absolute column is discarded, so the model depends only
-    #            on ratios (R/a, r/a, Rb/a) and the overall scale of the
-    #            system is unconstrained.
-    # "physical": set n_0 from Mdot / v_inf, so fl carries real units. This
-    #            breaks that scale degeneracy and lets the eclipse emerge
-    #            from wind opacity instead of from the geometric cutoff.
+    # n_0 is set from Mdot / v_inf, so fl carries real units. This breaks the
+    # scale degeneracy that an orbit-averaged rescaling would leave behind and
+    # lets the eclipse emerge from wind opacity instead of from a geometric
+    # cutoff.
     # ------------------------------------------------------------------
-    if wind_norm not in ("lam", "physical"):
-        raise ValueError(
-            f"Invalid wind_norm: {wind_norm!r}. Must be 'lam' or 'physical'."
-        )
+    n0 = wind_density_norm_from_mdot(
+        mdot, v_inf, wind_model, wind_params, mu=mu_wind
+    )
+    # fl is in units of 1e22 cm^-2; flx is the LOS integral of g in R_sun.
+    # f_opacity is an effective-opacity factor absorbing wind ionization,
+    # clumping and abundance departures from the solar-abundance TBabs table
+    # (a hyper-ionized wind has far less photoelectric opacity than its mass
+    # column implies).
+    col_scale = float(f_opacity) * n0 * R_SUN_CM / 1.0e22
+    results["fl"] = results["flx"].to_numpy(dtype=float) * col_scale
 
-    if wind_norm == "lam":
-        mean_flx = float(np.mean(flx))
-        col_scale = lam / mean_flx if mean_flx > 0 else 1.0
-    else:
-        n0 = wind_density_norm_from_mdot(
-            mdot, v_inf, wind_model, wind_params, mu=mu_wind
-        )
-        # fl is in units of 1e22 cm^-2; flx is the LOS integral of g in R_sun.
-        # f_opacity is an effective-opacity factor absorbing wind ionization,
-        # clumping and abundance departures from the solar-abundance TBabs
-        # table (a hyper-ionized wind has far less photoelectric opacity than
-        # its mass column implies).
-        col_scale = float(f_opacity) * n0 * R_SUN_CM / 1.0e22
+    # Build one nH -> flux mapping per band.
+    if flux_csv_path is None:
+        raise ValueError(f"flux_csv_path is required for flux_method='{flux_method}'")
 
-    fl = np.array(flx) * col_scale
-    results["fl"] = fl
-
-    # Build one nH -> flux mapping per band, then apply it either to the
-    # per-phase mean column (lam mode) or per emitter cell (physical mode).
     band_maps: Dict[str, Callable[[np.ndarray], np.ndarray]] = {}
-    if flux_method == "legacy":
-        # Legacy hardcoded exponential coefficients (single wind model only)
-        band_maps["hard"] = lambda n: 9.524 * np.exp(-n * 0.057)
-        band_maps["soft"] = lambda n: 9.3923 * np.exp(-n * 2.5062)
+    ctx = _build_flux_context(flux_csv_path, flux_type=flux_type)
+    available_bands = ctx["bands"]  # type: ignore[index]
+    if verbose:
+        print(f"Detected energy bands in CSV: {', '.join(available_bands)}")
 
-    elif flux_method == "interpolate":
-        # Interpolate from CSV data
-        if flux_csv_path is None:
-            raise ValueError("flux_csv_path required when flux_method='interpolate'")
-        ctx = _build_flux_context(flux_csv_path, flux_type=flux_type)
-        available_bands = ctx["bands"]  # type: ignore[index]
-        if verbose:
-            print(f"Detected energy bands in CSV: {', '.join(available_bands)}")
+    if flux_method == "interpolate":
         for band in available_bands:
             band_maps[band] = (
                 lambda n, _b=band: _interpolate_flux_from_context(
                     n, ctx, _b, warn_extrapolation=False,
                 )
             )
-
     elif flux_method == "refit":
-        # Fit new exponentials to CSV data
-        if flux_csv_path is None:
-            raise ValueError("flux_csv_path required when flux_method='refit'")
-        ctx = _build_flux_context(flux_csv_path, flux_type=flux_type)
-        available_bands = ctx["bands"]  # type: ignore[index]
         exp_fit_cache = ctx["exp_fit"]  # type: ignore[index]
-        if verbose:
-            print(f"Detected energy bands in CSV: {', '.join(available_bands)}")
-        # Keep behavior identical to existing fit_exponential_to_csv by
+        # Keep behavior identical to a direct fit_exponential_to_csv call by
         # constructing the same validated DataFrame once.
         df_flux, _ = load_flux_vs_nh_csv(flux_csv_path, verbose=False)
         for band in available_bands:
@@ -1565,46 +858,33 @@ def simulate_lightcurve(
                 A, B = fit_exponential_to_csv(df_flux, band, flux_type=flux_type)
                 exp_fit_cache[band] = (A, B)
             band_maps[band] = lambda n, _A=A, _B=B: _A * np.exp(-_B * n)
-
     else:
         raise ValueError(
             f"Invalid flux_method: {flux_method}. "
-            "Must be 'legacy', 'interpolate', or 'refit'"
+            "Must be 'interpolate' or 'refit'"
         )
 
-    use_per_cell = wind_norm == "physical"
-    if use_per_cell and cell_col_arr is None:
-        warnings.warn(
-            "wind_norm='physical' needs the numba mega-kernel for per-cell "
-            "columns; falling back to converting the mean column, which "
-            "understates the eclipse-core leakage. Install numba or leave "
-            "Rmax/converge_rmax at their defaults."
-        )
-        use_per_cell = False
-
-    if use_per_cell:
-        cell_nh = np.asarray(cell_col_arr, dtype=float) * col_scale
-        cell_A = np.asarray(cell_area_arr, dtype=float)
-        counts = np.asarray(cell_count_arr, dtype=np.int64)
-        valid = np.arange(cell_A.shape[1])[None, :] < counts[:, None]
-        cell_A = np.where(valid, cell_A, 0.0)
-        area_tot = cell_A.sum(axis=1)
+    # Per-cell columns, so the nonlinear nH -> flux map is applied before the
+    # area average rather than after it.
+    cell_nh = np.asarray(cell_col_arr, dtype=float) * col_scale
+    cell_A = np.asarray(cell_area_arr, dtype=float)
+    counts = np.asarray(cell_count_arr, dtype=np.int64)
+    valid = np.arange(cell_A.shape[1])[None, :] < counts[:, None]
+    cell_A = np.where(valid, cell_A, 0.0)
+    area_tot = cell_A.sum(axis=1)
 
     for band, fmap in band_maps.items():
         try:
-            if use_per_cell:
-                # <F(N)> over the emitter disk, NOT F(<N>): during ingress and
-                # in the eclipse core the column varies by orders of magnitude
-                # across the disk, and the surviving flux is dominated by the
-                # least-absorbed cells.
-                per_cell = fmap(cell_nh.reshape(-1)).reshape(cell_nh.shape)
-                num = np.einsum("ij,ij->i", np.nan_to_num(per_cell), cell_A)
-                results[f"nfl_{band}"] = np.divide(
-                    num, area_tot,
-                    out=np.zeros_like(num), where=area_tot > 0,
-                )
-            else:
-                results[f"nfl_{band}"] = fmap(fl)
+            # <F(N)> over the emitter disk, NOT F(<N>): during ingress and in
+            # the eclipse core the column varies by orders of magnitude across
+            # the disk, and the surviving flux is dominated by the
+            # least-absorbed cells.
+            per_cell = fmap(cell_nh.reshape(-1)).reshape(cell_nh.shape)
+            num = np.einsum("ij,ij->i", np.nan_to_num(per_cell), cell_A)
+            results[f"nfl_{band}"] = np.divide(
+                num, area_tot,
+                out=np.zeros_like(num), where=area_tot > 0,
+            )
         except Exception as e:
             warnings.warn(f"Failed to compute flux for band '{band}': {e}")
 
@@ -1626,7 +906,7 @@ def simulate_lightcurve(
 
 
 # =============================================================================
-# Surface number density helpers
+# Wind density normalization
 # =============================================================================
 #
 # Units note: the LOS integrator returns a dimensionless integral
@@ -1638,18 +918,10 @@ def simulate_lightcurve(
 # where n_0 is the "reference" number density such that the physical number
 # density at a point with dimensionless g value g(r) is n(r) = n_0 * g(r).
 #
-# The simulation normalizes so that mean(fl) = lam, i.e.
-#   mean(N_H) = lam * 1e22  (cm^-2)
-# Therefore
-#   n_0 = (lam * 1e22) / (R_sun * mean(flx_code))  (cm^-3)
-# This n_0 is the companion-surface number density when g(R_star) = 1
-# (true for the broken_pl / smooth_pl models at r = Rb, or for beta_law and
-# confinement when r just exceeds R_star and the normalization is chosen such
-# that g(r_reference) = 1). For a general profile, the surface density is
-#   n(R_star) = n_0 * g(R_star; params)
-#
-# compute_surface_density returns n(R_star) directly so callers need not know
-# about g's internal normalization.
+# n_0 is fixed from the mass-loss rate by matching the asymptotic r^-2 limit of
+# g to a spherical constant-velocity wind; see wind_density_norm_from_mdot.
+# The number density at any radius is then n(r) = n_0 * g(r; params), so the
+# companion-surface density is n(R_star) = n_0 * g(R_star; params).
 
 def wind_asymptotic_coefficient(
     wind_model: str, wind_params: Dict[str, float]
@@ -1660,10 +932,10 @@ def wind_asymptotic_coefficient(
     from the star every supported profile relaxes to a constant-velocity
     ``r^-2`` wind, and C is whatever prefactor that limit carries.
     """
-    if wind_model in ("broken_pl", "smooth_pl"):
+    if wind_model == "smooth_pl":
         Rb = float(wind_params["Rb"])
         return Rb * Rb
-    if wind_model in ("beta_law", "confinement"):
+    if wind_model == "confinement":
         return 1.0
     raise ValueError(f"Unknown wind_model '{wind_model}'")
 
@@ -1685,9 +957,8 @@ def wind_density_norm_from_mdot(
 
     with C from :func:`wind_asymptotic_coefficient`.
 
-    Unlike the ``mean(fl) = lam`` rescaling, this carries real units, which is
-    what makes the light curve sensitive to the *absolute* size of the system
-    rather than only to ratios such as R/a.
+    This carries real units, which is what makes the light curve sensitive to
+    the *absolute* size of the system rather than only to ratios such as R/a.
     """
     mdot_cgs = float(mdot_msun_yr) * M_SUN_G / YEAR_S
     v_cgs = float(v_inf_kms) * KM_TO_CM
@@ -1697,337 +968,6 @@ def wind_density_norm_from_mdot(
         raise ValueError("Non-positive denominator in wind density normalization.")
     return mdot_cgs / denom
 
-
-def compute_surface_density(
-    sim_df: pd.DataFrame,
-    lam: float,
-    R_star: float,
-    wind_model: str,
-    wind_params: Dict[str, float],
-) -> float:
-    """
-    Estimate the wind number density at the companion surface r = R_star.
-
-    Derivation:
-      The simulation scales the raw wind integral so that
-          mean(N_H) = lam * 1e22 cm^-2.
-      The physical LOS column is
-          N_H(phi) = n_0 * R_sun * flx_code(phi)
-      with flx_code the per-phase mean of the dimensionless LOS integral
-      returned by `wind_los_integral`. Taking the orbital mean:
-          lam * 1e22 = n_0 * R_sun * <flx_code>
-          n_0        = lam * 1e22 / (R_sun * <flx_code>)
-      The number density at any radius is n(r) = n_0 * g(r; params),
-      so at the companion surface:
-          n(R_star) = n_0 * g(R_star; params)
-
-    Args:
-        sim_df: DataFrame returned by `simulate_lightcurve` (needs the `flx` column).
-        lam: Target mean nH (1e22 cm^-2 units) used in that simulation.
-        R_star: Radius at which to evaluate the surface density (solar radii).
-        wind_model: Name of the wind profile (same one used in simulation).
-        wind_params: Parameter dict (same one used in simulation).
-
-    Returns:
-        n(R_star) in cm^-3.
-    """
-    if "flx" not in sim_df.columns:
-        raise KeyError("sim_df must contain a 'flx' column from simulate_lightcurve().")
-    flx_mean = float(np.mean(sim_df["flx"].to_numpy()))
-    if flx_mean <= 0.0:
-        raise ValueError("mean(flx) is non-positive; cannot compute surface density.")
-    g_surface = float(evaluate_g_profile(np.array([R_star]), wind_model, wind_params)[0])
-    if g_surface <= 0.0:
-        raise ValueError(
-            f"g(R_star={R_star}) = {g_surface} is non-positive for wind_model="
-            f"'{wind_model}'. Surface density is ill-defined at this radius."
-        )
-    n0 = (float(lam) * 1e22) / (R_SUN_CM * flx_mean)
-    return n0 * g_surface
-
-
-def compute_wind_normalization_constants(
-    lam: float,
-    flx_mean: float,
-    wind_model: str,
-    wind_params: Dict[str, float],
-    v_inf: Optional[float] = None,
-    mu: float = 1.4,
-) -> Dict[str, float]:
-    """
-    Back-calculate physical normalization constants for supported wind models.
-
-    The simulation evolves a dimensionless profile g(r) and enforces
-        mean(N_H) = lam * 1e22 cm^-2.
-    This implies a reference number density
-        n0 = lam * 1e22 / (R_sun * mean(flx_code)).
-
-    Using n0, this helper maps each model back to its physical normalization:
-      - smooth_pl: break density rho_b
-      - beta_law / confinement: Mdot/v_inf prefactor (and Mdot if v_inf supplied)
-
-    Args:
-        lam: Target mean column density in 1e22 cm^-2 units.
-        flx_mean: Mean of the raw dimensionless LOS integral (mean(sim_df["flx"])).
-        wind_model: One of "smooth_pl", "beta_law", "confinement".
-        wind_params: Wind-model parameter dictionary.
-        v_inf: Terminal velocity in km/s (optional; used for beta_law/confinement).
-        mu: Mean molecular weight for converting number to mass density.
-
-    Returns:
-        Dict of model-dependent normalization constants in physical units.
-    """
-    if flx_mean <= 0.0:
-        raise ValueError("flx_mean must be positive.")
-    if mu <= 0.0:
-        raise ValueError("mu must be positive.")
-
-    n0 = (float(lam) * 1e22) / (R_SUN_CM * float(flx_mean))
-    out: Dict[str, float] = {"n0_cm3": float(n0)}
-
-    if wind_model == "smooth_pl":
-        if "Rb" not in wind_params:
-            raise ValueError("wind_params for smooth_pl must include 'Rb'.")
-        Rb = float(wind_params["Rb"])
-        g_break = float(evaluate_g_profile(np.array([Rb]), wind_model, wind_params)[0])
-        if g_break <= 0.0:
-            raise ValueError(f"g(Rb={Rb}) is non-positive for smooth_pl.")
-        n_break = n0 * g_break
-        rho_b = mu * M_H_G * n_break
-        out["g_break"] = float(g_break)
-        out["n_break_cm3"] = float(n_break)
-        out["rho_b_g_cm3"] = float(rho_b)
-        return out
-
-    if wind_model in ("beta_law", "confinement"):
-        if "R_star" not in wind_params:
-            raise ValueError(f"wind_params for {wind_model} must include 'R_star'.")
-        R_star = float(wind_params["R_star"])
-        g_surface = float(
-            evaluate_g_profile(np.array([R_star]), wind_model, wind_params)[0]
-        )
-        if g_surface <= 0.0:
-            raise ValueError(
-                f"g(R_star={R_star}) is non-positive for wind_model='{wind_model}'."
-            )
-
-        n_surface = n0 * g_surface
-        rho_surface = mu * M_H_G * n_surface
-        mdot_over_vinf_cgs = mu * M_H_G * n0 * (4.0 * math.pi * (R_SUN_CM ** 2))
-
-        out["g_surface"] = float(g_surface)
-        out["n_surface_cm3"] = float(n_surface)
-        out["rho_surface_g_cm3"] = float(rho_surface)
-        out["mdot_over_vinf_g_per_cm"] = float(mdot_over_vinf_cgs)
-
-        if v_inf is not None:
-            v_inf_km_s = float(v_inf)
-            if v_inf_km_s <= 0.0:
-                raise ValueError("v_inf must be positive when provided.")
-            mdot_cgs = mdot_over_vinf_cgs * v_inf_km_s * KM_TO_CM
-            mdot_msun_yr = mdot_cgs * (3.1558e7 / M_SUN_G)
-            out["v_inf_km_s"] = float(v_inf_km_s)
-            out["mdot_g_s"] = float(mdot_cgs)
-            out["mdot_msun_yr"] = float(mdot_msun_yr)
-        return out
-
-    raise ValueError(
-        f"Unsupported wind_model '{wind_model}'. "
-        "Supported models are: smooth_pl, beta_law, confinement."
-    )
-
-
-def wind_density_posterior(
-    flx_mean,
-    lam_samples: np.ndarray,
-    R_star_samples,
-    wind_model: str,
-    wind_params_samples,
-) -> Dict[str, object]:
-    """
-    Posterior estimate of the wind surface number density n(R_star) from MCMC samples.
-
-    Two usage patterns:
-
-    (a) Fixed geometry (most common): run `simulate_lightcurve` once with the
-        best-fit geometry, take `flx_mean = mean(sim_df['flx'])`, then feed an
-        array of `lam` posterior samples here. `R_star_samples` and
-        `wind_params_samples` may be scalars / single dicts.
-
-    (b) Per-sample geometry: pass arrays/lists for each of `flx_mean`,
-        `R_star_samples`, `wind_params_samples` (one entry per posterior sample).
-        Callers are responsible for re-running `simulate_lightcurve` to build
-        those per-sample `flx_mean` values.
-
-    Args:
-        flx_mean: Scalar or 1-D array of mean(flx_code) per sample.
-        lam_samples: 1-D array of lam posterior samples (1e22 cm^-2 units).
-        R_star_samples: Scalar or 1-D array of R_star per sample (solar radii).
-        wind_model: Wind profile name.
-        wind_params_samples: Either a single dict (reused for all samples) or
-            an iterable of per-sample dicts with the same keys.
-
-    Returns:
-        Dict with keys:
-            - 'samples': per-sample n(R_star) array (cm^-3)
-            - 'median', 'p16', 'p84': summary statistics
-    """
-    lam_arr = np.asarray(lam_samples, dtype=float)
-    n_samples = lam_arr.size
-
-    flx_arr = np.asarray(flx_mean, dtype=float)
-    if flx_arr.ndim == 0:
-        flx_arr = np.full(n_samples, float(flx_arr))
-    if flx_arr.size != n_samples:
-        raise ValueError(
-            f"flx_mean must be scalar or have length {n_samples}, got {flx_arr.size}"
-        )
-
-    R_arr = np.asarray(R_star_samples, dtype=float)
-    if R_arr.ndim == 0:
-        R_arr = np.full(n_samples, float(R_arr))
-    if R_arr.size != n_samples:
-        raise ValueError(
-            f"R_star_samples must be scalar or have length {n_samples}, got {R_arr.size}"
-        )
-
-    if isinstance(wind_params_samples, dict):
-        params_iter = [wind_params_samples] * n_samples
-    else:
-        params_iter = list(wind_params_samples)
-        if len(params_iter) != n_samples:
-            raise ValueError(
-                f"wind_params_samples length {len(params_iter)} != n_samples {n_samples}"
-            )
-
-    out = np.empty(n_samples, dtype=float)
-    for idx in range(n_samples):
-        flx_i = flx_arr[idx]
-        if flx_i <= 0.0:
-            out[idx] = np.nan
-            continue
-        params_i = params_iter[idx]
-        g_surf = float(evaluate_g_profile(np.array([R_arr[idx]]), wind_model, params_i)[0])
-        if g_surf <= 0.0:
-            out[idx] = np.nan
-            continue
-        n0 = (lam_arr[idx] * 1e22) / (R_SUN_CM * flx_i)
-        out[idx] = n0 * g_surf
-
-    good = np.isfinite(out)
-    if not np.any(good):
-        return {"samples": out, "median": np.nan, "p16": np.nan, "p84": np.nan}
-    q16, q50, q84 = np.percentile(out[good], [16.0, 50.0, 84.0])
-    return {
-        "samples": out,
-        "median": float(q50),
-        "p16": float(q16),
-        "p84": float(q84),
-    }
-
-
-def wind_normalization_constants_posterior(
-    lam_samples: np.ndarray,
-    flx_mean,
-    wind_model: str,
-    wind_params_samples,
-    v_inf_samples=None,
-    mu: float = 1.4,
-) -> Dict[str, Dict[str, object]]:
-    """
-    Posterior estimates of wind normalization constants from sampled parameters.
-
-    This wraps `compute_wind_normalization_constants` over posterior samples and
-    summarizes each returned constant with median/p16/p84.
-
-    Args:
-        lam_samples: 1-D array of lam posterior samples (1e22 cm^-2 units).
-        flx_mean: Scalar or 1-D array of mean(flx_code) per sample.
-        wind_model: One of "smooth_pl", "beta_law", "confinement".
-        wind_params_samples: Single dict (reused) or iterable of per-sample dicts.
-        v_inf_samples: Optional scalar/array terminal velocity values in km/s.
-        mu: Mean molecular weight for number-to-mass conversion.
-
-    Returns:
-        Mapping from constant name -> {"samples", "median", "p16", "p84"}.
-    """
-    lam_arr = np.asarray(lam_samples, dtype=float)
-    n_samples = lam_arr.size
-    if n_samples == 0:
-        raise ValueError("lam_samples must contain at least one sample.")
-
-    flx_arr = np.asarray(flx_mean, dtype=float)
-    if flx_arr.ndim == 0:
-        flx_arr = np.full(n_samples, float(flx_arr))
-    if flx_arr.size != n_samples:
-        raise ValueError(
-            f"flx_mean must be scalar or have length {n_samples}, got {flx_arr.size}"
-        )
-
-    if isinstance(wind_params_samples, dict):
-        params_iter = [wind_params_samples] * n_samples
-    else:
-        params_iter = list(wind_params_samples)
-        if len(params_iter) != n_samples:
-            raise ValueError(
-                f"wind_params_samples length {len(params_iter)} != n_samples {n_samples}"
-            )
-
-    if v_inf_samples is None:
-        v_inf_arr = np.array([None] * n_samples, dtype=object)
-    else:
-        v_inf_arr = np.asarray(v_inf_samples, dtype=float)
-        if v_inf_arr.ndim == 0:
-            v_inf_arr = np.full(n_samples, float(v_inf_arr))
-        if v_inf_arr.size != n_samples:
-            raise ValueError(
-                f"v_inf_samples must be scalar or have length {n_samples}, "
-                f"got {v_inf_arr.size}"
-            )
-
-    series: Optional[Dict[str, np.ndarray]] = None
-    for idx in range(n_samples):
-        try:
-            vals = compute_wind_normalization_constants(
-                lam=float(lam_arr[idx]),
-                flx_mean=float(flx_arr[idx]),
-                wind_model=wind_model,
-                wind_params=params_iter[idx],
-                v_inf=v_inf_arr[idx],
-                mu=mu,
-            )
-        except Exception:
-            continue
-
-        if series is None:
-            series = {k: np.full(n_samples, np.nan, dtype=float) for k in vals.keys()}
-        for key, value in vals.items():
-            if key not in series:
-                series[key] = np.full(n_samples, np.nan, dtype=float)
-            series[key][idx] = float(value)
-
-    if series is None:
-        return {}
-
-    summary: Dict[str, Dict[str, object]] = {}
-    for key, arr in series.items():
-        good = np.isfinite(arr)
-        if not np.any(good):
-            summary[key] = {
-                "samples": arr,
-                "median": np.nan,
-                "p16": np.nan,
-                "p84": np.nan,
-            }
-            continue
-        q16, q50, q84 = np.percentile(arr[good], [16.0, 50.0, 84.0])
-        summary[key] = {
-            "samples": arr,
-            "median": float(q50),
-            "p16": float(q16),
-            "p84": float(q84),
-        }
-    return summary
 
 
 def main():
@@ -2079,53 +1019,24 @@ def main():
         help="Angular cell size (degrees) for the polar grid used in the surface integral",
     )
     parser.add_argument(
-        "--dz",
-        type=float,
-        default=0.5,
-        # NOTE: argparse runs every help string through `% params`, so a literal
-        # percent sign must be escaped as %% or --help raises ValueError.
-        help="Step size along the line of sight (solar radii). Default 0.5 gives "
-             "<0.1%% truncation error for typical r^-2-like wind profiles with "
-             "impact parameter b~d. Use smaller (e.g. 0.1) for very compact winds.",
-    )
-    parser.add_argument(
-        "--Rmax",
-        type=float,
-        default=None,
-        help="Maximum radius (solar radii) for LOS integration cutoff. "
-        "If not provided, defaults to 2*(d1+d2). Ignored if --converge-rmax is set.",
-    )
-    parser.add_argument(
-        "--converge-rmax",
-        action="store_true",
-        help="Override fixed Rmax cutoff and integrate adaptively until LOS tail contributions "
-        "become negligible (both wind models).",
-    )
-    parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print per-phase progress during simulation",
-    )
-    parser.add_argument(
-        "--n_jobs",
-        type=int,
-        default=1,
-        help="Number of parallel workers across phases (1 = serial)",
+        help="Print a one-line kernel summary during simulation",
     )
     parser.add_argument(
         "--flux_method",
         type=str,
-        choices=["legacy", "interpolate", "refit"],
-        default="legacy",
-        help="Method for converting nH to flux: 'legacy' (hardcoded exponentials), "
-        "'interpolate' (from CSV), or 'refit' (fit new exponentials to CSV)",
+        choices=["interpolate", "refit"],
+        default="interpolate",
+        help="Method for converting nH to flux: 'interpolate' (log-log "
+        "interpolation of the CSV table, default) or 'refit' (fit new "
+        "exponentials to the CSV table)",
     )
     parser.add_argument(
         "--flux_csv",
         type=str,
-        default=None,
-        help="Path to flux vs nH CSV file from compute_flux_vs_nH.py "
-        "(required if flux_method is not 'legacy')",
+        required=True,
+        help="Path to flux vs nH CSV file from compute_flux_vs_nH.py",
     )
     parser.add_argument(
         "--flux_type",
@@ -2133,42 +1044,21 @@ def main():
         choices=["erg", "ph"],
         default="erg",
         help="Which flux column from the CSV to use: "
-        "'erg' (erg/cm^2/s, default) or 'ph' (photons/cm^2/s). "
-        "Only applies when --flux_method is 'interpolate' or 'refit'.",
-    )
-    parser.add_argument(
-        "--lam",
-        type=float,
-        default=0.589537,
-        help="Target mean nH in 1e22 cm^-2 units. The raw wind integral is "
-        "scaled so that mean(fl) = lam. Only used with --wind-norm lam. "
-        "Default: 0.589537.",
-    )
-    parser.add_argument(
-        "--wind-norm",
-        type=str,
-        choices=["lam", "physical"],
-        default="lam",
-        help="How the wind LOS integral becomes an absolute N_H. 'lam' "
-        "(default) rescales so mean(fl) = --lam, which discards the absolute "
-        "column and leaves the light curve dependent only on ratios (R/a, "
-        "r/a, Rb/a). 'physical' fixes the density from --mdot / --v-inf so the "
-        "column carries real units, the eclipse is produced by wind opacity "
-        "rather than the geometric cutoff, and R means the true photosphere.",
+        "'erg' (erg/cm^2/s, default) or 'ph' (photons/cm^2/s).",
     )
     parser.add_argument(
         "--mdot",
         type=float,
         default=4.0e-6,
-        help="WR mass-loss rate in Msun/yr, used only with --wind-norm "
-        "physical. Default 4e-6 (Clark & Crowther 2004, clumping-corrected).",
+        help="WR mass-loss rate in Msun/yr, setting the absolute wind density. "
+        "Default 4e-6 (Clark & Crowther 2004, clumping-corrected).",
     )
     parser.add_argument(
         "--v-inf",
         type=float,
         default=1750.0,
-        help="Wind terminal velocity in km/s, used only with --wind-norm "
-        "physical. Default 1750 (Clark & Crowther 2004).",
+        help="Wind terminal velocity in km/s. "
+        "Default 1750 (Clark & Crowther 2004).",
     )
     parser.add_argument(
         "--mu-wind",
@@ -2182,11 +1072,11 @@ def main():
         "--f-opacity",
         type=float,
         default=1.0,
-        help="Effective-opacity factor applied to the Mdot-derived column "
-        "(only with --wind-norm physical). Absorbs wind photoionization, "
-        "clumping and WR abundance departures. Clark & Crowther's Mdot "
-        "overpredicts the observed N_H by ~1.5-2 dex, so values around "
-        "0.01-0.03 reproduce IC 10 X-1. Default 1.0 (no correction).",
+        help="Effective-opacity factor applied to the Mdot-derived column. "
+        "Absorbs wind photoionization, clumping and WR abundance departures. "
+        "Clark & Crowther's Mdot overpredicts the observed N_H by ~1.5-2 dex, "
+        "so values around 0.01-0.03 reproduce IC 10 X-1. "
+        "Default 1.0 (no correction).",
     )
     parser.add_argument(
         "--wind-model",
@@ -2194,37 +1084,28 @@ def main():
         choices=list(WIND_MODEL_IDS.keys()),
         default="smooth_pl",
         help="Dimensionless wind density profile to use. One of: "
-        "broken_pl, smooth_pl, beta_law, confinement. Default: smooth_pl.",
+        "smooth_pl, confinement. Default: smooth_pl.",
     )
     parser.add_argument(
         "--Rb",
         type=float,
         default=5.0,
-        help="Break radius (solar radii) for broken_pl / smooth_pl. Default: 5.0.",
+        help="Break radius (solar radii) for smooth_pl. Default: 5.0.",
     )
     parser.add_argument(
         "--p",
         type=float,
         default=4.0,
-        help="Inner-region power-law slope for broken_pl / smooth_pl. Default: 4.0.",
+        help="Inner-region power-law slope for smooth_pl. Default: 4.0.",
     )
     parser.add_argument(
         "--Delta",
         type=float,
-        default=1.0,
-        help="Smoothness parameter for smooth_pl. Larger -> sharper break. Default: 1.0.",
-    )
-    parser.add_argument(
-        "--beta",
-        type=float,
-        default=1.0,
-        help="CAK beta-law exponent for beta_law. Default: 1.0.",
-    )
-    parser.add_argument(
-        "--H",
-        type=float,
-        default=1.0,
-        help="Acceleration scale height (solar radii) for beta_law. Default: 1.0.",
+        default=2.0,
+        # Must match default_wind_params() and the MCMC's WIND_SHAPE_FIXED, or a
+        # CLI-generated model would use a different break sharpness than the one
+        # the MCMC fitted.
+        help="Smoothness parameter for smooth_pl. Larger -> sharper break. Default: 2.0.",
     )
     parser.add_argument(
         "--fconf",
@@ -2247,40 +1128,16 @@ def main():
 
     args = parser.parse_args()
 
-    # Default physical cutoff reproduces legacy behavior. Not applied under
-    # --wind-norm physical: a fixed Rmax disables the numba mega-kernel, which
-    # is the only path that returns per-cell columns, and without those the
-    # nonlinear nH -> flux conversion degrades to converting the *mean* column
-    # and badly understates eclipse-core leakage. The adaptive limits used
-    # instead integrate the full z-tail, which is strictly more accurate.
-    if args.Rmax is None and args.wind_norm == "lam":
-        args.Rmax = 2.0 * (args.d1 + args.d2)
-    if args.Rmax is not None and args.wind_norm == "physical" and not args.converge_rmax:
-        print(
-            "\n[warn] --Rmax with --wind-norm physical disables the per-cell "
-            "flux conversion (mega-kernel off). Drop --Rmax or add "
-            "--converge-rmax for the accurate eclipse core.\n"
-        )
-
-
-    # Validate arguments
-    if args.flux_method in ["interpolate", "refit"] and args.flux_csv is None:
-        parser.error(f"--flux_csv is required when flux_method='{args.flux_method}'")
-
     # Collect wind-model parameters
-    if args.wind_model == "broken_pl":
-        wind_params = {"Rb": args.Rb, "p": args.p}
-    elif args.wind_model == "smooth_pl":
+    if args.wind_model == "smooth_pl":
         wind_params = {"Rb": args.Rb, "p": args.p, "Delta": args.Delta}
-    elif args.wind_model == "beta_law":
-        wind_params = {"R_star": args.R, "beta": args.beta, "H": args.H}
     elif args.wind_model == "confinement":
         wind_params = {"R_star": args.R, "fconf": args.fconf, "ell": args.ell}
     else:
         parser.error(f"Unsupported wind_model: {args.wind_model}")
 
     print("Starting XRB Lightcurve Simulation...")
-    print(f"Parameters:")
+    print("Parameters:")
     print(f"  r (emitter radius): {args.r} solar radii")
     print(f"  R (companion radius): {args.R} solar radii")
     print(f"  d1 (emitter separation): {args.d1} solar radii")
@@ -2290,22 +1147,13 @@ def main():
           f"(90 = edge-on)")
     print(f"  dth (orbital increment): {args.dth} degrees")
     print(f"  d2h (polar cell size): {args.d2h} degrees")
-    print(f"  dz (LOS step size): {args.dz}")
-    print(f"  Rmax (LOS cutoff): {args.Rmax}")
-    print(f"  converge_rmax: {args.converge_rmax}")
-    print(f"  n_jobs (parallel workers): {args.n_jobs}")
     print(f"  flux_method: {args.flux_method}")
-    if args.flux_csv:
-        print(f"  flux_csv: {args.flux_csv}")
-        print(f"  flux_type: {args.flux_type}")
-    print(f"  wind_norm: {args.wind_norm}")
-    if args.wind_norm == "lam":
-        print(f"  lam: {args.lam}")
-    else:
-        print(f"  mdot: {args.mdot} Msun/yr")
-        print(f"  v_inf: {args.v_inf} km/s")
-        print(f"  mu_wind: {args.mu_wind}")
-        print(f"  f_opacity: {args.f_opacity}")
+    print(f"  flux_csv: {args.flux_csv}")
+    print(f"  flux_type: {args.flux_type}")
+    print(f"  mdot: {args.mdot} Msun/yr")
+    print(f"  v_inf: {args.v_inf} km/s")
+    print(f"  mu_wind: {args.mu_wind}")
+    print(f"  f_opacity: {args.f_opacity}")
     print(f"  wind_model: {args.wind_model}")
     print(f"  wind_params: {wind_params}")
     print(f"  Output file: {args.output}")
@@ -2321,18 +1169,12 @@ def main():
         i0=args.i0,
         dth=args.dth,
         d2h=args.d2h,
-        dz=args.dz,
         verbose=args.verbose,
-        n_jobs=args.n_jobs,
         flux_method=args.flux_method,
         flux_csv_path=args.flux_csv,
         flux_type=args.flux_type,
-        lam=args.lam,
-        Rmax=args.Rmax,
-        converge_rmax=args.converge_rmax,
         wind_model=args.wind_model,
         wind_params=wind_params,
-        wind_norm=args.wind_norm,
         mdot=args.mdot,
         v_inf=args.v_inf,
         mu_wind=args.mu_wind,
