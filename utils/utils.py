@@ -61,6 +61,10 @@ DEFAULT_PHASE_SHIFT_GRID_SIZE = 25
 DEFAULT_PHASE_SHIFT_EVAL_POINTS = 240
 DEFAULT_PHASE_SHIFT_REFINE_POINTS = 9
 
+# Phase grid for the drawn model overlay, shared by plot_utils.plot_phase and
+# write_model_lightcurve so the dumped curve is exactly the plotted one.
+MODEL_OVERLAY_N_POINTS = 721
+
 
 # -----------------------------------------------------------------------------
 # Small utilities
@@ -1214,6 +1218,107 @@ def fit_simulation(
             f"  Reduced χ² = {reduced_chi2:.3f}  (dof = {max(len(rate_obs) - n_free, 1)})"
         )
     return float(best_shift), float(reduced_chi2)
+
+
+def write_model_lightcurve(
+    path: str,
+    obs_df: pd.DataFrame,
+    sim_df: pd.DataFrame,
+    sim_column: str,
+    shift: float,
+    scatter: float = 0.0,
+    *,
+    red_chi2: Optional[float] = None,
+    shift_fitted: bool = False,
+    obs_column: str = "rate",
+    sim_file: Optional[str] = None,
+    n_model_points: int = MODEL_OVERLAY_N_POINTS,
+    verbose: bool = True,
+) -> str:
+    """Write the fitted tabulated model light curve to a text file.
+
+    The point of this file is that the *fitted* model is not the ``--sim-file``
+    contents: :func:`fit_simulation` slides the model in phase and adds the
+    ``scatter`` floor, so reproducing the drawn curve from the simulation CSV
+    alone means re-applying both by hand. Here they are already applied, and the
+    header records them so the transformation stays auditable.
+
+    Two blocks, matching ``mcmc_lightcurve_fit._write_bestfit_model_txt``: the
+    dense model curve on the plotting grid, then the observed bins with the
+    model at their phases and the normalized residual. Both are plain
+    whitespace-delimited tables under ``#`` comments, so
+    ``np.genfromtxt(..., names=True)`` reads either after selecting its rows.
+
+    Every model value routes through :func:`model_from_wrap`, the same evaluator
+    used by the χ² and the plot overlay, so the three cannot disagree.
+
+    Returns the path written.
+    """
+    phase_wrap, flux_wrap = prepare_model_interpolator(sim_df, sim_column)
+    shift = float(shift)
+    scatter = float(scatter)
+
+    obs_phase = np.mod(obs_df["phase"].to_numpy(dtype=float), 1.0)
+    obs_flux = obs_df["rate"].to_numpy(dtype=float)
+    obs_err = obs_errors(obs_df)
+
+    model_phase = np.linspace(0.0, 1.0, int(n_model_points))
+    model_flux = model_from_wrap(phase_wrap, flux_wrap, model_phase, shift, scatter)
+    obs_model = model_from_wrap(phase_wrap, flux_wrap, obs_phase, shift, scatter)
+
+    n_free = 1 if shift_fitted else 0
+    dof = max(len(obs_flux) - n_free, 1)
+    chi2_total = float(np.sum(((obs_flux - obs_model) / obs_err) ** 2))
+
+    parent = os.path.dirname(str(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(path, "w") as f:
+        f.write(f"# Fitted model light curve -- {band_label_from_column(sim_column)} "
+                f"band, column '{sim_column}'\n")
+        if sim_file:
+            f.write(f"# sim_file: {sim_file}\n")
+        f.write(f"# obs_column: {obs_column}\n")
+        f.write(f"# phase_shift applied to model: {shift:.6f}"
+                f"  ({'fitted' if shift_fitted else 'held fixed'})\n")
+        f.write(f"# scattered flux added to model: {scatter:.8g}  (constant, additive)\n")
+        f.write("# No multiplicative flux rescaling is applied -- the model keeps its "
+                "native normalization.\n")
+        f.write(f"# chi2/dof: {chi2_total / dof:.6g}  (chi2 = {chi2_total:.6g}, "
+                f"dof = {dof} = {len(obs_flux)} bins - {n_free} free)\n")
+        if red_chi2 is not None and np.isfinite(red_chi2):
+            # Guards against a shift/scatter here that disagrees with the
+            # fit_simulation call, exactly as plot_phase's self-check does.
+            if abs(chi2_total / dof - float(red_chi2)) > 0.01 * max(
+                abs(float(red_chi2)), 1e-300
+            ):
+                warnings.warn(
+                    f"write_model_lightcurve: recomputed reduced chi2 "
+                    f"({chi2_total / dof:.4g}) does not match the value reported by "
+                    f"the fit ({float(red_chi2):.4g}); the shift/scatter passed here "
+                    f"probably differ from the fit_simulation call.",
+                    stacklevel=2,
+                )
+        f.write("#\n")
+        f.write("# --- BLOCK 1: dense model curve (phase already shifted to the "
+                "observed frame, scatter added) ---\n")
+        f.write("phase model_flux\n")
+        for p_val, flux_val in zip(model_phase, model_flux):
+            f.write(f"{p_val:.8f} {flux_val:.8e}\n")
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            resid = (obs_flux - obs_model) / obs_err
+        order = np.argsort(obs_phase)
+        f.write("#\n# --- BLOCK 2: observed bins vs model ---\n")
+        f.write("phase obs_flux obs_err model_flux resid_sigma\n")
+        for idx in order:
+            f.write(f"{obs_phase[idx]:.8f} {obs_flux[idx]:.8e} {obs_err[idx]:.8e} "
+                    f"{obs_model[idx]:.8e} {resid[idx]:.6f}\n")
+
+    if verbose:
+        print(f"Model light curve written to: {path}")
+    return str(path)
 
 
 # -----------------------------------------------------------------------------

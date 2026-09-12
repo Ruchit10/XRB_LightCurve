@@ -50,6 +50,14 @@ $ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
     --obs-column flux_t --time-column t_raw --counts-per-bin 100 \\
     --fit --sim-file sim.csv --fit-phase-shift --output fit.png
 
+# Write the fitted model light curve alongside the plot (fit.png -> fit_model.txt):
+$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+    --sim-column nfl_broad --fit-phase-shift --output fit.png --write-model
+
+# ... or to an explicit path:
+$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+    --sim-column nfl_broad --fit-phase-shift --write-model broad_model.txt
+
 # Load CIAO format data (time in second column, flux as ECF):
 $ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
     --obs-column ECF --output ciao_plot.png
@@ -73,6 +81,7 @@ Dependencies: numpy, pandas, matplotlib, scipy (in requirements.txt).
 from __future__ import annotations
 
 import argparse
+import os
 
 import pandas as pd
 
@@ -99,6 +108,7 @@ from utils.utils import (
     read_observation,
     smooth_lightcurve,
     validate_sim_columns,
+    write_model_lightcurve,
 )
 from utils.plot_utils import (
     add_residual_panel,
@@ -131,12 +141,26 @@ __all__ = [
     "read_observation",
     "smooth_lightcurve",
     "validate_sim_columns",
+    "write_model_lightcurve",
 ]
 
 
 # -----------------------------------------------------------------------------
 # Command-line interface
 # -----------------------------------------------------------------------------
+
+def _default_model_output(plot_output: str | None) -> str:
+    """Model-light-curve path derived from the plot path, for bare --write-model.
+
+    Mirrors ``mcmc_lightcurve_fit.plot_best_fit``, which writes its model dump as
+    ``<plot>_model.txt`` beside the figure, so the text file sits next to the
+    plot it describes under either entry point.
+    """
+    if not plot_output:
+        return "model_lightcurve.txt"
+    stem, _ = os.path.splitext(str(plot_output))
+    return f"{stem}_model.txt"
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -279,6 +303,22 @@ def main() -> None:
         metavar=("PHASE_MIN", "PHASE_MAX"),
         help="Phase window used to estimate scattered flux when --scatter is not provided.",
     )
+    parser.add_argument(
+        "--write-model",
+        type=str,
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="After --fit, write the fitted model light curve to a text file: "
+             "the dense model curve with the fitted phase shift applied and the "
+             "scattered-flux floor added, followed by the observed bins with the "
+             "model at their phases and the normalized residual. Given bare, the "
+             "path is derived from --output (or 'model_lightcurve.txt'); with a "
+             "PATH, that file is used. When several --sim-column values are "
+             "fitted, the column name is inserted before the extension so each "
+             "gets its own file. Requires --fit.",
+    )
 
     args = parser.parse_args()
 
@@ -291,6 +331,12 @@ def main() -> None:
         parser.error("--n-phase-bins must be > 0.")
     if args.counts_per_bin is not None and args.counts_per_bin <= 0:
         parser.error("--counts-per-bin must be > 0.")
+    if args.write_model is not None and not args.fit:
+        parser.error(
+            "--write-model needs a fitted model: add --fit (and --sim-file). "
+            "Without a fit there is no phase shift or scattered-flux floor to "
+            "apply, so the file would just restate --sim-file."
+        )
 
     # Determine observation column to use
     obs_column = args.obs_column if args.obs_column else "rate"
@@ -416,6 +462,24 @@ def main() -> None:
                 print(f"⚠️  Failed to fit column '{col}': {e}")
                 # Add dummy values so we can still plot other columns
                 fit_results.append((0.0, float('nan')))
+
+        if args.write_model is not None:
+            base = args.write_model or _default_model_output(args.output)
+            stem, ext = os.path.splitext(base)
+            if not ext:
+                ext = ".txt"
+            for col, (shift, chi2) in zip(sim_columns, fit_results):
+                # A failed fit left a (0.0, nan) placeholder; writing it out
+                # would look like a real fit at zero shift.
+                if not (chi2 == chi2):  # NaN
+                    print(f"Skipping model light curve for '{col}': fit failed.")
+                    continue
+                path = f"{stem}_{col}{ext}" if len(sim_columns) > 1 else f"{stem}{ext}"
+                write_model_lightcurve(
+                    path, df, sim_df, col, shift, scatter_value,
+                    red_chi2=chi2, shift_fitted=args.fit_phase_shift,
+                    obs_column=obs_column, sim_file=args.sim_file,
+                )
 
         # Plot based on number of columns
         if len(sim_columns) == 1:
