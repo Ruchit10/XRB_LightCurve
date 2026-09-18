@@ -136,9 +136,12 @@ the physical normalization step (below). Registry: `WIND_MODEL_IDS`,
 | ------------- | -- | ---------------------- | ---- |
 | `smooth_pl`   | 0  | `Rb, p, Delta`         | **Default.** Smoothly broken PL: `(r/Rb)^-2 · [1 + (Rb/r)^Δ]^((p-2)/Δ)`. |
 | `confinement` | 1  | `R_star, fconf, ell`   | `1/r²` with inner exponential compression: `[1 + f_conf·e^{-(r-R★)/ℓ}]/r²`. |
+| `beta_law`    | 2  | `R_star, beta, H`      | Velocity-based (Wind_Density.pdf §5): `g = 1/(r² v̂)`, `v̂ = (1 − e^{-(r-R★)/H})(1 − R★/r)^β`. Zero inside `R★`; diverges at the surface, so limb-grazing rays are opaque. Effective break `R★ + 3H`. |
 
-Both relax to a constant-velocity `r⁻²` wind at large radius, which is what
-lets `wind_asymptotic_coefficient()` tie `g` to a physical mass-loss rate.
+All three relax to a constant-velocity `r⁻²` wind at large radius, which is
+what lets `wind_asymptotic_coefficient()` tie `g` to a physical mass-loss rate.
+`R_STAR_TIED_MODELS = ("beta_law", "confinement")` lists the profiles whose
+`R_star` is auto-filled from the geometry `R`.
 
 Two implementations kept in lockstep:
 
@@ -283,7 +286,8 @@ n(r) = n_0 · g(r)
 ```
 
 - `wind_asymptotic_coefficient(wind_model, wind_params)` → `C`: `Rb²` for
-  `smooth_pl`, `1.0` for `confinement`.
+  `smooth_pl`, `1.0` for `confinement` and `beta_law` (both are written as
+  `Mdot/(4π r² v_inf)` times a factor that tends to 1).
 - `wind_density_norm_from_mdot(mdot_msun_yr, v_inf_kms, wind_model, wind_params, mu)`
   → `n_0`, called once per `simulate_lightcurve`.
 
@@ -507,10 +511,13 @@ dimensions:
 | -------------- | ------------ | ------------- | ---------------- |
 | `smooth_pl`    | `Rb, p`      | `Delta = 2.0` | — |
 | `confinement`  | `fconf, ell` | —             | `R_star = R` |
+| `beta_law`     | `beta, H`    | —             | `R_star = R` |
 
 Registries: `WIND_MODELS`, `WIND_SHAPE_FIT`, `WIND_SHAPE_FIXED`,
 `WIND_SHAPE_LABELS`, `WIND_SHAPE_PRIORS`, `ALL_WIND_SHAPE_NAMES`. Priors are
-overridable via `--prior-Rb/-p/-fconf/-ell` using `mean,std,min,max`.
+overridable via `--prior-Rb/-p/-fconf/-ell/-beta/-H` using `mean,std,min,max`.
+`beta_law` frees both `beta` and `H` so that every profile has two shape
+dimensions; `--freeze H=1.0` recovers a one-parameter beta-law fit.
 
 `--fit-fopacity` additionally promotes `log10 f_opacity` to a free dimension
 (prior `FOPACITY_PRIOR`, centred at `-1.5`).
@@ -892,7 +899,7 @@ are standalone data-prep scripts, not part of the package API:
 | [changes_tracked.md](changes_tracked.md) | Full change log, including removed features. |
 | [mcmc_chi2_jitter_explanation.md](mcmc_chi2_jitter_explanation.md) | Likelihood/jitter math and emcee-vs-zeus internals. |
 | [PERFORMANCE_VALIDATION_REPORT.md](PERFORMANCE_VALIDATION_REPORT.md) | Benchmark harness and parity thresholds. |
-| `Wind_Density.pdf` | Source equations for the wind profiles (includes `broken_pl` / `beta_law`, both since removed). |
+| `Wind_Density.pdf` | Source equations for the wind profiles (`broken_pl` was removed as a special case of `smooth_pl`; `beta_law` was re-added in Phase 32). |
 | `stu2151.pdf` | Laycock et al. 2015 — ephemeris and eclipse properties. |
 | `FLUX_INTEGRATION_SUMMARY.md`, `FLUX_METHODS_QUICKREF.md`, `XSPEC_CONVERSION_GUIDE.md`, `FITS_CONVERSION_README.md`, `QUICK_START_FLUX_CONVERSION.md`, `CONVERSION_WORKFLOW.md`, `README_CONVERSION_TOOLS.md` | Flux-conversion and FITS-pipeline guides. |
 | [README.md](README.md) | User-facing overview: pipeline, parameters, output columns. |

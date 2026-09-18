@@ -47,14 +47,18 @@ difference; for IC 10 X-1 it lands around 0.01–0.03. In MCMC runs, fit it with
 
 ### Wind density profiles
 
-Two dimensionless profiles `g(r)`, selected with `--wind-model`:
+Three dimensionless profiles `g(r)`, selected with `--wind-model`:
 
 | Model | Parameters | Form |
 |-------|-----------|------|
 | `smooth_pl` (default) | `Rb`, `p`, `Delta` | smoothly broken power law: inner slope `p`, outer `r⁻²`, break at `Rb` with smoothness `Delta` |
 | `confinement` | `R_star`, `fconf`, `ell` | `r⁻²` wind with an exponential inner overdensity of amplitude `fconf` and scale `ell` |
+| `beta_law` | `R_star`, `beta`, `H` | velocity-based, `n = Ṁ / (4π r² v(r))` with `v = v_inf (1 − e^{−(r−R★)/H}) (1 − R★/r)^β`; dense acceleration zone inside `R★ + 3H`, `r⁻²` beyond |
 
-For `confinement`, `R_star` is tied to the geometric companion radius `R`.
+For `confinement` and `beta_law`, `R_star` is tied to the geometric companion
+radius `R`. `beta_law` is the profile that follows most directly from the
+`n₀ = Ṁ/(4π R_sun² v_inf μ m_H)` normalization: `g = 1/(r² v̂)` with
+`v̂ = v/v_inf → 1`, so `C = 1`.
 
 ---
 
@@ -149,9 +153,10 @@ normalization instead of exposing it.
 | `--flux_csv` | *required* | Flux vs nH CSV from `compute_flux_vs_nH.py` |
 | `--flux_method` | `interpolate` | `interpolate` or `refit` (see below) |
 | `--flux_type` | `erg` | `erg` (erg/cm²/s) or `ph` (photons/cm²/s) |
-| `--wind-model` | `smooth_pl` | `smooth_pl` or `confinement` |
+| `--wind-model` | `smooth_pl` | `smooth_pl`, `confinement` or `beta_law` |
 | `--Rb`, `--p`, `--Delta` | 5.0, 4.0, 2.0 | `smooth_pl` shape parameters (`Delta` matches the value the MCMC holds fixed) |
 | `--fconf`, `--ell` | 10.0, 0.5 | `confinement` shape parameters |
+| `--beta`, `--H` | 1.0, 1.0 | `beta_law` shape parameters (CAK exponent, acceleration scale height in R☉) |
 | `--mdot` | 4e-6 | WR mass-loss rate (M☉/yr), Clark & Crowther (2004) |
 | `--v-inf` | 1750.0 | Wind terminal velocity (km/s) |
 | `--mu-wind` | 1.4 | Mean mass per hydrogen-equivalent nucleus |

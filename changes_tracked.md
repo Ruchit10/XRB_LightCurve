@@ -39,9 +39,10 @@ fitting, and inference stack since the original R port.
 30. [Phase 29 — Mass Reparameterization & Error-Column Fix](#phase-29--mass-reparameterization--error-column-fix)
 31. [Phase 30 — Physical Norm in the Single-Model CLI, Model-LC Dump & χ²_eff Fix](#phase-30--physical-norm-in-the-single-model-cli-model-lc-dump--χ_eff-fix)
 32. [Phase 31 — Release Trim: `lam`, Wind Models and Flux Methods](#phase-31--release-trim-lam-wind-models-and-flux-methods)
-33. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
-34. [Current File Inventory](#current-file-inventory)
-35. [Current Status & Quick Commands](#current-status--quick-commands)
+33. [Phase 32 — `beta_law` Wind Profile Restored](#phase-32--beta_law-wind-profile-restored)
+34. [Side Investigation — Reference Epoch Recalibration](#side-investigation--reference-epoch-recalibration)
+35. [Current File Inventory](#current-file-inventory)
+36. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -1902,6 +1903,79 @@ The notebooks still use the removed API — `xrb_model_analysis_single_15803.ipy
 calls the deleted `compute_surface_density`. Untracked scripts
 (`utils/benchmark_mcmc_performance.py`, `chandra_analysis_combined_flux.py`)
 also still pass `--lam` and were left alone as legacy.
+
+---
+
+## Phase 32 — `beta_law` Wind Profile Restored
+
+### Why
+
+Phase 31 removed `beta_law` because it had never been used in a production
+fit. For the methods paper it is the profile that follows most directly from
+the physical normalization: mass continuity gives `n = Ṁ/(4π r² v(r))`, and
+with `v̂ = v/v_inf → 1` the dimensionless shape is `g = 1/(r² v̂)` with `C = 1`,
+so `n₀ = Ṁ/(4π R_sun² v_inf μ m_H)` is literally the terminal-velocity density.
+Three profiles (power-law, confinement, velocity-law) also give the paper a
+genuine model-comparison axis.
+
+### The profile (Wind_Density.pdf §5)
+
+```
+v̂(r) = (1 − e^{−(r−R★)/H}) · (1 − R★/r)^β ,   g(r) = 1 / (r² v̂(r)) ,  r > R★
+```
+
+`g = 0` inside the photosphere. `v̂ → 0` at the surface, so `g` diverges there
+(as `(r−R★)^{−(1+β)}`): rays grazing the limb are effectively opaque, which is
+the physically expected behaviour of a dense acceleration zone. The effective
+break radius is `R★ + 3H`.
+
+### Changes
+
+- `xrb_lightcurve.py`: `beta_law` registered as model id 2 with params
+  `(R_star, beta, H)`; scalar branch in `_g_profile` (numba) and vectorized
+  branch in `evaluate_g_profile` (uses `r ≤ R★ → inf` so `v̂ → 1`, `g → 0`
+  without a negative base); `default_wind_params` → `beta = 1, H = 1`;
+  `wind_asymptotic_coefficient` returns 1; new `R_STAR_TIED_MODELS =
+  ("beta_law", "confinement")` drives the `R_star` auto-fill; CLI `--beta`,
+  `--H`.
+- `mcmc_lightcurve_fit.py`: `WIND_MODELS`, `WIND_SHAPE_FIT['beta_law'] =
+  ['beta', 'H']` (both free, unlike the pre-Phase-31 version which fixed `H`;
+  `--freeze H=…` recovers that), priors `beta ~ N(0.8, 0.3) on [0.3, 2]`,
+  `H ~ N(1, 0.7) on [0.1, 10]`, labels, `--prior-beta/--prior-H` (generated
+  from `ALL_WIND_SHAPE_NAMES`), `--freeze` help, `R_star` tying via
+  `R_STAR_TIED_MODELS` in `_to_wind_params` and `DirectLightCurveModel`.
+  The wind-profile diagnostic marks `R★ + 3H`.
+- `utils/test_flux_methods.py`: now runs every `flux_method × wind_model`
+  and checks that visible phases carry finite, non-negative flux and
+  strictly positive column.
+- Docs: README, PROJECT.md tables.
+
+### Verification (conda env `henv`, 2026-09-17)
+
+- `utils/test_flux_methods.py`: 6/6 (`interpolate`/`refit` × 3 profiles).
+- **Regression:** `smooth_pl` and `confinement` outputs bit-identical to HEAD
+  (max |diff| = 0.0 across all 12 numeric columns).
+- **Physics:** with `R★ = 2`, `β = 0.8`, `H = 1` the `beta_law` column is
+  1.05–1.17× that of a pure `r⁻²` wind of the same `Ṁ/v_inf` (slower inner
+  wind is denser); mean N_H 0.185 vs 0.169 ×10²².
+- **Quadrature:** per-ray GL16 vs adaptive reference — `beta_law` rel. error
+  3e-6 at `b = R★ + 0.5`, 4e-8 at `+1`, ≤1e-10 beyond; degrades to 0.9 % at
+  `b = R★ + 0.1` and 28 % at `+0.02` because `g` diverges at the surface.
+  At the light-curve level (GL16 vs GL64) the max relative flux change is
+  **≤ 9e-9** for `beta_law` (three `(β, H)` combinations), 8e-9 for
+  `confinement`, 6e-16 for `smooth_pl`: the limb-grazing cells are opaque
+  either way, so the local inaccuracy never reaches the flux.
+- **MCMC smoke tests** on ObsID 15803 broad: (i) `--reparam --fit-wind-shape
+  --fit-fopacity --likelihood jitter` samples `['a','q','r','R','i0','log_f',
+  'log_fopa','beta','H']`, `--prior-beta/--prior-H` honoured, `R_star` tied to
+  the fitted `R` (1.565 at the MAP), wind-profile plot marks `R★+3H`;
+  (ii) `--kepler-mtot --freeze H=1.0 --likelihood chi2` samples 7 dims with
+  `H` frozen and records `"freeze": "H=1.0"` in the run config; `--replot`
+  regenerates every figure from the saved chain.
+- Scale–opacity invariance (all lengths incl. `R_star`, `H` ×λ, `f_opacity`
+  ×λ) holds for `beta_law` to round-off: max rel. flux change 1.2e-15,
+  1.5e-15, 0.0 at λ = 0.8, 1.3, 2.0 — the same exact invariance as the other
+  two profiles (Proposition 2 of the CLOAK paper).
 
 ---
 

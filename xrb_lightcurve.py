@@ -43,6 +43,9 @@ except ImportError as exc:  # pragma: no cover - environment guard
 # Supported models (Wind_Density.pdf):
 #   0 smooth_pl   — smoothly broken power law; params (Rb, p, Delta)
 #   1 confinement — inner confinement / compression; params (R_star, fconf, ell)
+#   2 beta_law    — velocity-based, n = Mdot / (4 pi r^2 v(r)) with a CAK
+#                   beta law plus inner acceleration scale H; params
+#                   (R_star, beta, H). g = 1 / (r^2 v_hat), v_hat = v / v_inf.
 
 # Physical constants. Defined here rather than beside the column-density
 # helpers below because they are used as default argument values.
@@ -60,12 +63,18 @@ MU_WIND_DEFAULT = 1.4
 WIND_MODEL_IDS: Dict[str, int] = {
     "smooth_pl": 0,
     "confinement": 1,
+    "beta_law": 2,
 }
 
 WIND_MODEL_PARAM_KEYS: Dict[str, Tuple[str, ...]] = {
     "smooth_pl": ("Rb", "p", "Delta"),
     "confinement": ("R_star", "fconf", "ell"),
+    "beta_law": ("R_star", "beta", "H"),
 }
+
+# Profiles whose R_star is the companion photosphere. Callers may omit R_star
+# for these and it is filled from the geometry parameter R.
+R_STAR_TIED_MODELS: Tuple[str, ...] = ("beta_law", "confinement")
 
 # Cache flux-vs-NH interpolation/refit inputs keyed by (csv_path, flux_type)
 # to avoid repeated CSV read/sort/interpolator creation during MCMC.
@@ -134,6 +143,23 @@ def _g_profile(r, model_id, p1, p2, p3, p4):
         factor = 1.0 + fconf * math.exp(-(r - R_star) / ell)
         return factor / (r * r)
 
+    if model_id == 2:
+        # beta_law: R_star=p1, beta=p2, H=p3
+        # Mass continuity n = Mdot / (4 pi r^2 v) with the dimensionless
+        # velocity v_hat = (1 - exp(-(r-R*)/H)) * (1 - R*/r)^beta -> 1 at
+        # infinity, so g -> 1/r^2 and C = 1 in wind_asymptotic_coefficient.
+        # Inside the photosphere there is no wind; v_hat -> 0 at the surface,
+        # so g diverges there and rays grazing the limb are effectively opaque.
+        R_star = p1
+        beta = p2
+        H = p3
+        if r <= R_star:
+            return 0.0
+        v_hat = (1.0 - math.exp(-(r - R_star) / H)) * (1.0 - R_star / r) ** beta
+        if v_hat <= 0.0:
+            return 0.0
+        return 1.0 / (r * r * v_hat)
+
     return 0.0
 
 
@@ -169,6 +195,16 @@ def evaluate_g_profile(
         safe_r = np.where(r > 0.0, r, np.inf)
         factor = 1.0 + fconf * np.exp(-(safe_r - R_star) / ell)
         return factor / (safe_r * safe_r)
+
+    if model_id == 2:
+        R_star = p1
+        beta = p2
+        H = p3
+        # r <= R_star maps to inf so that v_hat -> 1 and g -> 0 there, matching
+        # the scalar kernel without evaluating a negative base.
+        rr = np.where(r > R_star, r, np.inf)
+        v_hat = (1.0 - np.exp(-(rr - R_star) / H)) * (1.0 - R_star / rr) ** beta
+        return np.where(v_hat > 0.0, 1.0 / (rr * rr * v_hat), 0.0)
 
     return np.zeros_like(r)
 
@@ -653,12 +689,16 @@ def default_wind_params(wind_model: str, R: float) -> Dict[str, float]:
     Return sensible default parameters for a given wind model.
 
     `R` is the companion radius in solar radii, used as `R_star` for the
-    confinement model.
+    confinement and beta_law models.
     """
     if wind_model == "smooth_pl":
         return {"Rb": 5.0, "p": 4.0, "Delta": 2.0}
     if wind_model == "confinement":
         return {"R_star": float(R), "fconf": 10.0, "ell": 0.5}
+    if wind_model == "beta_law":
+        # Effective break at R_star + 3H, so H = 1 puts it near the smooth_pl
+        # default Rb = 5 for a 2 Rsun companion.
+        return {"R_star": float(R), "beta": 1.0, "H": 1.0}
     raise ValueError(f"Unknown wind_model '{wind_model}'")
 
 
@@ -724,7 +764,7 @@ def simulate_lightcurve(
         flux_type: Which flux column from the CSV to use — "erg" (erg/cm^2/s,
             default) or "ph" (photons/cm^2/s).
         wind_model: Name of the dimensionless wind density profile, one of
-            "smooth_pl" or "confinement". Default "smooth_pl".
+            "smooth_pl", "confinement" or "beta_law". Default "smooth_pl".
         wind_params: Dict of profile parameters (see WIND_MODEL_PARAM_KEYS).
             If None, uses defaults from default_wind_params(wind_model, R).
         scattered_flux: Constant additive flux offset applied to all ``nfl_*``
@@ -763,9 +803,9 @@ def simulate_lightcurve(
     # Wind profile parameter packing (done once per call)
     if wind_params is None:
         wind_params = default_wind_params(wind_model, R)
-    # For the confinement profile, auto-fill R_star from R if the caller
-    # omitted it.
-    if wind_model == "confinement" and "R_star" not in wind_params:
+    # For the profiles anchored at the photosphere, auto-fill R_star from R
+    # if the caller omitted it.
+    if wind_model in R_STAR_TIED_MODELS and "R_star" not in wind_params:
         wind_params = dict(wind_params)
         wind_params["R_star"] = float(R)
     model_id, p1, p2, p3, p4 = pack_wind_params(wind_model, wind_params)
@@ -935,7 +975,10 @@ def wind_asymptotic_coefficient(
     if wind_model == "smooth_pl":
         Rb = float(wind_params["Rb"])
         return Rb * Rb
-    if wind_model == "confinement":
+    if wind_model in ("confinement", "beta_law"):
+        # Both are written directly as Mdot / (4 pi r^2 v_inf) times a factor
+        # that tends to 1, so n_0 is exactly the terminal-velocity density
+        # normalization.
         return 1.0
     raise ValueError(f"Unknown wind_model '{wind_model}'")
 
@@ -1084,7 +1127,7 @@ def main():
         choices=list(WIND_MODEL_IDS.keys()),
         default="smooth_pl",
         help="Dimensionless wind density profile to use. One of: "
-        "smooth_pl, confinement. Default: smooth_pl.",
+        "smooth_pl, confinement, beta_law. Default: smooth_pl.",
     )
     parser.add_argument(
         "--Rb",
@@ -1120,6 +1163,19 @@ def main():
         help="Confinement scale length (solar radii) for confinement model. Default: 0.5.",
     )
     parser.add_argument(
+        "--beta",
+        type=float,
+        default=1.0,
+        help="CAK velocity-law exponent for beta_law. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--H",
+        type=float,
+        default=1.0,
+        help="Inner acceleration scale height (solar radii) for beta_law; the "
+        "effective break radius is R + 3H. Default: 1.0.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="xrb_lightcurve_output.csv",
@@ -1133,6 +1189,8 @@ def main():
         wind_params = {"Rb": args.Rb, "p": args.p, "Delta": args.Delta}
     elif args.wind_model == "confinement":
         wind_params = {"R_star": args.R, "fconf": args.fconf, "ell": args.ell}
+    elif args.wind_model == "beta_law":
+        wind_params = {"R_star": args.R, "beta": args.beta, "H": args.H}
     else:
         parser.error(f"Unsupported wind_model: {args.wind_model}")
 

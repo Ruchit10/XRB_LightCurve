@@ -8,6 +8,8 @@ binary system parameters by fitting model light curves to observed Chandra data.
 WIND MODELS (selected via --wind-model):
 - smooth_pl   : Smoothly broken power-law density profile (Rb, p, Delta)
 - confinement : Inner-confinement / compression amplification (R_star, fconf, ell)
+- beta_law    : Velocity-based n = Mdot/(4 pi r^2 v(r)), CAK beta law with an
+                inner acceleration scale (R_star, beta, H)
 
 GEOMETRY parameters (always fit):
 - d1: Distance of compact object from center of mass (solar radii)
@@ -22,6 +24,9 @@ chosen --wind-model):
 - smooth_pl   : Rb (break radius), p (inner slope). Delta is fixed at 2.
 - confinement : fconf (compression amplitude), ell (compression scale).
                 R_star is tied to R.
+- beta_law    : beta (CAK exponent), H (acceleration scale height; effective
+                break at R + 3H). R_star is tied to R. Freeze H for a
+                one-parameter beta-law fit.
 
 The wind column density is normalized physically, from --mdot / --v-inf, so
 N_H carries real units and the light curve constrains the absolute scale of the
@@ -49,6 +54,10 @@ Usage:
     # Confinement wind with shape fit (adds fconf, ell)
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
         --wind-model confinement --fit-wind-shape --fit-fopacity
+
+    # Beta-law wind with shape fit (adds beta, H)
+    python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
+        --wind-model beta_law --fit-wind-shape --fit-fopacity
 
     # Use zeus sampler / jitter likelihood
     python mcmc_lightcurve_fit.py --band broad --flux-csv data_flux_vs_nH.csv \\
@@ -111,6 +120,7 @@ warnings.filterwarnings(
 from xrb_lightcurve import (
     simulate_lightcurve,
     WIND_MODEL_PARAM_KEYS,
+    R_STAR_TIED_MODELS,
     MU_WIND_DEFAULT,
     default_wind_params,
     evaluate_g_profile,
@@ -410,16 +420,18 @@ def build_param_spec(
 WIND_MODELS = {
     'smooth_pl':   'Smoothly Broken Power-Law Wind',
     'confinement': 'Inner-Confinement / Compression Wind',
+    'beta_law':    'CAK Beta-Law (Velocity-Based) Wind',
 }
 
 # Per-model wind-shape parameters that become free MCMC dimensions when the
 # user passes --fit-wind-shape. The remaining keys in WIND_SHAPE_FIXED are
-# always passed to simulate_lightcurve as constants. R_star (for confinement)
-# is *tied* to the geometry parameter R and is therefore not listed here; it is
-# filled in by _to_wind_params().
+# always passed to simulate_lightcurve as constants. R_star (for confinement
+# and beta_law) is *tied* to the geometry parameter R and is therefore not
+# listed here; it is filled in by _to_wind_params().
 WIND_SHAPE_FIT = {
     'smooth_pl':   ['Rb', 'p'],
     'confinement': ['fconf', 'ell'],
+    'beta_law':    ['beta', 'H'],
 }
 
 # Fixed shape parameters that are passed inside wind_params but are NOT
@@ -427,6 +439,7 @@ WIND_SHAPE_FIT = {
 WIND_SHAPE_FIXED = {
     'smooth_pl':   {'Delta': 2.0},
     'confinement': {},
+    'beta_law':    {},
 }
 
 # Pretty labels for corner plots / diagnostics.
@@ -435,16 +448,23 @@ WIND_SHAPE_LABELS = {
     'p':     r'$p$',
     'fconf': r'$f_\mathrm{conf}$',
     'ell':   r'$\ell$ (R$_\odot$)',
+    'beta':  r'$\beta$',
+    'H':     r'$H$ (R$_\odot$)',
 }
 
 # Default priors for wind-shape parameters (mean, std, min, max).
 # Box bounds are kept generous; the Gaussian acts as a weak preference toward
 # physically motivated values. Override with --prior-<name> on the CLI.
+# beta ~ 0.8-1 is the CAK range for OB/WR winds; H is the acceleration scale
+# height, so the effective break R + 3H mirrors Rb (smooth_pl) and ell
+# (confinement). Freeze H to recover a one-parameter beta-law fit.
 WIND_SHAPE_PRIORS = {
     'Rb':    {'mean': 5.0, 'std': 3.0,  'min': 0.5, 'max': 30.0},
     'p':     {'mean': 4.0, 'std': 1.0,  'min': 2.0, 'max': 8.0},
     'fconf': {'mean': 5.0, 'std': 5.0,  'min': 0.0, 'max': 50.0},
     'ell':   {'mean': 1.0, 'std': 0.7,  'min': 0.1, 'max': 10.0},
+    'beta':  {'mean': 0.8, 'std': 0.3,  'min': 0.3, 'max': 2.0},
+    'H':     {'mean': 1.0, 'std': 0.7,  'min': 0.1, 'max': 10.0},
 }
 
 # Names of every wind-shape parameter across all models; used for CLI prior
@@ -564,7 +584,7 @@ def _to_wind_params(
 
     Pulls fittable shape values from *theta* using their position in
     *active_names*; fills in fixed shape values from WIND_SHAPE_FIXED; and
-    ties R_star to the geometry R for the confinement model.
+    ties R_star to the geometry R for the confinement and beta_law models.
     """
     wp: Dict[str, float] = dict(WIND_SHAPE_FIXED.get(wind_model, {}))
 
@@ -583,7 +603,7 @@ def _to_wind_params(
         else:
             wp[name] = float(WIND_SHAPE_PRIORS[name]['mean'])
 
-    if wind_model == 'confinement':
+    if wind_model in R_STAR_TIED_MODELS:
         wp['R_star'] = float(R_value)
 
     return wp
@@ -647,14 +667,14 @@ class DirectLightCurveModel:
         """Evaluate model by running simulate_lightcurve.
 
         ``wind_params`` overrides the default fixed shape parameters when
-        provided. R_star is auto-filled from R for the confinement model if
-        not present.
+        provided. R_star is auto-filled from R for the confinement and
+        beta_law models if not present.
         """
         if wind_params is None:
             wp = dict(self.wind_params_default)
         else:
             wp = dict(wind_params)
-        if self.wind_model == 'confinement' and 'R_star' not in wp:
+        if self.wind_model in R_STAR_TIED_MODELS and 'R_star' not in wp:
             wp['R_star'] = float(R)
 
         try:
@@ -2407,11 +2427,16 @@ def plot_geometry_diagnostics(
         if k in wind_params
     )
     profile_path = os.path.join(output_dir, f"{suffix}_wind_profile.png")
+    # Characteristic radii to mark on the profile: the break radius for
+    # smooth_pl, the compression scale for confinement, and the effective
+    # break R_star + 3H (Wind_Density.pdf, Eq. 8) for beta_law.
+    mark_radii = {k: wind_params[k] for k in ('Rb', 'ell') if k in wind_params}
+    if wind_model == 'beta_law' and 'H' in wind_params:
+        mark_radii['R_*+3H'] = float(R) + 3.0 * float(wind_params['H'])
     try:
         plot_wind_profile(
             r_grid, np.vstack(g_rows), R=R, probed_range=probed,
-            mark_radii={k: wind_params[k] for k in ('Rb', 'ell')
-                        if k in wind_params},
+            mark_radii=mark_radii,
             wind_model=WIND_MODELS.get(wind_model, wind_model),
             band=band_label, shape_summary=summary or None,
             output_path=profile_path, verbose=verbose)
@@ -3310,9 +3335,9 @@ def main():
         action="store_true",
         help=(
             "Add the wind-shape parameters of the chosen --wind-model as free "
-            "MCMC dimensions (smooth_pl: Rb, p; confinement: fconf, ell). "
-            "Override priors via --prior-Rb, --prior-p, --prior-fconf, "
-            "--prior-ell."
+            "MCMC dimensions (smooth_pl: Rb, p; confinement: fconf, ell; "
+            "beta_law: beta, H). Override priors via --prior-Rb, --prior-p, "
+            "--prior-fconf, --prior-ell, --prior-beta, --prior-H."
         ),
     )
     
@@ -3465,7 +3490,7 @@ def main():
         metavar="NAME=VAL[,NAME=VAL,...]",
         help="Freeze selected free parameters at fixed values and remove them from sampling. "
              "Supported names: d1,d2,a,q,r,R,i0,M_X,M_RH,M_tot,q_m,f_scatter,"
-             "log_fopa,Rb,p,fconf,ell. Freezing log_fopa pins the effective "
+             "log_fopa,Rb,p,fconf,ell,beta,H. Freezing log_fopa pins the effective "
              "opacity at 10**VALUE (e.g. --freeze log_fopa=-1.7). "
              "log_f cannot be frozen."
     )
