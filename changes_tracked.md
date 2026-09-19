@@ -505,11 +505,44 @@ jitter) the new prior, likelihood and statistics agree with the previous file to
 - `py_compile` on every changed file; `compute_flux_vs_nH.py` compiles but
   cannot be executed here (no PyXspec in this environment — pre-existing).
 
-### Not changed / follow-ups
+### Follow-up commit: `utils/utils.py` dedupe, a swallowed-error fix, stale docs
 
-- `utils/utils.py` still has some duplication (`read_observation`'s repeated
-  case-insensitive column lookup, the shared weighted-mean logic of the two
-  binners, `fit_simulation` vs `apply_best_phase_shift`); low-risk, deferred.
+- **`read_observation` no longer swallows errors.** The whole header path was
+  inside `try: … except Exception: pass`, so an unknown `--obs-column`, a
+  header whose name count did not match the data columns, or a missing time
+  column silently fell through to the headerless reader, which parses a
+  CIAO file as three columns of the wrong quantities. Header detection is now
+  `_header_columns()`; errors in the header path are raised, and the
+  headerless reader is used only when no header exists. Column lookups go
+  through one case-insensitive `find_column()` (the same loop was written five
+  times) and error detection through `_detect_error_column()`; a requested
+  but absent `--obs-error-column` / `--time-column` now warns before
+  auto-detecting. Output DataFrames are identical to before on every CIAO file.
+- **One `weighted_mean(values, errors)`** for both binners (the two ~25-line
+  copies differed only in the degenerate all-errors-invalid fallback, which
+  now always uses the guarded version). Binned outputs identical on the real
+  data.
+- `detect_flux_columns` is defined through `detect_energy_bands`; `frac`
+  drops a redundant `abs`; unused `warnings` import removed from
+  `xrb_lightcurve.py`.
+- **Docs.** `PROJECT.md` referenced 17 files that are not in the tree
+  (`xspec_fit_mcmc.py`, `compute_count_to_flux_factor.py`, `example_usage.py`,
+  `MIGRATION_SUMMARY.md`, seven conversion guides,
+  `mcmc_chi2_jitter_explanation.md`, `PERFORMANCE_VALIDATION_REPORT.md`,
+  `compare_models.sh`, `convert_fits_to_txt_heasoft.sh`,
+  `xspec_tbabs_fit_results.xcm`); the XSPEC section, data-layout pipeline,
+  environment list, file inventory and known rough edges now describe what
+  exists. README no longer promises extrapolation warnings the code does not
+  emit (columns are clipped and extrapolated silently).
+
+### Left as is
+
+- `fit_simulation` (single-model CLI) and `apply_best_phase_shift` (MCMC)
+  both do a coarse scan then refine, but with different refinement targets
+  (bounded scalar minimization vs a 9-point grid) for different model
+  representations; kept separate.
+- `compute_flux_vs_nH.py` keeps its own small exponential fit for the plot
+  annotation so it does not depend on numba in the XSPEC environment.
 - `chandra_analysis_combined_flux.py` (untracked) is an unmigrated fork with
   its own multi-column helpers and a multiplicative flux scale; retiring it is
   recommended. The `utils/` data-prep scripts and the notebooks are unchanged
@@ -540,7 +573,6 @@ interpretability of plotted phases; the study script is not in the tree.
 | `utils/plot_utils.py` | ~940 | All plotting on the single `plot_lightcurve_fit`; geometry and wind-profile figures. |
 | `compute_flux_vs_nH.py` | ~930 | XSPEC flux-vs-nH table generator, one band per table. |
 | `plot_results.py` | 104 | Thin CLI over `utils/plot_utils.py` (`--geometric`, `--orbit`). |
-| `xspec_fit_mcmc.py`, `compute_count_to_flux_factor.py` | | XSPEC-side helpers. |
 
 ### Utilities, scripts, references
 `utils/` is a package (`utils.py`, `plot_utils.py`); `test_flux_methods.py` is

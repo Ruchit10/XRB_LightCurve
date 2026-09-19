@@ -69,8 +69,8 @@ MODEL_OVERLAY_N_POINTS = 721
 # -----------------------------------------------------------------------------
 
 def frac(x: np.ndarray | float) -> np.ndarray | float:
-    """Return the fractional part of *x* (vectorised)."""
-    return np.abs(x - np.floor(x))
+    """Return the fractional part of *x* in [0, 1) (vectorised)."""
+    return x - np.floor(x)
 
 
 def fmt_val(value: float, width: int = 0) -> str:
@@ -133,17 +133,34 @@ def get_band_display_name(band: str) -> Tuple[str, str]:
 
 
 def detect_flux_columns(df: pd.DataFrame) -> List[str]:
-    """Band-flux columns (``nfl_{band}``) present in a simulation DataFrame.
-
-    The column-density columns ``flx`` / ``fl`` are not flux values and are
-    excluded.
-    """
-    return sorted(col for col in df.columns if col.startswith("nfl_"))
+    """Band-flux columns (``nfl_{band}``) of a simulation DataFrame, in the
+    physical band order of :func:`detect_energy_bands`."""
+    return [f"nfl_{band}" for band in detect_energy_bands(df)]
 
 
 # -----------------------------------------------------------------------------
 # Observation reading
 # -----------------------------------------------------------------------------
+
+def find_column(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
+    """The column of *df* whose name matches *name* case-insensitively, or None."""
+    if name is None:
+        return None
+    target = str(name).upper()
+    for col in df.columns:
+        if str(col).upper() == target:
+            return col
+    return None
+
+
+def _first_column(df: pd.DataFrame, names) -> Optional[str]:
+    """First of *names* present in *df* (case-insensitive), or None."""
+    for name in names:
+        col = find_column(df, name)
+        if col is not None:
+            return col
+    return None
+
 
 def _derive_err_from_rate_err(df: pd.DataFrame, obs_col: str) -> Optional[pd.Series]:
     """Derive observable errors from rate_err for proportional columns.
@@ -156,41 +173,95 @@ def _derive_err_from_rate_err(df: pd.DataFrame, obs_col: str) -> Optional[pd.Ser
     For rows where that ratio is undefined, fall back to a robust file-level
     conversion factor median(obs/rate) computed from valid rows.
     """
-    rate_col = None
-    rate_err_col = None
-
-    for col in df.columns:
-        if col.upper() == "RATE":
-            rate_col = col
-            break
-
-    for col in df.columns:
-        if col.upper() in {"RATE_ERR", "ERR_RATE", "COUNT_RATE_ERR"}:
-            rate_err_col = col
-            break
-
+    rate_col = find_column(df, "RATE")
+    rate_err_col = _first_column(df, ("RATE_ERR", "ERR_RATE", "COUNT_RATE_ERR"))
     if rate_col is None or rate_err_col is None:
         return None
 
-    obs_vals = pd.to_numeric(df[obs_col], errors="coerce")
-    rate_vals = pd.to_numeric(df[rate_col], errors="coerce")
-    rate_err_vals = pd.to_numeric(df[rate_err_col], errors="coerce")
+    obs_vals = pd.to_numeric(df[obs_col], errors="coerce").to_numpy(dtype=float)
+    rate_vals = pd.to_numeric(df[rate_col], errors="coerce").to_numpy(dtype=float)
+    rate_err_vals = pd.to_numeric(df[rate_err_col], errors="coerce").to_numpy(dtype=float)
 
-    valid_ratio = (
-        np.isfinite(obs_vals.to_numpy())
-        & np.isfinite(rate_vals.to_numpy())
-        & (rate_vals.to_numpy() > 0.0)
-    )
+    valid_ratio = np.isfinite(obs_vals) & np.isfinite(rate_vals) & (rate_vals > 0.0)
     if not np.any(valid_ratio):
         return None
 
     ratio = np.full(len(df), np.nan, dtype=float)
-    ratio[valid_ratio] = obs_vals.to_numpy()[valid_ratio] / rate_vals.to_numpy()[valid_ratio]
-    cf = float(np.nanmedian(ratio[valid_ratio]))
-    ratio = np.where(np.isfinite(ratio), ratio, cf)
+    ratio[valid_ratio] = obs_vals[valid_ratio] / rate_vals[valid_ratio]
+    ratio = np.where(np.isfinite(ratio), ratio, float(np.nanmedian(ratio[valid_ratio])))
+    return pd.Series(rate_err_vals * ratio, index=df.index, dtype=float)
 
-    derived = rate_err_vals.to_numpy() * ratio
-    return pd.Series(derived, index=df.index, dtype=float)
+
+def _detect_error_column(df: pd.DataFrame, obs_col: str,
+                         requested: Optional[str] = None) -> Optional[str]:
+    """Error column belonging to *obs_col*, or None.
+
+    An explicitly requested name wins (with a warning if it is absent).
+    Otherwise candidates are matched case-insensitively and a candidate equal
+    to the observable itself is always skipped -- a lower-case ``flux_t`` once
+    matched its own column and set error := flux. ``rate_err`` measures the
+    rate, so it is only offered when the observable *is* the rate; for a
+    proportional column such as ``flux_t`` it has the wrong scale and the
+    caller derives the error from it instead (:func:`_derive_err_from_rate_err`).
+    """
+    if requested:
+        col = find_column(df, requested)
+        if col is not None:
+            return col
+        warnings.warn(f"Requested error column '{requested}' not found; "
+                      f"auto-detecting. Available columns: {list(df.columns)}")
+
+    obs_upper = str(obs_col).upper()
+    candidates = [
+        f"{obs_upper}_ERR",
+        f"ERR_{obs_upper}",
+        obs_upper.replace("RATE", "ERR_RATE"),
+        obs_upper.replace("FLUX", "FLUX_ERR"),
+    ]
+    if obs_upper in {"RATE", "COUNT_RATE", "NET_RATE"}:
+        candidates += ["RATE_ERR", "ERR_RATE", "COUNT_RATE_ERR"]
+    for name in dict.fromkeys(candidates):
+        if name == obs_upper:
+            continue
+        col = find_column(df, name)
+        if col is not None:
+            return col
+
+    # Generic fallback: any *_ERR column naming this observable. Deliberately
+    # does not accept a bare rate_err for a non-rate observable.
+    obs_base = obs_upper.split("_")[0]
+    for col in df.columns:
+        col_upper = str(col).upper()
+        if col_upper != obs_upper and "ERR" in col_upper and obs_base and obs_base in col_upper:
+            return col
+    return None
+
+
+def _header_columns(file_path: str) -> Optional[List[str]]:
+    """Column names declared in a file's comment header, or None if it has none.
+
+    Recognizes the CIAO ``# Columns: a, b, c`` (or ``# #Columns:``) form and a
+    plain commented header line naming TIME/RATE/FLUX-like columns. Only the
+    leading comment block (at most 10 lines) is inspected.
+    """
+    lines: List[str] = []
+    with open(file_path, "r") as fh:
+        for line in fh:
+            lines.append(line.strip())
+            if not line.strip().startswith("#") or len(lines) > 10:
+                break
+
+    header: Optional[List[str]] = None
+    for line in lines:
+        if not line.startswith("#"):
+            continue
+        if "Columns:" in line:
+            return [c.strip() for c in line.split("Columns:")[1].split(",") if c.strip()]
+        clean = line.lstrip("#").strip()
+        if clean and ":" not in clean and "=" not in clean and any(
+                key in clean.upper() for key in ("TIME", "RATE", "FLUX")):
+            header = clean.split()
+    return header
 
 
 def read_observation(
@@ -203,231 +274,73 @@ def read_observation(
 ) -> pd.DataFrame:
     """Read a single Chandra observation text file.
 
-    The files can be whitespace-delimited with or without headers.
-    If a header is present (lines starting with #), column names are extracted.
-    Otherwise, assumes three columns: time, count rate/flux, error.
+    Two file shapes are supported:
 
-    Supports multiple formats:
-    1. Standard format: TIME in first column, tab or space delimited
-    2. CIAO format: time column (t_raw or time), space delimited, with "# Columns:" or "# #Columns:" header
+    1. A commented header naming the columns -- CIAO's ``# Columns: dt, t_raw,
+       mjd, phase, counts, rate, rate_err, flux_t`` or a plain
+       ``# TIME RATE ERROR`` line. Columns are resolved case-insensitively:
+       the timestamp from *time_column* or ``TIME``/``T_RAW``/``T``/``MJD``,
+       the observable from *obs_column*, the error from *obs_error_column* or
+       auto-detection (falling back to a ``rate_err``-derived error for
+       proportional columns such as ``flux_t``), and *counts_column* when
+       present.
+    2. No header: three whitespace-separated columns ``time, rate, error``.
 
-    Parameters
-    ----------
-    file_path : str
-        Path to observation file
-    label : str
-        Label for this observation
-    obs_column : str, default "rate"
-        Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE", "ECF", "flux_t").
-        If file has no header, this is ignored and "rate" is used.
-    obs_error_column : str, optional
-        Name of column to use for errors. If None, will attempt to auto-detect based on obs_column
-        (e.g., "ERR_RATE" for "NET_RATE", "FLUX_ERR" for "FLUX", "rate_err" for CIAO).
-    time_column : str, optional
-        Name of column containing timestamps (e.g., "TIME", "time", "t_raw"). If None, will auto-detect.
-    counts_column : str, optional
-        Name of column containing counts. If present in the file, it is passed through
-        to the output as ``counts``.
+    Errors in the header path (unknown observable, header/data column-count
+    mismatch, no time column) are raised rather than silently falling back to
+    the headerless reader.
+
     Returns
     -------
-    DataFrame with columns: time, phase, obs, and the specified observable column renamed to "rate"
-    (and optionally "error" column)
+    DataFrame with columns ``time, rate, phase, obs`` plus ``error`` and
+    ``counts`` when available; ``rate`` holds the requested observable.
     """
-    # Try to read with header detection
-    try:
-        # Read file and check for header format
-        with open(file_path, 'r') as f:
-            lines = []
-            for line in f:
-                lines.append(line.strip())
-                if not line.strip().startswith('#') or len(lines) > 10:
-                    break
+    header = _header_columns(file_path)
+    if header is None:
+        df = pd.read_csv(file_path, sep=r"\s+", comment="#", header=None,
+                         names=["time", "rate", "error"])
+        df["phase"] = frac((df["time"] - REF_EPOCH) / ORBITAL_PERIOD)
+        df["obs"] = label
+        return df
 
-        # Check for CIAO format with "Columns:" header (handles both "# Columns:" and "# #Columns:")
-        ciao_format = False
-        header_line = None
-        for line in lines:
-            # Match both "# Columns:" and "# #Columns:" formats
-            if line.startswith('#') and 'Columns:' in line:
-                ciao_format = True
-                # Extract column names after "Columns:"
-                col_part = line.split('Columns:')[1].strip()
-                col_names = [c.strip() for c in col_part.split(',')]
-                header_line = ' '.join(col_names)
-                break
-            elif line.startswith('#') and not ciao_format:
-                # Standard format: check if this line has column-like content
-                # Skip lines with ":" or "=" which indicate metadata
-                clean_line = line.lstrip('#').strip()
-                if clean_line and ':' not in clean_line and '=' not in clean_line:
-                    if any(name in line.upper() for name in ['TIME', 'RATE', 'FLUX']):
-                        header_line = clean_line
+    df = pd.read_csv(file_path, sep=r"\s+", comment="#", header=None)
+    if len(header) != len(df.columns):
+        raise ValueError(
+            f"{file_path}: header names {header} do not match the "
+            f"{len(df.columns)} data columns")
+    df.columns = header
 
-        # Check if file has a header
-        has_header = header_line is not None or any(
-            any(col_name in line.upper() for col_name in ['TIME', 'RATE', 'FLUX', 'COUNTS', 'ECF', 'PHASE'])
-            for line in lines if line.startswith('#')
-        )
+    time_col = find_column(df, time_column) if time_column else None
+    if time_column and time_col is None:
+        warnings.warn(f"Time column '{time_column}' not found in {file_path}; "
+                      f"auto-detecting. Available columns: {list(df.columns)}")
+    if time_col is None:
+        time_col = _first_column(df, ("TIME", "T_RAW", "T", "MJD"))
+    if time_col is None:
+        raise ValueError(f"No time column found in {file_path}. "
+                         f"Available columns: {list(df.columns)}")
 
-        if has_header:
-            # Read with header - skip comment lines
-            df = pd.read_csv(file_path, sep='\\s+', comment='#', header=None)
+    obs_col = find_column(df, obs_column)
+    if obs_col is None:
+        raise ValueError(f"Column '{obs_column}' not found in {file_path}. "
+                         f"Available columns: {list(df.columns)}")
 
-            if header_line:
-                col_names = header_line.split()
-                if len(col_names) == len(df.columns):
-                    df.columns = col_names
+    out = pd.DataFrame({"rate": df[obs_col], "time": df[time_col]})
+    err_col = _detect_error_column(df, obs_col, obs_error_column)
+    if err_col is not None:
+        out["error"] = df[err_col]
+    else:
+        derived = _derive_err_from_rate_err(df, obs_col)
+        if derived is not None:
+            out["error"] = derived
+    counts_col = find_column(df, counts_column) if counts_column else None
+    if counts_col is not None:
+        out["counts"] = pd.to_numeric(df[counts_col], errors="coerce")
 
-                    # Find time column (case-insensitive, or use user-specified)
-                    time_col = None
-                    if time_column:
-                        # User specified time column
-                        for col in df.columns:
-                            if col.upper() == time_column.upper():
-                                time_col = col
-                                break
-                        if not time_col:
-                            print(f"⚠️  Warning: Specified time column '{time_column}' not found in {file_path}")
-                            print(f"   Available columns: {list(df.columns)}")
-
-                    if not time_col:
-                        # Auto-detect time column - check common names
-                        time_column_names = ['TIME', 'T_RAW', 'T', 'MJD']
-                        for time_name in time_column_names:
-                            for col in df.columns:
-                                if col.upper() == time_name:
-                                    time_col = col
-                                    break
-                            if time_col:
-                                break
-
-                    # Need a time column to compute phase
-                    if not time_col:
-                        print(f"⚠️  Warning: No time column found in {file_path}")
-                        print(f"   Available columns: {list(df.columns)}")
-                        raise ValueError("No time column found")
-
-                    # Case-insensitive column matching for obs_column
-                    actual_obs_column = None
-                    for col in df.columns:
-                        if col.upper() == obs_column.upper():
-                            actual_obs_column = col
-                            break
-
-                    if not actual_obs_column:
-                        # Column not found - print available columns and raise error
-                        print(f"⚠️  Error: Column '{obs_column}' not found in {file_path}")
-                        print(f"   Available columns: {list(df.columns)}")
-                        raise ValueError(f"Column '{obs_column}' not found in observation file")
-
-                    # Use specified columns
-                    result_df = pd.DataFrame({
-                        'rate': df[actual_obs_column],
-                    })
-
-                    # Add time column (required for phase computation)
-                    result_df['time'] = df[time_col]
-
-                    # Try to find error column
-                    error_col = None
-                    if obs_error_column:
-                        # Check for user-specified error column (case-insensitive)
-                        for col in df.columns:
-                            if col.upper() == obs_error_column.upper():
-                                error_col = col
-                                break
-
-                    obs_upper = actual_obs_column.upper()
-                    # Whether the observable *is* the count rate. rate_err
-                    # measures the rate, so it may only be used directly in that
-                    # case; for a proportional column such as flux_t it has the
-                    # wrong scale and must be converted by
-                    # _derive_err_from_rate_err instead.
-                    obs_is_rate = obs_upper in {"RATE", "COUNT_RATE", "NET_RATE"}
-
-                    if not error_col:
-                        # Auto-detect an error column belonging to *this*
-                        # observable. Candidates are matched case-insensitively
-                        # and a candidate equal to the observable is always
-                        # skipped: the previous case-sensitive
-                        # .replace("FLUX", "FLUX_ERR") was a no-op on a
-                        # lower-case name, so "flux_t" matched its own column
-                        # and errors were silently set equal to the flux
-                        # (~3x too large after inverse-variance binning, and
-                        # chi2 too small by ~an order of magnitude).
-                        candidates = [
-                            f"{obs_upper}_ERR",
-                            f"ERR_{obs_upper}",
-                            obs_upper.replace("RATE", "ERR_RATE"),
-                            obs_upper.replace("FLUX", "FLUX_ERR"),
-                        ]
-                        if obs_is_rate:
-                            candidates += ["RATE_ERR", "ERR_RATE", "COUNT_RATE_ERR"]
-
-                        seen = set()
-                        for err_name in candidates:
-                            if err_name == obs_upper or err_name in seen:
-                                continue
-                            seen.add(err_name)
-                            for col in df.columns:
-                                if col.upper() == err_name:
-                                    error_col = col
-                                    break
-                            if error_col:
-                                break
-
-                        # Generic fallback: any *_ERR column naming this
-                        # observable. Deliberately does not accept a bare
-                        # rate_err for a non-rate observable.
-                        if not error_col:
-                            obs_base = obs_upper.split('_')[0]
-                            for col in df.columns:
-                                col_upper = col.upper()
-                                if col_upper == obs_upper or 'ERR' not in col_upper:
-                                    continue
-                                if obs_base and obs_base in col_upper:
-                                    error_col = col
-                                    break
-
-                    if error_col:
-                        result_df['error'] = df[error_col]
-                    else:
-                        derived = _derive_err_from_rate_err(df, actual_obs_column)
-                        if derived is not None:
-                            result_df['error'] = derived
-
-                    if counts_column:
-                        actual_counts_column = None
-                        for col in df.columns:
-                            if col.upper() == counts_column.upper():
-                                actual_counts_column = col
-                                break
-                        if actual_counts_column:
-                            result_df['counts'] = pd.to_numeric(
-                                df[actual_counts_column], errors='coerce'
-                            )
-
-                    # Always compute phase from timestamps and current ephemeris.
-                    result_df['phase'] = frac((result_df['time'] - REF_EPOCH) / ORBITAL_PERIOD)
-
-                    result_df['obs'] = label
-
-                    return result_df
-    except Exception:
-        pass
-
-    # Fallback: read as headerless file with 3 columns
-    df = pd.read_csv(
-        file_path,
-        sep='\\s+',
-        comment='#',
-        header=None,
-        names=["time", "rate", "error"],
-    )
-    # Convert timestamps to orbital phase (0–1)
-    df["phase"] = frac((df["time"] - REF_EPOCH) / ORBITAL_PERIOD)
-    df["obs"] = label
-    return df
+    # Phase is always recomputed from the timestamps and the current ephemeris.
+    out["phase"] = frac((out["time"] - REF_EPOCH) / ORBITAL_PERIOD)
+    out["obs"] = label
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -560,6 +473,35 @@ def load_observed_lightcurves(
 # Phase binning
 # -----------------------------------------------------------------------------
 
+def weighted_mean(values: np.ndarray, errors: Optional[np.ndarray]) -> Tuple[float, float]:
+    """Inverse-variance weighted mean of *values* and its error ``sqrt(1/Σw)``.
+
+    Zero, negative or non-finite errors are patched with the median valid
+    error; when no error is valid the spread of the values is used instead
+    (floored at machine epsilon). Without any errors the plain mean and the
+    standard error of the mean are returned. Shared by both phase binners so
+    they weight points identically.
+    """
+    values = np.asarray(values, dtype=float)
+    n = values.size
+    if errors is not None:
+        errors = np.asarray(errors, dtype=float)
+    if errors is None or not np.any(np.isfinite(errors)):
+        if n > 1:
+            return float(np.mean(values)), float(np.std(values) / np.sqrt(n))
+        return float(values[0]), 0.0
+
+    bad = (errors <= 0) | ~np.isfinite(errors)
+    valid = errors[~bad]
+    if valid.size:
+        errors = np.where(bad, np.median(valid), errors)
+    else:
+        spread = np.std(values) if n > 1 else abs(values[0]) * 0.1
+        errors = np.full(n, max(float(spread), np.finfo(float).eps))
+    weights = 1.0 / errors ** 2
+    return float(np.average(values, weights=weights)), float(np.sqrt(1.0 / np.sum(weights)))
+
+
 def phase_bin_data(
     df: pd.DataFrame,
     n_bins: int = 50,
@@ -618,32 +560,10 @@ def phase_bin_data(
         bin_df = df[bin_mask]
 
         if len(bin_df) >= min_points_per_bin:
-            # Get rate values
-            rate_vals = bin_df[rate_column].values
-
-            # If errors are available, use weighted mean
-            has_errors = (error_column in bin_df.columns and
-                         not bin_df[error_column].isna().all())
-
-            if has_errors:
-                err_vals = bin_df[error_column].values
-                # Replace zero/nan errors with median of valid errors
-                valid_err = err_vals[(err_vals > 0) & np.isfinite(err_vals)]
-                if len(valid_err) > 0:
-                    median_err = np.median(valid_err)
-                    err_vals = np.where((err_vals <= 0) | ~np.isfinite(err_vals),
-                                       median_err, err_vals)
-                else:
-                    err_vals = np.ones_like(rate_vals) * np.std(rate_vals)
-
-                weights = 1.0 / err_vals**2
-                mean_rate = np.average(rate_vals, weights=weights)
-                # Standard error of weighted mean
-                mean_err = np.sqrt(1.0 / np.sum(weights))
-            else:
-                # Simple mean and standard error
-                mean_rate = np.mean(rate_vals)
-                mean_err = np.std(rate_vals) / np.sqrt(len(rate_vals))
+            rate_vals = bin_df[rate_column].to_numpy(dtype=float)
+            err_vals = (bin_df[error_column].to_numpy(dtype=float)
+                        if error_column in bin_df.columns else None)
+            mean_rate, mean_err = weighted_mean(rate_vals, err_vals)
 
             binned_data.append({
                 'phase': bin_centers[i],
@@ -746,31 +666,9 @@ def phase_bin_data_snr(
     for indices in bins:
         bin_df = work.iloc[indices]
         rate_vals = bin_df[rate_column].to_numpy(dtype=float)
-        err_vals = (
-            bin_df[error_column].to_numpy(dtype=float)
-            if (error_column in bin_df.columns)
-            else np.full(len(bin_df), np.nan, dtype=float)
-        )
-        has_errors = np.any(np.isfinite(err_vals))
-
-        if has_errors:
-            valid_err = err_vals[(err_vals > 0) & np.isfinite(err_vals)]
-            if len(valid_err) > 0:
-                median_err = float(np.median(valid_err))
-                err_vals = np.where(
-                    (err_vals <= 0) | ~np.isfinite(err_vals),
-                    median_err,
-                    err_vals,
-                )
-            else:
-                fallback = np.std(rate_vals) if len(rate_vals) > 1 else np.abs(rate_vals[0]) * 0.1
-                err_vals = np.full_like(rate_vals, max(float(fallback), np.finfo(float).eps))
-            weights = 1.0 / err_vals ** 2
-            mean_rate = float(np.average(rate_vals, weights=weights))
-            mean_err = float(np.sqrt(1.0 / np.sum(weights)))
-        else:
-            mean_rate = float(np.mean(rate_vals))
-            mean_err = float(np.std(rate_vals) / np.sqrt(len(rate_vals))) if len(rate_vals) > 1 else 0.0
+        err_vals = (bin_df[error_column].to_numpy(dtype=float)
+                    if error_column in bin_df.columns else None)
+        mean_rate, mean_err = weighted_mean(rate_vals, err_vals)
 
         phase_vals = bin_df['phase'].to_numpy(dtype=float)
         bin_counts = np.maximum(bin_df[counts_column].to_numpy(dtype=float), 0.0)

@@ -360,11 +360,15 @@ handles three file shapes:
 
 1. CIAO style with a `# Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t` header.
 2. Standard commented header containing TIME/RATE/FLUX-like names.
-3. Headerless 3-column `time, rate, error` fallback.
+3. Headerless 3-column `time, rate, error` — used **only** when no header is
+   found. Errors in the header path (unknown observable, header/data
+   column-count mismatch, no time column) are raised; they used to be
+   swallowed and the file silently re-read as three headerless columns.
 
-Column resolution is case-insensitive with auto-detection for time
-(`TIME`/`T_RAW`/`T`/`MJD`), the observable, the error
-(`{col}_ERR`, `ERR_{col}`, `rate_err`, `count_rate_err`, …), and `counts`.
+Column resolution is case-insensitive (`find_column`) with auto-detection for
+time (`TIME`/`T_RAW`/`T`/`MJD`), the observable, the error
+(`_detect_error_column`: `{col}_ERR`, `ERR_{col}`, … — `rate_err` only when the
+observable *is* the rate), and `counts`.
 
 **`flux_t` error derivation.** CIAO files carry `flux_t` but no `flux_t_err`.
 When no error column matches, `_derive_err_from_rate_err` derives per-row errors
@@ -375,11 +379,13 @@ of `*.txt`.
 
 ### Binning
 
-Two mutually exclusive binners:
+Two mutually exclusive binners, both reducing each bin with the shared
+`weighted_mean(values, errors)` (inverse-variance mean, `error = √(1/Σw)`,
+invalid errors patched with the median valid error):
 
 - **`phase_bin_data(df, n_bins=50, min_points_per_bin=3, …)`** — fixed-width
-  phase bins, inverse-variance weighted mean, `error = √(1/Σw)`; bins below
-  `min_points_per_bin` are dropped. Variable counts per bin.
+  phase bins; bins below `min_points_per_bin` are dropped. Variable counts per
+  bin.
 - **`phase_bin_data_snr(df, counts_per_bin=100, …)`** — adaptive
   *constant-counts* bins. Points are sorted by phase and accumulated greedily
   until each bin holds `counts_per_bin` counts, giving every binned point roughly
@@ -574,10 +580,9 @@ dimensions; `--freeze H=1.0` recovers a one-parameter beta-law fit.
 - **`jitter`** — adds a free fractional systematic `log_f`; per-point variance
   becomes `σ²_eff = σ_obs² + (f·model)²` with `f = e^{log_f}`, and the
   likelihood carries the `+log σ²_eff` normalization. Recommended when fitting
-  raw unbinned data, where formal errors underestimate the real scatter. Prior
-  `JITTER_PRIOR = {mean:-3, std:2, min:-10, max:0}`. See
-  [mcmc_chi2_jitter_explanation.md](mcmc_chi2_jitter_explanation.md) for the
-  full derivation and an emcee-vs-zeus walkthrough.
+  raw unbinned data, where formal errors underestimate the real scatter, and
+  for binned real data, which carries ~20–25 % intrinsic variability. Prior
+  `JITTER_PRIOR = {mean:-3, std:2, min:-10, max:0}`.
 
 ### Priors
 
@@ -737,24 +742,16 @@ replotting.
 
 ## Spectral / XSPEC side
 
-- **`compute_flux_vs_nH.py`** — the key upstream product. Loads a spectrum
-  (PHA + background + responses) from `--specdir`, fits
-  `{phabs,tbabs,wabs}×powerlaw` over `--fit_emin/--fit_emax`, freezes the
-  powerlaw, then sweeps `nH` over a log grid and integrates band flux at each
-  point. Emits `flux_vs_nH*.csv` with `nH_1e22`, `flux_{band}_ph`,
-  `flux_{band}_erg` — exactly what `--flux_method interpolate` consumes.
-  Chandra bands: `broad` 0.5–7.0, `soft` 0.5–2.0, `medium` 1.2–2.0,
-  `hard` 2.0–7.0 keV.
-- **`xspec_fit_mcmc.py`** — spectral-side MCMC for `phabs×(powerlaw+diskbb)`
-  over 0.5–7 keV using XSPEC's Goodman-Weare chain engine, with optional corner
-  plot.
-- **`compute_count_to_flux_factor.py`** — derives the count-rate → flux
-  conversion factor, either from an XSPEC fit or from manually supplied values.
-- **`compare_models.sh`** — driver for the TBabs-vs-phabs comparison (logs to
-  `model_comparison.log`).
-- **`xspec_tbabs_fit_results.xcm`** — saved TBabs×powerlaw best fit.
-
-Requires XSPEC in the active Python environment (the `henv` conda env).
+**`compute_flux_vs_nH.py`** is the key upstream product. It loads a spectrum
+(PHA + background + responses) from `--specdir`, fits
+`{phabs,tbabs,wabs}×powerlaw` over `--fit_emin/--fit_emax`, freezes the
+powerlaw, then sweeps `nH` over a log grid and integrates the flux of **one**
+band (`--band`, default `broad`) at each point. Emits a CSV with `nH_1e22`,
+`flux_{band}_ph`, `flux_{band}_erg` — exactly what `--flux_method interpolate`
+consumes. Chandra bands: `broad` 0.5–7.0, `soft` 0.5–2.0, `medium` 1.2–2.0,
+`hard` 2.0–7.0 keV. Requires PyXspec in the active environment; the earlier
+XSPEC helper scripts (`.xcm` files, model-comparison and conversion-factor
+tools) are no longer in the tree.
 
 ---
 
@@ -783,11 +780,10 @@ natural single-observation test case.
 
 Time-averaged count rates (cts/s): broad 0.1132, soft 0.0635, hard 0.0497.
 
-Conversion pipeline: `utils/convert_fits_to_txt.py` (or
-`convert_fits_to_txt_heasoft.sh`) → `utils/add_flux_simple.py` /
-`utils/add_flux_to_lightcurves.py`, with factors from
-`compute_count_to_flux_factor.py` and rates from
-`utils/get_average_count_rates.py`.
+Conversion pipeline for the legacy `IC_10_X1_LC` layout:
+`utils/convert_fits_to_txt.py` → `utils/add_flux_simple.py` /
+`utils/add_flux_to_lightcurves.py`, with time-averaged rates from
+`utils/get_average_count_rates.py`. The CIAO layout needs none of this.
 
 ---
 
@@ -900,8 +896,7 @@ Conda env `henv` (heasoft/XSPEC + Python deps). Beyond
 - **`arviz`** — convergence summaries (optional; degrades gracefully).
 - **`zeus-mcmc`** — `--sampler zeus` (optional).
 - **`astropy`** — FITS conversion utilities.
-- **XSPEC Python (`pyxspec`)** — `compute_flux_vs_nH.py`, `xspec_fit_mcmc.py`,
-  `compute_count_to_flux_factor.py`.
+- **XSPEC Python (`pyxspec`)** — `compute_flux_vs_nH.py` only.
 
 `xrb_lightcurve.py` itself needs only numpy, pandas and numba (scipy is no
 longer imported there).
@@ -919,54 +914,30 @@ longer imported there).
 | [utils/utils.py](utils/utils.py) | ~1570 | Shared layer: ephemeris, loading, both binners, smoothing, periodic model interpolation + phase-shift search, `fit_simulation`, run-config persistence. |
 | [utils/plot_utils.py](utils/plot_utils.py) | ~940 | All plotting, built on the single `plot_lightcurve_fit`. |
 | [compute_flux_vs_nH.py](compute_flux_vs_nH.py) | ~930 | XSPEC `flux vs nH` table generator (one band per table). |
-| [xspec_fit_mcmc.py](xspec_fit_mcmc.py) | 702 | XSPEC-side spectral MCMC. |
-| `chandra_analysis_combined_flux.py` (untracked) | 539 | Unmigrated fork for pre-folded combined-flux files; see Known rough edges. |
 | [plot_results.py](plot_results.py) | 104 | Thin CLI over `utils/plot_utils.py` for simulation CSVs (`--geometric`, `--orbit`). |
-| [compute_count_to_flux_factor.py](compute_count_to_flux_factor.py) | 147 | Count-rate → flux factor. |
-| [example_usage.py](example_usage.py) | 96 | Programmatic `simulate_lightcurve` examples. |
 
 ### Utilities (`utils/`)
 `utils/` is a package (`__init__.py`). Two modules are library code imported by
-the analysis scripts — `utils.py` and `plot_utils.py` (see Core above). The rest
-are standalone data-prep scripts, not part of the package API:
-`convert_fits_to_txt.py`, `add_flux_simple.py`, `add_flux_to_lightcurves.py`,
-`get_average_count_rates.py`, `test_flux_methods.py`,
-`benchmark_mcmc_performance.py`.
+the analysis scripts — `utils.py` and `plot_utils.py` (see Core above).
+`test_flux_methods.py` is the regression test. The rest are standalone
+one-time data-prep scripts for the legacy `IC_10_X1_LC` layout, not part of
+the package API: `convert_fits_to_txt.py`, `add_flux_simple.py`,
+`add_flux_to_lightcurves.py`, `get_average_count_rates.py`.
 
-### Shell / XSPEC
-`convert_fits_to_txt_heasoft.sh`, `compare_models.sh`,
-`rkp_run_w_mcmc_cmds.sh` (command scrapbook),
-`xspec_tbabs_fit_results.xcm`.
-
-### Notebooks
-`xrb_toy_wind_models.ipynb` (wind-profile exploration — the active one),
-`xrb_model_analysis.ipynb`, `xrb_model_analysis_single_15803.ipynb`,
-`xrb_flux_nH_abs.ipynb`.
+### Scripts, references, untracked
+`rkp_run_w_mcmc_cmds.sh` — the worked command sequence. Reference PDFs:
+`Wind_Density.pdf` (profile equations), `stu2151.pdf` (Laycock et al. 2015),
+`manuscript_1.pdf` (2017 MS thesis). `paper/` — MDPI *Algorithms* manuscript
+skeleton and bibliography. Untracked and local only: `notebooks/` (predate
+Phases 31–33), `chandra_analysis_combined_flux.py` (see Known rough edges),
+`utils/benchmark_mcmc_performance.py`, `.cursor/plans/`, `temp/`, `legacy_r_code/`.
 
 ### Documentation
 | File | Contents |
 | ---- | -------- |
 | `PROJECT.md` | This file — current state. |
-| [changes_tracked.md](changes_tracked.md) | Full change log, including removed features. |
-| [mcmc_chi2_jitter_explanation.md](mcmc_chi2_jitter_explanation.md) | Likelihood/jitter math and emcee-vs-zeus internals. |
-| [PERFORMANCE_VALIDATION_REPORT.md](PERFORMANCE_VALIDATION_REPORT.md) | Benchmark harness and parity thresholds. |
-| `Wind_Density.pdf` | Source equations for the wind profiles (`broken_pl` was removed as a special case of `smooth_pl`; `beta_law` was re-added in Phase 32). |
-| `stu2151.pdf` | Laycock et al. 2015 — ephemeris and eclipse properties. |
-| `FLUX_INTEGRATION_SUMMARY.md`, `FLUX_METHODS_QUICKREF.md`, `XSPEC_CONVERSION_GUIDE.md`, `FITS_CONVERSION_README.md`, `QUICK_START_FLUX_CONVERSION.md`, `CONVERSION_WORKFLOW.md`, `README_CONVERSION_TOOLS.md` | Flux-conversion and FITS-pipeline guides. |
+| [changes_tracked.md](changes_tracked.md) | Condensed change log, including removed features. |
 | [README.md](README.md) | User-facing overview: pipeline, parameters, output columns. |
-| [MIGRATION_SUMMARY.md](MIGRATION_SUMMARY.md) | **Stale** — describes the original R→Python port. |
-
-### Plans (`.cursor/plans/`)
-One `*.plan.md` per feature increment: `unified_wind_model`,
-`mcmc_performance_and_statistics`, `mcmc_convergence_improvements`,
-`mcmc_wind_shape_params`, `mcmc_speed_memory_optimization`,
-`flux_t_error_and_unbinned_mcmc`, `freeze_params_and_kepler`,
-`wind_normalization_constants`, `adaptive_constant-snr_binning`,
-`gaussian_phase_smoothing_reference`, `reference_epoch_recalibration`.
-
-### Legacy
-`legacy_r_code/` (`new11.R`, `grid4.R`, `wind_los2.R`, `density_fnc.R`),
-`light_curve_model_opt_bw.R`, `temp/LC_MC/*.m` (MATLAB smoothing reference).
 
 ---
 
@@ -989,12 +960,6 @@ One `*.plan.md` per feature increment: `unified_wind_model`,
   `278800407.267`, which sits commented out beside `REF_EPOCH`. In practice the
   MCMC's per-sample phase-shift search absorbs the offset, so this mostly
   affects the interpretability of plotted phases.
-- **`MIGRATION_SUMMARY.md` is stale**, documenting removed API
-  (`--lam2`, `flx2`/`fl2`, `nfl_*_av`/`_cv`, `pho_count_*`).
-- **Some referenced helper files are absent** from the working tree:
-  `find_reference_epoch.py`, `compare_absorption_models.xcm` (which
-  `compare_models.sh` invokes), `xspec_get_conversion_factors_tbabs.xcm`,
-  `get_xspec_nH.py`, `utils/get_conversion_factors.sh`.
 - **`.gitignore` excludes `*.csv`, `*.txt`, `*.png`**, so data, XSPEC tables,
   and figures are not version-controlled — inputs must be regenerated or copied
   in on a fresh clone.

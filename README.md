@@ -227,8 +227,10 @@ flux conversion averaged over the disk (**not** the conversion of `fl`).
 **`ImportError: numba is required`** — install Numba; there is no pure-Python
 fallback integrator.
 
-**Extrapolation warnings** — model columns fell outside the CSV's `nH` range.
-Regenerate the table with a wider `--nH_min` / `--nH_max`.
+**Columns outside the table's `nH` range** are handled silently: the column is
+clipped to `[1e-6, 1e6] × 10²² cm⁻²` and the flux is extrapolated linearly in
+log–log space from the table's end segments. If your fits reach such columns,
+regenerate the table with a wider `--nH_min` / `--nH_max`.
 
 **Model flux orders of magnitude too low** — `f_opacity` is probably at its
 default of 1.0. The Clark & Crowther mass-loss rate overpredicts the observed

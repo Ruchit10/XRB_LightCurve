@@ -15,7 +15,6 @@ trigonometric functions.
 import argparse
 import math
 import os
-import warnings
 from typing import Dict, Optional, Tuple
 
 import numpy as np

@@ -136,8 +136,8 @@ def main():
         print("      data/IC_10_X1_LC/Broad_with_flux/ \\")
         print("      3.0e-11")
         print()
-        print("To get the conversion factor, run:")
-        print("  python compute_count_to_flux_factor.py")
+        print("The conversion factor is the band flux of your XSPEC best-fit model")
+        print("divided by the time-averaged count rate (utils/get_average_count_rates.py).")
         sys.exit(1)
     
     input_path = sys.argv[1]

@@ -49,7 +49,7 @@ import argparse
 import glob
 import os
 import sys
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, Optional, Dict
 
 import numpy as np
 import pandas as pd
