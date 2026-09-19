@@ -7,7 +7,11 @@ of a geometric eclipse and phase-dependent photoelectric absorption in that
 wind.
 
 Originally ported from R; the numerical core is a Numba-parallel
-Gauss-Legendre quadrature over the line of sight.
+Gauss-Legendre quadrature over the line of sight. One full light curve
+(360 phases, 60 angular sectors × 10 radial cells) takes ≈ 30 ms on a laptop,
+which is what makes direct-evaluation MCMC practical. The model is run **one
+energy band at a time**: each flux-vs-nH table holds a single band and each
+simulation produces a single `nfl_{band}` column.
 
 ---
 
@@ -16,15 +20,18 @@ Gauss-Legendre quadrature over the line of sight.
 For each orbital phase the code
 
 1. builds a polar grid across the projected emitter disk,
-2. integrates the wind density along the line of sight from every grid cell,
+2. integrates the wind density along the line of sight from every visible
+   grid cell (sectors mirrored about the star–star line share their geometry,
+   so only half of them are integrated),
 3. converts each cell's column density `N_H` to a band flux using an XSPEC
    `flux vs nH` table, and
 4. area-averages the result.
 
-Step 3 is done **per cell, before averaging**. The `N_H → flux` map is strongly
-nonlinear, so `⟨F(N)⟩ ≠ F(⟨N⟩)` wherever the column varies steeply across the
-disk — during ingress/egress and throughout the eclipse core, where the
-surviving flux is dominated by the least-absorbed cells.
+Steps 3–4 run inside one compiled pass, **per cell, before averaging**. The
+`N_H → flux` map is strongly nonlinear, so `⟨F(N)⟩ ≠ F(⟨N⟩)` wherever the
+column varies steeply across the disk — during ingress/egress and throughout
+the eclipse core, where the surviving flux is dominated by the least-absorbed
+cells.
 
 ### Wind column normalization
 
@@ -84,25 +91,30 @@ Light curves are generated from column densities, so an XSPEC-derived
 
 ```bash
 python compute_flux_vs_nH.py \
-    --specdir ./data/IC10X1_spec \
-    --out_csv data_flux_vs_nH.csv \
-    --out_png data_flux_vs_nH.png \
+    --specdir ./data/IC10X1_spec --band broad \
+    --out_csv flux_vs_nH_broad.csv \
+    --out_png flux_vs_nH_broad.png \
     --nH_min 1e20 --nH_max 1e24 --nH_points 60
 ```
 
-Requires XSPEC (PyXspec) in the environment. The CSV carries `nH_1e22` plus
-`flux_{band}_ph` / `flux_{band}_erg` columns; bands are auto-detected downstream.
+Requires XSPEC (PyXspec) in the environment. Each CSV carries `nH_1e22` plus
+`flux_{band}_ph` / `flux_{band}_erg` for **one** band; make one table per band
+you intend to fit. (A table holding several bands is still accepted, but the
+simulator then needs `--band` / `band=` to pick one.)
 
 ### 2. Generate a model light curve
 
 ```bash
 python xrb_lightcurve.py \
-    --flux_csv data_flux_vs_nH.csv \
+    --flux_csv flux_vs_nH_broad.csv \
     --wind-model smooth_pl \
     --R 2.0 --r 0.001 --d1 11.0 --d2 8.0 --i0 78.0 \
     --f-opacity 0.02 \
     --output sim_broad.csv
 ```
+
+From Python, `simulate_lightcurve(...)` returns the per-phase DataFrame and
+`simulate_band_flux(...)` just the `(phase, flux)` arrays the likelihood needs.
 
 ### 3. Fit
 
@@ -119,7 +131,7 @@ Full posterior via MCMC:
 
 ```bash
 python mcmc_lightcurve_fit.py \
-    --band broad --flux-csv data_flux_vs_nH.csv \
+    --band broad --flux-csv flux_vs_nH_broad.csv \
     --data-dir data/IC_10_X1_LC_CIAO/broad/single/ \
     --obs-column flux_t --time-column t_raw --n-phase-bins 150 \
     --wind-model smooth_pl --fit-wind-shape --fit-fopacity \
@@ -151,6 +163,7 @@ normalization instead of exposing it.
 | `--dth` | 1.0 | Orbital increment (degrees) |
 | `--d2h` | 6.0 | Angular cell size of the polar grid (degrees) |
 | `--flux_csv` | *required* | Flux vs nH CSV from `compute_flux_vs_nH.py` |
+| `--band` | *auto* | Band to simulate; only needed if the CSV holds more than one |
 | `--flux_method` | `interpolate` | `interpolate` or `refit` (see below) |
 | `--flux_type` | `erg` | `erg` (erg/cm²/s) or `ph` (photons/cm²/s) |
 | `--wind-model` | `smooth_pl` | `smooth_pl`, `confinement` or `beta_law` |
@@ -167,10 +180,11 @@ normalization instead of exposing it.
 
 1. **`interpolate`** (default) — log-log interpolation of the XSPEC table.
    Most faithful to the spectral model.
-2. **`refit`** — fits `A·exp(−B·nH)` to the same table and uses the analytic
-   form. Cheaper and smoother, at the cost of a small systematic error where
-   the true curve departs from a single exponential. Fitted coefficients are
-   printed.
+2. **`refit`** — fits `A·exp(−B·nH)` to the same table (once per table, then
+   cached) and uses the analytic form. Smoother, at the cost of a small
+   systematic error where the true curve departs from a single exponential.
+
+Both conversions are applied per emitter cell inside a compiled kernel.
 
 ---
 
@@ -178,13 +192,12 @@ normalization instead of exposing it.
 
 | Column | Meaning |
 |--------|---------|
-| `deg`, `ph`, `phase` | Phase angle in degrees / radians, and normalized phase (0–1) |
-| `time` | Time since the reference epoch (s) |
-| `flx` | Dimensionless mean wind LOS integral ∫g(r)dz, r in R☉ |
-| `fl` | Absolute column density `N_H` (10²² cm⁻²) |
-| `icd`, `A2` | Area-weighted column sum and total emitter area (integration diagnostics) |
+| `deg`, `phase` | Phase angle in degrees, and normalized phase (0–1) |
 | `l3`, `L3`, `h3` | Sky-plane separation and its in-plane / out-of-plane components (R☉) |
+| `A2` | Visible emitter area (grid units; an integration diagnostic) |
 | `is_eclipsed` | Per-phase geometric eclipse flag |
+| `flx` | Dimensionless mean wind LOS integral ∫g(r)dz, r in R☉ |
+| `fl` | Absolute mean column density `N_H` (10²² cm⁻²) |
 | `nfl_{band}` | Absorbed band flux, area-averaged over the emitter disk |
 
 `fl = flx × f_opacity × n₀ × R_sun / 10²²`, and `nfl_{band}` is the per-cell
