@@ -31,7 +31,7 @@ Example:
       --model tbabs \\
       --statistic chi \\
       --fit_emin 0.5 --fit_emax 7.0 \\
-      --bands broad soft medium hard \\
+      --band broad \\
       --out_csv flux_vs_nH.csv \\
       --out_png flux_vs_nH.png \\
       --nH_min 1e20 --nH_max 1e24 --nH_points 60
@@ -80,10 +80,6 @@ INSTRUMENT_BANDS = {
         "medium": (1.2, 2.0),
         "hard": (2.0, 7.0),
     },
-}
-
-DEFAULT_BANDS = {
-    "chandra": ["broad"],
 }
 
 # Supported absorption models
@@ -727,11 +723,12 @@ def main():
         help="X-ray instrument (determines available energy bands)",
     )
     parser.add_argument(
-        "--bands",
+        "--band",
         type=str,
-        nargs="+",
         default=None,
-        help="Energy bands to compute (space-separated). If not specified, uses instrument default.",
+        help="Energy band to tabulate. The light-curve model is run one band at "
+             "a time, so each output CSV holds a single band. Default: the "
+             "instrument's broad band.",
     )
     parser.add_argument("--nH_min", type=float, default=1e20, help="Min nH (cm^-2) for flux grid")
     parser.add_argument("--nH_max", type=float, default=1e24, help="Max nH (cm^-2) for flux grid")
@@ -748,18 +745,17 @@ def main():
     # Get instrument-specific bands
     instrument_bands = INSTRUMENT_BANDS[args.instrument]
     
-    # Determine which bands to use
-    if args.bands is None:
-        band_names = DEFAULT_BANDS.get(args.instrument, list(instrument_bands.keys()))
+    # One band per table: the light-curve model is run one band at a time.
+    if args.band is None:
+        band_name = "broad" if "broad" in instrument_bands else next(iter(instrument_bands))
+    elif args.band not in instrument_bands:
+        print(f"Error: Invalid band for {args.instrument}: {args.band}")
+        print(f"Available bands: {list(instrument_bands.keys())}")
+        sys.exit(1)
     else:
-        band_names = args.bands
-        invalid_bands = [b for b in band_names if b not in instrument_bands]
-        if invalid_bands:
-            print(f"Error: Invalid bands for {args.instrument}: {invalid_bands}")
-            print(f"Available bands: {list(instrument_bands.keys())}")
-            sys.exit(1)
-    
-    bands = {name: instrument_bands[name] for name in band_names}
+        band_name = args.band
+
+    bands = {band_name: instrument_bands[band_name]}
     
     print(f"Computing flux vs nH for {args.instrument} instrument")
     print(f"Model: {args.model}*powerlaw")

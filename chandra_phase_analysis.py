@@ -30,12 +30,12 @@ $ python chandra_phase_analysis.py --data-dir data --obs-column NET_RATE --outpu
 # Use FLUX column from observations with specific error column:
 $ python chandra_phase_analysis.py --data-dir data --obs-column FLUX --obs-error-column FLUX_ERR --output plot.png
 
-# Fit simulation to observations (auto-detects all flux columns):
+# Fit simulation to observations (the simulation's single nfl_* column is used):
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file simulation.csv --output fit.png
 
-# Fit specific flux columns:
+# Name the flux column explicitly:
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
-    --sim-column nfl_broad nfl_soft --output fit.png
+    --sim-column nfl_broad --output fit.png
 
 # Fit with specific observation column, phase shift held at 0:
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
@@ -95,7 +95,6 @@ from utils.utils import (
     band_label_from_column,
     detect_flux_columns,
     estimate_scattered_flux,
-    evaluate_model_at_phases,
     fit_simulation,
     frac,
     interp_periodic_phases,
@@ -107,13 +106,11 @@ from utils.utils import (
     prepare_model_interpolator,
     read_observation,
     smooth_lightcurve,
-    validate_sim_columns,
     write_model_lightcurve,
 )
 from utils.plot_utils import (
     add_residual_panel,
     plot_lightcurve_fit,
-    plot_multi_column_fits,
     plot_phase,
 )
 
@@ -124,7 +121,6 @@ __all__ = [
     "band_label_from_column",
     "detect_flux_columns",
     "estimate_scattered_flux",
-    "evaluate_model_at_phases",
     "fit_simulation",
     "frac",
     "interp_periodic_phases",
@@ -135,12 +131,10 @@ __all__ = [
     "phase_bin_data",
     "phase_bin_data_snr",
     "plot_lightcurve_fit",
-    "plot_multi_column_fits",
     "plot_phase",
     "prepare_model_interpolator",
     "read_observation",
     "smooth_lightcurve",
-    "validate_sim_columns",
     "write_model_lightcurve",
 ]
 
@@ -212,10 +206,9 @@ def main() -> None:
     parser.add_argument(
         "--sim-column",
         type=str,
-        nargs='+',
         default=None,
-        help="Column name(s) in simulation CSV to use as model flux. Can specify multiple columns separated by spaces. "
-             "If not specified, will auto-detect all available scaled flux columns (nfl_*).",
+        help="Column in the simulation CSV to use as the model flux (nfl_{band}). "
+             "If omitted, the simulation's single nfl_* column is used.",
     )
     parser.add_argument(
         "--fit",
@@ -316,9 +309,7 @@ def main() -> None:
              "scattered-flux floor added, followed by the observed bins with the "
              "model at their phases and the normalized residual. Given bare, the "
              "path is derived from --output (or 'model_lightcurve.txt'); with a "
-             "PATH, that file is used. When several --sim-column values are "
-             "fitted, the column name is inserted before the extension so each "
-             "gets its own file. Requires --fit.",
+             "PATH, that file is used. Requires --fit.",
     )
 
     args = parser.parse_args()
@@ -432,72 +423,46 @@ def main() -> None:
 
         print(f"Loading simulation file: {args.sim_file}")
         sim_df = pd.read_csv(args.sim_file)
-        
-        # Auto-detect or validate columns
+
+        # One model column per fit: the simulation is run one band at a time.
+        available = detect_flux_columns(sim_df)
         if args.sim_column is None:
-            # Auto-detect all flux columns
-            sim_columns = detect_flux_columns(sim_df)
-            if not sim_columns:
-                parser.error("No scaled flux columns found in simulation file. Expected columns like nfl_*")
-            print(f"Auto-detected {len(sim_columns)} scaled flux column(s): {sim_columns}")
-        else:
-            # Validate user-specified columns
-            requested_columns = args.sim_column if isinstance(args.sim_column, list) else [args.sim_column]
-            sim_columns = validate_sim_columns(sim_df, requested_columns)
-            print(f"Using {len(sim_columns)} flux column(s): {sim_columns}")
-        
-        # Fit each column
-        fit_results = []
-        for col in sim_columns:
-            print(f"\n{'='*60}")
-            print(f"Fitting column: {col}")
-            print('='*60)
-            try:
-                shift, chi2 = fit_simulation(
-                    df, sim_df, col,
-                    fit_phase_shift=args.fit_phase_shift,
-                    scatter=scatter_value,
+            if len(available) != 1:
+                parser.error(
+                    f"Expected exactly one nfl_* column in {args.sim_file}, found "
+                    f"{available or 'none'}; choose one with --sim-column."
                 )
-                fit_results.append((shift, chi2))
-            except Exception as e:
-                print(f"⚠️  Failed to fit column '{col}': {e}")
-                # Add dummy values so we can still plot other columns
-                fit_results.append((0.0, float('nan')))
+            sim_column = available[0]
+        elif args.sim_column not in sim_df.columns:
+            parser.error(
+                f"Column '{args.sim_column}' not found in {args.sim_file}. "
+                f"Available flux columns: {available or 'none'}"
+            )
+        else:
+            sim_column = args.sim_column
+        print(f"Using flux column: {sim_column}")
+
+        print(f"\n{'='*60}\nFitting column: {sim_column}\n{'='*60}")
+        shift, chi2 = fit_simulation(
+            df, sim_df, sim_column,
+            fit_phase_shift=args.fit_phase_shift,
+            scatter=scatter_value,
+        )
 
         if args.write_model is not None:
             base = args.write_model or _default_model_output(args.output)
             stem, ext = os.path.splitext(base)
-            if not ext:
-                ext = ".txt"
-            for col, (shift, chi2) in zip(sim_columns, fit_results):
-                # A failed fit left a (0.0, nan) placeholder; writing it out
-                # would look like a real fit at zero shift.
-                if not (chi2 == chi2):  # NaN
-                    print(f"Skipping model light curve for '{col}': fit failed.")
-                    continue
-                path = f"{stem}_{col}{ext}" if len(sim_columns) > 1 else f"{stem}{ext}"
-                write_model_lightcurve(
-                    path, df, sim_df, col, shift, scatter_value,
-                    red_chi2=chi2, shift_fitted=args.fit_phase_shift,
-                    obs_column=obs_column, sim_file=args.sim_file,
-                )
+            write_model_lightcurve(
+                f"{stem}{ext or '.txt'}", df, sim_df, sim_column, shift, scatter_value,
+                red_chi2=chi2, shift_fitted=args.fit_phase_shift,
+                obs_column=obs_column, sim_file=args.sim_file,
+            )
 
-        # Plot based on number of columns
-        if len(sim_columns) == 1:
-            # Single column: use original plot
-            shift, chi2 = fit_results[0]
-            plot_phase(
-                df, args.output, sim_df, shift, sim_columns[0], chi2,
-                shift_fitted=args.fit_phase_shift, obs_column_name=obs_column,
-                is_binned=is_binned, smooth_df=smooth_df, scatter=scatter_value,
-            )
-        else:
-            # Multiple columns: use grid plot
-            plot_multi_column_fits(
-                df, args.output, sim_df, sim_columns, fit_results,
-                shift_fitted=args.fit_phase_shift, obs_column_name=obs_column,
-                is_binned=is_binned, smooth_df=smooth_df, scatter=scatter_value,
-            )
+        plot_phase(
+            df, args.output, sim_df, shift, sim_column, chi2,
+            shift_fitted=args.fit_phase_shift, obs_column_name=obs_column,
+            is_binned=is_binned, smooth_df=smooth_df, scatter=scatter_value,
+        )
     else:
         smooth_df = None
         if args.smooth:

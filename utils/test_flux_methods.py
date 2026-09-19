@@ -21,13 +21,15 @@ import argparse
 import os
 import sys
 
+import numpy as np
+
 # Running this as a script puts utils/ on sys.path rather than the repo root,
 # so add the parent directory explicitly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import the simulation module
 try:
-    from xrb_lightcurve import simulate_lightcurve, WIND_MODEL_IDS
+    from xrb_lightcurve import simulate_lightcurve, simulate_band_flux, WIND_MODEL_IDS
 except ImportError:
     print("Error: Could not import xrb_lightcurve module")
     print("Make sure you're in the repository root and the correct conda environment")
@@ -92,6 +94,16 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
             ok = False
     if not results.loc[~results["is_eclipsed"], "fl"].gt(0).all():
         print("✗ fl is not strictly positive at every visible phase")
+        ok = False
+    # The likelihood path must see exactly the curve the DataFrame reports.
+    phase, flux = simulate_band_flux(
+        flux_method=flux_method, flux_csv_path=csv_path, wind_model=wind_model,
+        **BASE_PARAMS,
+    )
+    col = flux_cols[0]
+    if not (np.array_equal(phase, results["phase"].to_numpy())
+            and np.array_equal(flux, results[col].to_numpy())):
+        print("✗ simulate_band_flux disagrees with the simulate_lightcurve DataFrame")
         ok = False
     return ok
 

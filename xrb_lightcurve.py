@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-Simulation of column densities for eclipsing binary systems.
-This module simulates the column densities obtained as the compact object 
-eclipses companion in a Binary System orbiting a common Center of Mass.
+Forward model for the X-ray light curve of an eclipsing, wind-fed binary.
 
-The Compact object and the Accretion disk is referred to as Star B
-The Companion Star is referred to as Star A
-All Distance units are in Solar Radii
-All Angle units are converted into radians for trigonometric functions
+For every orbital phase the compact object (Star B, an emitting disk of radius
+``r``) is decomposed into a polar grid; each visible cell's line of sight is
+integrated through the companion's (Star A, radius ``R``) spherically symmetric
+wind to obtain a column density, the column is converted to a band flux with an
+XSPEC-derived ``flux vs nH`` table, and the per-cell fluxes are area-averaged.
+
+All distances are in solar radii; all angles are converted to radians for the
+trigonometric functions.
 """
 
 import argparse
-import numpy as np
-import pandas as pd
 import math
 import os
 import warnings
-from typing import Tuple, List, Optional, Dict, Callable
-from scipy.interpolate import interp1d
-from scipy.optimize import curve_fit
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 
 try:
     from numba import njit, prange
 except ImportError as exc:  # pragma: no cover - environment guard
     raise ImportError(
-        "numba is required: the Gauss-Legendre mega-kernel is the only LOS "
-        "integrator, and it is also the only path that returns the per-cell "
-        "columns needed for the nonlinear N_H -> flux conversion. "
+        "numba is required: the Gauss-Legendre kernel is the only LOS "
+        "integrator and the per-cell N_H -> flux conversion runs inside it. "
         "Install with: pip install numba"
     ) from exc
 
@@ -76,8 +76,11 @@ WIND_MODEL_PARAM_KEYS: Dict[str, Tuple[str, ...]] = {
 # for these and it is filled from the geometry parameter R.
 R_STAR_TIED_MODELS: Tuple[str, ...] = ("beta_law", "confinement")
 
-# Cache flux-vs-NH interpolation/refit inputs keyed by (csv_path, flux_type)
-# to avoid repeated CSV read/sort/interpolator creation during MCMC.
+# Radial cells of the emitter grid (9 annular segments per angular sector).
+N_RADIAL_CELLS = 10
+
+# Cache of flux-vs-nH tables keyed by (abs csv path, flux_type), so an MCMC run
+# reads and prepares the CSV once rather than once per likelihood call.
 _FLUX_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
 
 
@@ -163,66 +166,44 @@ def _g_profile(r, model_id, p1, p2, p3, p4):
     return 0.0
 
 
-def evaluate_g_profile(
-    r,
-    wind_model: str,
-    wind_params: Dict[str, float],
-):
-    """
-    Pure-Python (vectorized) wind density profile for use in helpers.
+@njit(cache=True)
+def _g_profile_array(r_flat, model_id, p1, p2, p3, p4):
+    """Elementwise ``_g_profile`` over a 1-D array (one implementation, no mirror)."""
+    out = np.empty(r_flat.shape[0])
+    for i in range(r_flat.shape[0]):
+        out[i] = _g_profile(r_flat[i], model_id, p1, p2, p3, p4)
+    return out
 
-    Returns the dimensionless g(r) matching `_g_profile` for arrays or scalars.
+
+def evaluate_g_profile(r, wind_model: str, wind_params: Dict[str, float]):
+    """
+    Wind density profile g(r) for arrays or scalars, for helpers and plots.
+
+    Evaluates the same compiled ``_g_profile`` the kernel uses, so there is no
+    second implementation to keep in step.
     """
     model_id, p1, p2, p3, p4 = pack_wind_params(wind_model, wind_params)
-    r = np.asarray(r, dtype=float)
-
-    if model_id == 0:
-        Rb = p1
-        p_slope = p2
-        Delta = p3
-        x = np.where(r > 0.0, r / Rb, np.inf)
-        if Delta <= 0.0:
-            return x ** (-2.0)
-        base = x ** (-2.0)
-        bracket = 1.0 + (1.0 / x) ** Delta
-        exponent = (p_slope - 2.0) / Delta
-        return base * (bracket ** exponent)
-
-    if model_id == 1:
-        R_star = p1
-        fconf = p2
-        ell = p3
-        safe_r = np.where(r > 0.0, r, np.inf)
-        factor = 1.0 + fconf * np.exp(-(safe_r - R_star) / ell)
-        return factor / (safe_r * safe_r)
-
-    if model_id == 2:
-        R_star = p1
-        beta = p2
-        H = p3
-        # r <= R_star maps to inf so that v_hat -> 1 and g -> 0 there, matching
-        # the scalar kernel without evaluating a negative base.
-        rr = np.where(r > R_star, r, np.inf)
-        v_hat = (1.0 - np.exp(-(rr - R_star) / H)) * (1.0 - R_star / rr) ** beta
-        return np.where(v_hat > 0.0, 1.0 / (rr * rr * v_hat), 0.0)
-
-    return np.zeros_like(r)
+    r_arr = np.asarray(r, dtype=float)
+    flat = np.ascontiguousarray(r_arr.reshape(-1))
+    out = _g_profile_array(flat, model_id, p1, p2, p3, p4).reshape(r_arr.shape)
+    return float(out) if r_arr.ndim == 0 else out
 
 
 # =============================================================================
 # Numba-accelerated LOS integration kernel
 # =============================================================================
 #
-# `_simulate_phases_numba` is a mega-kernel that, for each phase, builds the
-# polar emitter grid inline and integrates every cell's LOS using fixed-node
-# Gauss-Legendre quadrature with the substitution u = arctan(z/b). This
-# collapses the slowly-decaying r^{-2} tail to a bounded smooth integrand on a
-# finite interval, so 16 GL nodes per cell give >10 digits of accuracy for any
-# wind profile and any impact parameter (no special-casing of b vs Rb), and the
-# full z-tail is always integrated — there is no cutoff radius to choose. The
-# whole 360-phase loop runs under one numba @njit(parallel=True) call with
-# prange over phases, eliminating per-phase Python overhead and per-call thread
-# launches.
+# `_simulate_phases_numba` computes every orbital phase in one call (prange over
+# phases). Per phase it builds the polar emitter grid inline and integrates each
+# visible cell's LOS with fixed-node Gauss-Legendre quadrature under the
+# substitution u = arctan(z/b), which maps the slowly decaying r^-2 tail onto a
+# bounded smooth integrand on a finite interval: 16 nodes per cell give many
+# digits of accuracy for any profile and impact parameter, and the full z-tail
+# is always integrated (no cutoff radius).
+#
+# The angular sectors are mirror-symmetric about the line joining the two stars
+# (the impact parameter depends on the sector angle only through its cosine), so
+# only half of them are integrated and each result is used twice.
 
 # Pre-computed 16-point Gauss-Legendre nodes/weights on [-1, 1].
 # Generated once via numpy.polynomial.legendre.leggauss(16).
@@ -293,85 +274,96 @@ def _simulate_phases_numba(
     gl_x, gl_w,
 ):
     """
-    Mega-kernel: compute (flx, icd, A2, l, L, h, is_eclipsed) for ALL phases.
+    Kernel: per-phase geometry, eclipse test and per-cell LOS columns.
 
     For each phase (parallelized via prange):
-      - Compute orbital geometry (l, h, eclipse test).
-      - If eclipsed, return zeros and is_eclipsed=1.
-      - Otherwise iterate the polar (theta, r) grid inline: for each
-        consecutive valid (i.e. unmasked) cell pair within the same theta
-        ring, build the segment (av_x, av_th, av_db, A_seg) and integrate
-        its LOS column with `_los_gl_quadrature`.
-      - Reduce per-phase to the area-weighted mean column mean(lw)/sum(A),
-        alongside the raw sums and the per-cell arrays.
+      - Compute the projected separation l, its sky-plane components (L, h)
+        and the LOS offset z_start of the emitter behind the companion.
+      - If the emitter disk lies entirely behind the companion disk, flag the
+        phase as eclipsed and skip the grid.
+      - Otherwise walk the polar emitter grid. A radial segment between two
+        consecutive unmasked radii in the same angular sector gets one column
+        integral (`_los_gl_quadrature`) at its centre and its annular-sector
+        area. Sectors mirrored about the star-star line are geometrically
+        identical, so each integral is computed once and recorded twice.
+      - Reduce to the area-weighted mean column and total visible area, and
+        return the per-cell columns/areas the nonlinear nH -> flux conversion
+        needs (<F(N)> != F(<N>) wherever the column varies across the disk).
+
+    Returns
+    -------
+    flx, A2, l, L, h : per-phase arrays
+    eclipsed         : uint8 per-phase flag
+    cell_col, cell_area : (n_phases, n_cells_max) per-cell columns and areas
+    cell_count       : number of valid cells per phase
     """
     n_phases = gma_values.shape[0]
     flx_out = np.zeros(n_phases)
-    icd_out = np.zeros(n_phases)
     A2_out = np.zeros(n_phases)
     l_out = np.zeros(n_phases)
     L_out = np.zeros(n_phases)
     h_out = np.zeros(n_phases)
     eclipse_out = np.zeros(n_phases, dtype=np.uint8)
 
-    n_th = int(360.0 / d2h_deg) + 1
-    n_r_ring = 10
+    # n_th equal angular sectors of width 2*pi/n_th (== d2h when it divides
+    # 360). Sector i spans [i, i+1) * step; its mask and impact parameter are
+    # both evaluated at the sector centre, and the cosine table is made exactly
+    # mirror-symmetric so sectors i and n_th-1-i share the same geometry.
+    n_th = int(360.0 / d2h_deg)
+    if n_th < 2:
+        n_th = 2
+    n_half = (n_th + 1) // 2
+    th_step = 2.0 * math.pi / n_th
+    cos_c = np.empty(n_th)
+    for i_th in range(n_th):
+        cos_c[i_th] = math.cos((i_th + 0.5) * th_step)
+    for i_th in range(n_th // 2):
+        cos_c[n_th - 1 - i_th] = cos_c[i_th]
 
-    # Per-cell LOS columns and areas. The nH -> flux conversion is nonlinear,
-    # so <F(N)> != F(<N>): when the column varies steeply across the emitter
-    # disk (near the occulter limb, or anywhere in physical-normalization mode)
-    # the flux must be converted per cell and only then area-averaged. Callers
-    # that only need the mean column can ignore these.
-    n_cells_max = n_th * n_r_ring
+    # Radial grid of the emitter disk and the segment tables derived from it.
+    n_r = N_RADIAL_CELLS
+    r_min = r / 10.0
+    r_step = (r - r_min) / (n_r - 1)
+    r_vals = np.empty(n_r)
+    av_x_tab = np.zeros(n_r)   # centre radius of segment (i_r-1, i_r)
+    A_seg_tab = np.zeros(n_r)  # annular-sector area of that segment
+    for i_r in range(n_r):
+        r_vals[i_r] = r_min + i_r * r_step
+    for i_r in range(1, n_r):
+        av_x_tab[i_r] = 0.5 * (r_vals[i_r - 1] + r_vals[i_r])
+        A_seg_tab[i_r] = 0.5 * th_step * (
+            r_vals[i_r] * r_vals[i_r] - r_vals[i_r - 1] * r_vals[i_r - 1]
+        )
+
+    n_cells_max = n_th * n_r
     cell_col_out = np.zeros((n_phases, n_cells_max))
     cell_area_out = np.zeros((n_phases, n_cells_max))
     cell_count_out = np.zeros(n_phases, dtype=np.int64)
-    d2h_rad = d2h_deg * math.pi / 180.0
-    th_step_rad = 2.0 * math.pi / (n_th - 1)
-    th_vals = np.empty(n_th, dtype=np.float64)
-    cos_th_vals = np.empty(n_th, dtype=np.float64)
-    for i_th in range(n_th):
-        th_val = i_th * th_step_rad
-        th_vals[i_th] = th_val
-        cos_th_vals[i_th] = math.cos(th_val)
-
-    # Pre-compute r-grid (shared across phases, no shared writes)
-    r_min = r / 10.0
-    r_step = (r - r_min) / (n_r_ring - 1)
 
     sin_i = math.sin(incl)
     cos_i = math.cos(incl)
     R2 = R * R
+    a = d1 + d2
 
     for ip in prange(n_phases):
         cur_gma = gma_values[ip]
         sin_g = math.sin(cur_gma)
         cos_g = math.cos(cur_gma)
 
-        h1 = d1 * sin_g * sin_i
-        h2 = d2 * sin_g * sin_i
-        L1 = d1 * cos_g
-        L2 = d2 * cos_g
-        l1 = math.sqrt(h1 * h1 + L1 * L1)
-        l2 = math.sqrt(h2 * h2 + L2 * L2)
-        h = h1 + h2
-        L = L1 + L2
-        l = l1 + l2
+        # Geometry depends on the separation a = d1 + d2 alone.
+        h = a * sin_g * sin_i
+        L = a * cos_g
+        l = math.sqrt(h * h + L * L)
+        z_start = a * sin_g * cos_i
 
-        z_start = (d1 + d2) * sin_g * cos_i
-
-        # Eclipse test (only when emitter is BEHIND companion: sin_g > 0)
+        # Total eclipse (only when the emitter is BEHIND the companion: sin_g > 0)
         is_eclipsed_phase = False
-        if sin_g > 0.0:
-            n_outer = l / (R + r) if (R + r) > 0.0 else 1e30
-            if n_outer < 1.0:
-                # Compact object disk overlaps companion projected disk
-                if (R - r) > 0.0:
-                    n_inner = l / (R - r)
-                    if abs(n_inner) <= 1.0:
-                        is_eclipsed_phase = True
-                else:
+        if sin_g > 0.0 and l < (R + r):
+            if (R - r) > 0.0:
+                if l <= (R - r):
                     is_eclipsed_phase = True
+            else:
+                is_eclipsed_phase = True
 
         l_out[ip] = l
         L_out[ip] = L
@@ -381,307 +373,243 @@ def _simulate_phases_numba(
             eclipse_out[ip] = 1
             continue
 
-        # Walk the polar grid in (i_th, i_r) flat order, tracking the previous
-        # unmasked cell so that consecutive unmasked cells within the same
-        # theta ring (dx > 0) form an annular-sector segment.
-        prev_is_set = False
-        prev_r = 0.0
-        prev_th = 0.0
-
         sum_lw = 0.0
         sum_A = 0.0
+        k_cell = 0
+        for i_th in range(n_half):
+            cos_th = cos_c[i_th]
+            reps = 2 if (n_th - 1 - i_th) != i_th else 1
+            prev_ok = False
+            for i_r in range(n_r):
+                r_val = r_vals[i_r]
 
-        for i_th in range(n_th):
-            th_val = th_vals[i_th]
-            cos_th = cos_th_vals[i_th]
-            for i_r in range(n_r_ring):
-                r_val = r_min + i_r * r_step
-
-                # Eclipse mask (cells of compact object surface blocked)
+                # Occultation mask: cell hidden behind the companion disk.
                 if sin_g > 0.0:
                     nn2 = r_val * r_val + l * l - 2.0 * r_val * l * cos_th
                     if nn2 < R2:
+                        prev_ok = False
                         continue
 
-                if prev_is_set and r_val > prev_r:
-                    x1 = prev_r
-                    x2 = r_val
-                    th1 = prev_th
-                    av_x = 0.5 * (x1 + x2)
-                    av_th = th1 + 0.5 * d2h_rad
-                    cos_avth = math.cos(av_th)
-                    bv2 = av_x * av_x + l * l - 2.0 * av_x * l * cos_avth
-                    if bv2 < 0.0:
-                        bv2 = 0.0
-                    bv = math.sqrt(bv2)
-                    A_seg = 0.5 * d2h_rad * (x2 * x2 - x1 * x1)
-
+                if prev_ok:
+                    av_x = av_x_tab[i_r]
+                    bv2 = av_x * av_x + l * l - 2.0 * av_x * l * cos_th
+                    bv = math.sqrt(bv2) if bv2 > 0.0 else 0.0
+                    A_seg = A_seg_tab[i_r]
                     los_val = _los_gl_quadrature(
                         bv, z_start, model_id, p1, p2, p3, p4, gl_x, gl_w
                     )
-                    sum_lw += los_val * A_seg
-                    sum_A += A_seg
+                    for _rep in range(reps):
+                        sum_lw += los_val * A_seg
+                        sum_A += A_seg
+                        cell_col_out[ip, k_cell] = los_val
+                        cell_area_out[ip, k_cell] = A_seg
+                        k_cell += 1
+                prev_ok = True
 
-                    k_cell = cell_count_out[ip]
-                    cell_col_out[ip, k_cell] = los_val
-                    cell_area_out[ip, k_cell] = A_seg
-                    cell_count_out[ip] = k_cell + 1
-
-                prev_r = r_val
-                prev_th = th_val
-                prev_is_set = True
-
+        cell_count_out[ip] = k_cell
         if sum_A > 0.0:
             flx_out[ip] = sum_lw / sum_A
-        icd_out[ip] = sum_lw
         A2_out[ip] = sum_A
 
     return (
-        flx_out, icd_out, A2_out, l_out, L_out, h_out, eclipse_out,
+        flx_out, A2_out, l_out, L_out, h_out, eclipse_out,
         cell_col_out, cell_area_out, cell_count_out,
     )
 
+
 # =============================================================================
-# Flux conversion (XSPEC flux-vs-nH table)
+# Per-cell N_H -> flux conversion
 # =============================================================================
+#
+# The band flux is <F(N)> over the visible emitter disk, NOT F(<N>): the
+# attenuation law is convex, so during ingress/egress and in the eclipse core
+# (where the column varies by orders of magnitude across the disk) the
+# surviving flux is carried by the least-absorbed cells. Both converters below
+# apply the mapping per cell and then area-average, in one compiled pass.
+
+@njit(cache=True, parallel=True)
+def _cell_flux_loglog(cell_col, cell_area, cell_count, col_scale, log_nh, log_flux):
+    """Area-averaged flux per phase from a log-log table (linear in log space).
+
+    Reproduces ``scipy.interpolate.interp1d(kind='linear',
+    fill_value='extrapolate')`` on ``(log10 nH, log10 flux)``: linear
+    extrapolation from the end segments, with the column clipped to
+    [1e-6, 1e6] x 1e22 cm^-2 first.
+    """
+    n_phases = cell_col.shape[0]
+    n = log_nh.shape[0]
+    out = np.zeros(n_phases)
+    for ip in prange(n_phases):
+        num = 0.0
+        den = 0.0
+        for k in range(cell_count[ip]):
+            N = cell_col[ip, k] * col_scale
+            if N < 1e-6:
+                N = 1e-6
+            elif N > 1e6:
+                N = 1e6
+            lx = math.log10(N)
+            if lx <= log_nh[0]:
+                j = 0
+            elif lx >= log_nh[n - 1]:
+                j = n - 2
+            else:
+                lo = 0
+                hi = n - 1
+                while hi - lo > 1:
+                    mid = (lo + hi) >> 1
+                    if log_nh[mid] <= lx:
+                        lo = mid
+                    else:
+                        hi = mid
+                j = lo
+            t = (lx - log_nh[j]) / (log_nh[j + 1] - log_nh[j])
+            F = 10.0 ** (log_flux[j] + t * (log_flux[j + 1] - log_flux[j]))
+            A = cell_area[ip, k]
+            num += F * A
+            den += A
+        out[ip] = num / den if den > 0.0 else 0.0
+    return out
 
 
-def get_available_bands_from_csv(df: pd.DataFrame) -> List[str]:
-    """
-    Detect available energy bands from CSV column names.
-    
-    Looks for columns matching pattern: flux_{band}_ph
-    
-    Args:
-        df: DataFrame from flux vs nH CSV
-        
-    Returns:
-        List of band names (e.g., ['broad', 'soft', 'medium', 'hard'])
-    """
-    bands = []
-    for col in df.columns:
-        if col.startswith("flux_") and col.endswith("_ph"):
-            # Extract band name from flux_{band}_ph
-            band = col[5:-3]  # Remove "flux_" prefix and "_ph" suffix
-            bands.append(band)
-    return sorted(bands)
+@njit(cache=True, parallel=True)
+def _cell_flux_exp(cell_col, cell_area, cell_count, col_scale, A_coef, B_coef):
+    """Area-averaged flux per phase for the analytic law F = A exp(-B N)."""
+    n_phases = cell_col.shape[0]
+    out = np.zeros(n_phases)
+    for ip in prange(n_phases):
+        num = 0.0
+        den = 0.0
+        for k in range(cell_count[ip]):
+            N = cell_col[ip, k] * col_scale
+            A = cell_area[ip, k]
+            num += A_coef * math.exp(-B_coef * N) * A
+            den += A
+        out[ip] = num / den if den > 0.0 else 0.0
+    return out
+
+
+# =============================================================================
+# Flux-vs-nH table (compute_flux_vs_nH.py output)
+# =============================================================================
+
+def get_available_bands_from_csv(df: pd.DataFrame, flux_type: str = "erg") -> list:
+    """Band names present as ``flux_{band}_{flux_type}`` columns, sorted."""
+    suffix = f"_{flux_type}"
+    return sorted(
+        col[len("flux_"):-len(suffix)]
+        for col in df.columns
+        if col.startswith("flux_") and col.endswith(suffix)
+    )
 
 
 def load_flux_vs_nh_csv(
-    csv_path: str, verbose: bool = True
-) -> Tuple[pd.DataFrame, List[str]]:
+    csv_path: str, flux_type: str = "erg", verbose: bool = True
+) -> Tuple[pd.DataFrame, list]:
     """
-    Load flux vs nH CSV file generated by compute_flux_vs_nH.py.
-    Automatically detects available energy bands from column names.
-    
-    Args:
-        csv_path: Path to CSV file with columns like nH_1e22, flux_{band}_ph, flux_{band}_erg
-        
-    Returns:
-        Tuple of (DataFrame with flux vs nH data, list of available band names)
-        
-    Raises:
-        FileNotFoundError: If CSV file doesn't exist
-        ValueError: If CSV is missing required columns or has no valid bands
+    Load a flux vs nH CSV from compute_flux_vs_nH.py.
+
+    Returns ``(df, bands)`` with rows restricted to a valid, positive
+    ``nH_1e22`` and at least one finite flux value among the detected bands.
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Flux vs nH CSV file not found: {csv_path}")
-    
+
     df = pd.read_csv(csv_path)
-    
-    # Check for nH column
     if "nH_1e22" not in df.columns:
         raise ValueError("CSV missing required column: nH_1e22")
-    
-    # Detect available bands
-    bands = get_available_bands_from_csv(df)
+
+    bands = get_available_bands_from_csv(df, flux_type)
     if not bands:
-        raise ValueError("No flux columns found in CSV. Expected columns like flux_{band}_ph")
-    
+        raise ValueError(
+            f"No flux columns found in CSV for flux_type='{flux_type}'. "
+            f"Expected columns like flux_{{band}}_{flux_type}"
+        )
     if verbose:
         print(f"Detected energy bands in CSV: {', '.join(bands)}")
-    
-    # Filter out rows with invalid nH
-    df = df[df["nH_1e22"].notna() & (df["nH_1e22"] > 0)]
-    
-    # Filter out rows where all flux columns are NaN or negative
-    valid_mask = df["nH_1e22"].notna()
+
+    nh = pd.to_numeric(df["nH_1e22"], errors="coerce")
+    keep = nh.notna() & (nh > 0)
+    any_flux = np.zeros(len(df), dtype=bool)
     for band in bands:
-        flux_col = f"flux_{band}_ph"
-        if flux_col in df.columns:
-            # Keep row if at least one band has valid data
-            valid_mask = valid_mask & df[flux_col].notna()
-    
-    df = df[valid_mask]
-    
+        any_flux |= pd.to_numeric(df[f"flux_{band}_{flux_type}"], errors="coerce").notna().to_numpy()
+    df = df[keep.to_numpy() & any_flux]
     if len(df) == 0:
         raise ValueError("No valid data points in CSV after filtering")
-    
     return df, bands
 
 
+def fit_exponential(nh: np.ndarray, flux: np.ndarray) -> Tuple[float, float]:
+    """Least-squares fit of ``flux = A exp(-B nH)`` in log space.
+
+    Fitting ``log flux = log A - B nH`` gives every point equal weight
+    regardless of magnitude, appropriate for data spanning many decades.
+    """
+    nh = np.asarray(nh, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+    valid = np.isfinite(nh) & np.isfinite(flux) & (flux > 0) & (nh > 0)
+    if np.count_nonzero(valid) < 2:
+        raise ValueError("Exponential fit needs at least two valid (nH, flux) points")
+    slope, intercept = np.polyfit(nh[valid], np.log(flux[valid]), 1)
+    return float(np.exp(intercept)), float(-slope)
+
+
 def _build_flux_context(csv_path: str, flux_type: str) -> Dict[str, object]:
-    """Build/load cached interpolation and refit context for flux conversion."""
+    """Build (once) the per-band interpolation and refit data for a CSV."""
     key = (os.path.abspath(csv_path), str(flux_type))
     cached = _FLUX_CACHE.get(key)
     if cached is not None:
         return cached
 
-    df, bands = load_flux_vs_nh_csv(csv_path, verbose=False)
-    band_data: Dict[str, Dict[str, object]] = {}
-
-    # Sort once and reuse for all bands.
+    df, bands = load_flux_vs_nh_csv(csv_path, flux_type=flux_type, verbose=False)
     df_sorted = df.sort_values("nH_1e22")
-    nh_base = df_sorted["nH_1e22"].values
-    valid_nh = np.isfinite(nh_base) & (nh_base > 0)
-    nh_base = nh_base[valid_nh]
+    nh_base = pd.to_numeric(df_sorted["nH_1e22"], errors="coerce").to_numpy(dtype=float)
 
+    band_data: Dict[str, Dict[str, object]] = {}
     for band in bands:
-        flux_col = f"flux_{band}_{flux_type}"
-        if flux_col not in df_sorted.columns:
+        flux_vals = pd.to_numeric(
+            df_sorted[f"flux_{band}_{flux_type}"], errors="coerce"
+        ).to_numpy(dtype=float)
+        valid = np.isfinite(nh_base) & (nh_base > 0) & np.isfinite(flux_vals) & (flux_vals > 0)
+        if np.count_nonzero(valid) < 2:
             continue
-        flux_vals = df_sorted[flux_col].values
-        flux_vals = flux_vals[valid_nh]
-        valid = np.isfinite(flux_vals) & (flux_vals > 0)
-        if not np.any(valid):
-            continue
-
         nh_csv = nh_base[valid]
         flux_csv = flux_vals[valid]
-        interp_func = interp1d(
-            np.log10(nh_csv),
-            np.log10(flux_csv),
-            kind="linear",
-            fill_value="extrapolate",
-            bounds_error=False,
-        )
         band_data[band] = {
             "nh": nh_csv,
             "flux": flux_csv,
-            "interp_loglog": interp_func,
+            "log_nh": np.ascontiguousarray(np.log10(nh_csv)),
+            "log_flux": np.ascontiguousarray(np.log10(flux_csv)),
+            "exp_fit": None,  # (A, B), fitted on first 'refit' use
         }
 
     ctx: Dict[str, object] = {
         "csv_path": key[0],
         "flux_type": key[1],
-        "bands": sorted(list(band_data.keys())),
+        "bands": sorted(band_data),
         "band_data": band_data,
-        "exp_fit": {},
     }
     _FLUX_CACHE[key] = ctx
     return ctx
 
 
-def _interpolate_flux_from_context(
-    nh_1e22: np.ndarray,
-    ctx: Dict[str, object],
-    band: str,
-    warn_extrapolation: bool = True,
-) -> np.ndarray:
-    """Interpolate using prebuilt flux context."""
-    band_data = ctx["band_data"]  # type: ignore[index]
-    if band not in band_data:
-        available = sorted(list(band_data.keys()))
+def _select_band(ctx: Dict[str, object], band: Optional[str]) -> str:
+    """Resolve the band to simulate: the requested one, or the CSV's only one."""
+    bands = ctx["bands"]  # type: ignore[index]
+    if band is None:
+        if len(bands) == 1:
+            return bands[0]
         raise ValueError(
-            f"Band '{band}' not present in flux cache for flux_type='{ctx['flux_type']}'. "
-            f"Available bands: {available}"
+            f"The flux table {ctx['csv_path']} contains {len(bands)} bands "
+            f"{bands}; pass band=... to choose one (the model is run one band "
+            f"at a time)."
         )
-
-    info = band_data[band]
-    nh_csv = info["nh"]
-    interp_func = info["interp_loglog"]
-    nh_min, nh_max = float(np.min(nh_csv)), float(np.max(nh_csv))
-    nh_1e22 = np.asarray(nh_1e22)
-
-    if warn_extrapolation and (
-        np.any(nh_1e22 < nh_min) or np.any(nh_1e22 > nh_max)
-    ):
-        warnings.warn(
-            f"Some nH values are outside CSV range [{nh_min:.3f}, {nh_max:.3f}] 1e22 cm^-2 for band '{band}'. "
-            f"Extrapolation will be used (fill_value='extrapolate')."
-        )
-
-    nh_1e22_safe = np.clip(nh_1e22, 1e-6, 1e6)
-    log_flux = interp_func(np.log10(nh_1e22_safe))
-    return 10 ** log_flux
-
-
-
-def fit_exponential_to_csv(
-    df: pd.DataFrame, band: str, flux_type: str = "erg"
-) -> Tuple[float, float]:
-    """
-    Fit exponential function A * exp(-B * nH) to CSV flux data in LOG SPACE.
-    
-    Fitting in log space: log(flux) = log(A) - B * nH
-    This gives equal weight to all data points regardless of magnitude,
-    appropriate for data spanning many orders of magnitude.
-    
-    Args:
-        df: DataFrame from load_flux_vs_nh_csv
-        band: Band name (e.g., "soft", "hard", "broad", "medium")
-        flux_type: Which flux column to use — "erg" (erg/cm^2/s, default) or
-                   "ph" (photons/cm^2/s)
-        
-    Returns:
-        Tuple of (A, B) coefficients for flux = A * exp(-B * nH_1e22)
-        in units determined by flux_type
-        
-    Raises:
-        ValueError: If band/flux_type column is not found or fit fails without fallback
-    """
-    flux_col = f"flux_{band}_{flux_type}"
-
-    if flux_col not in df.columns:
-        available = get_available_bands_from_csv(df)
+    if band not in bands:
         raise ValueError(
-            f"Column '{flux_col}' not found in CSV. "
-            f"Available bands: {available}. "
-            f"flux_type must be 'ph' or 'erg'."
+            f"Band '{band}' not in flux table {ctx['csv_path']} "
+            f"(flux_type='{ctx['flux_type']}'). Available: {bands}"
         )
-    
-    # Get data
-    df_sorted = df.sort_values("nH_1e22")
-    nh = df_sorted["nH_1e22"].values
-    flux = df_sorted[flux_col].values
-    
-    # Filter out NaN/invalid values
-    valid = np.isfinite(nh) & np.isfinite(flux) & (flux > 0) & (nh > 0)
-    if not np.any(valid):
-        raise ValueError(f"No valid flux data for band '{band}'")
-    
-    nh = nh[valid]
-    flux = flux[valid]
-    
-    # Take logarithm for fitting in log space
-    log_flux = np.log(flux)
-    
-    # Fit linear function in log space: log(flux) = log(A) - B * nH
-    def linear_func(x, log_A, B):
-        return log_A - B * x
-    
-    try:
-        # Initial guess for log(A) and B from endpoints
-        log_A_guess = np.log(flux[0]) + 0.1 * nh[0]
-        B_guess = -(log_flux[-1] - log_flux[0]) / (nh[-1] - nh[0])
-        
-        popt, _ = curve_fit(
-            linear_func,
-            nh,
-            log_flux,
-            p0=[log_A_guess, max(B_guess, 0.01)],
-            maxfev=10000,
-        )
-        log_A, B = popt
-        A = np.exp(log_A)  # Convert back from log space
-        
-        print(f"Fitted exponential for {band} band: A={A:.6e}, B={B:.6f}")
-        return float(A), float(B)
-        
-    except Exception as e:
-        raise ValueError(
-            f"Exponential fit failed for {band} band (flux_type='{flux_type}'): {e}"
-        ) from e
+    return band
 
 
 def default_wind_params(wind_model: str, R: float) -> Dict[str, float]:
@@ -703,7 +631,7 @@ def default_wind_params(wind_model: str, R: float) -> Dict[str, float]:
 
 
 def inclination_to_internal_rad(i0_deg: float) -> float:
-    """Convert a conventional inclination into the kernels' internal angle.
+    """Convert a conventional inclination into the kernel's internal angle.
 
     ``i0`` at the public API is the standard astronomical inclination: the angle
     between the orbital-plane normal and the line of sight, so ``i0 = 90 deg``
@@ -711,12 +639,110 @@ def inclination_to_internal_rad(i0_deg: float) -> float:
     in the plane of the sky and never eclipses).
 
     The geometry kernel (``_simulate_phases_numba``) instead measures ``incl``
-    from the *line of sight*, so that
-    ``h = a sin(gma) sin(incl)`` is the sky-plane offset and
-    ``z = a sin(gma) cos(incl)`` the offset along the line of sight. The two
-    differ by the 90 deg complement applied here; nothing downstream changes.
+    from the *line of sight*, so that ``h = a sin(gma) sin(incl)`` is the
+    sky-plane offset and ``z = a sin(gma) cos(incl)`` the offset along the line
+    of sight. The two differ by the 90 deg complement applied here.
     """
     return (90.0 - float(i0_deg)) * np.pi / 180.0
+
+
+# =============================================================================
+# Simulation
+# =============================================================================
+
+def _simulate_core(
+    r: float,
+    R: float,
+    d1: float,
+    d2: float,
+    gma0: float,
+    i0: float,
+    dth: float,
+    d2h: float,
+    flux_method: str,
+    flux_csv_path: Optional[str],
+    flux_type: str,
+    wind_model: str,
+    wind_params: Optional[Dict[str, float]],
+    scattered_flux: float,
+    mdot: float,
+    v_inf: float,
+    mu_wind: float,
+    f_opacity: float,
+    band: Optional[str],
+) -> Dict[str, object]:
+    """Shared implementation of simulate_lightcurve / simulate_band_flux."""
+    if flux_csv_path is None:
+        raise ValueError("flux_csv_path is required (table from compute_flux_vs_nH.py)")
+    if flux_method not in ("interpolate", "refit"):
+        raise ValueError(
+            f"Invalid flux_method: {flux_method}. Must be 'interpolate' or 'refit'"
+        )
+
+    # Only the input convention changes here: `incl` is the internal angle from
+    # the line of sight that the kernel's geometry assumes.
+    incl = inclination_to_internal_rad(i0)
+
+    if wind_params is None:
+        wind_params = default_wind_params(wind_model, R)
+    # Profiles anchored at the photosphere take R_star from R when omitted.
+    if wind_model in R_STAR_TIED_MODELS and "R_star" not in wind_params:
+        wind_params = dict(wind_params)
+        wind_params["R_star"] = float(R)
+    model_id, p1, p2, p3, p4 = pack_wind_params(wind_model, wind_params)
+
+    gma0_rad = gma0 * np.pi / 180.0
+    n_phases = int(360 / dth)
+    gma_values = gma0_rad + np.arange(n_phases) * (dth * np.pi / 180.0)
+
+    (flx, A2, l_arr, L_arr, h_arr, eclipsed,
+     cell_col, cell_area, cell_count) = _simulate_phases_numba(
+        gma_values.astype(np.float64),
+        float(r), float(R), float(d1), float(d2), float(incl), float(d2h),
+        int(model_id), float(p1), float(p2), float(p3), float(p4),
+        _GL16_X, _GL16_W,
+    )
+
+    # Column-density normalization: n_0 from Mdot / v_inf, so fl carries real
+    # units (1e22 cm^-2); flx is the LOS integral of g in R_sun. f_opacity is an
+    # effective-opacity factor absorbing wind ionization, clumping and abundance
+    # departures from the solar-abundance TBabs table.
+    n0 = wind_density_norm_from_mdot(mdot, v_inf, wind_model, wind_params, mu=mu_wind)
+    col_scale = float(f_opacity) * n0 * R_SUN_CM / 1.0e22
+
+    ctx = _build_flux_context(flux_csv_path, flux_type=flux_type)
+    band = _select_band(ctx, band)
+    info = ctx["band_data"][band]  # type: ignore[index]
+
+    if flux_method == "interpolate":
+        nfl = _cell_flux_loglog(
+            cell_col, cell_area, cell_count, col_scale,
+            info["log_nh"], info["log_flux"],
+        )
+    else:
+        if info["exp_fit"] is None:
+            info["exp_fit"] = fit_exponential(info["nh"], info["flux"])
+        A_coef, B_coef = info["exp_fit"]
+        nfl = _cell_flux_exp(cell_col, cell_area, cell_count, col_scale, A_coef, B_coef)
+
+    # Eclipsed phases have no visible cells, so nfl is already 0 there; the
+    # scattered-light floor is a constant, phase-independent addition.
+    if float(scattered_flux) != 0.0:
+        nfl = nfl + float(scattered_flux)
+
+    return {
+        "band": band,
+        "deg": gma_values * (180.0 / np.pi),
+        "phase": (gma_values - gma0_rad) / (2.0 * np.pi),
+        "A2": A2,
+        "flx": flx,
+        "l3": l_arr,
+        "L3": L_arr,
+        "h3": h_arr,
+        "is_eclipsed": eclipsed.astype(bool),
+        "fl": flx * col_scale,
+        "nfl": nfl,
+    }
 
 
 def simulate_lightcurve(
@@ -739,9 +765,10 @@ def simulate_lightcurve(
     v_inf: float = 1750.0,
     mu_wind: float = MU_WIND_DEFAULT,
     f_opacity: float = 1.0,
+    band: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Main simulation function for lightcurve calculation.
+    Simulate one orbit and return a per-phase DataFrame.
 
     Args:
         r: Radius of smaller star B (compact object) in solar radii
@@ -751,217 +778,106 @@ def simulate_lightcurve(
         gma0: Starting phase angle in degrees
         i0: Orbital inclination in degrees, standard astronomical convention:
             measured from the orbital-plane normal, so 90 deg is edge-on and
-            0 deg is face-on. Converted internally by
-            inclination_to_internal_rad(); the geometry itself is unchanged.
+            0 deg is face-on.
         dth: Orbital increment in degrees
-        d2h: Angular cell size (degrees) for the polar grid used in the surface integral
+        d2h: Angular cell size (degrees) of the polar emitter grid
         verbose: If True, prints a one-line summary of the kernel call
-        flux_method: Method for converting nH to flux. Options:
-            - "interpolate": log-log interpolation of the CSV flux vs nH table
-              (default)
-            - "refit": fit exponentials A*exp(-B*nH) to the same CSV table
-        flux_csv_path: Path to CSV file from compute_flux_vs_nH.py (required)
-        flux_type: Which flux column from the CSV to use — "erg" (erg/cm^2/s,
-            default) or "ph" (photons/cm^2/s).
-        wind_model: Name of the dimensionless wind density profile, one of
-            "smooth_pl", "confinement" or "beta_law". Default "smooth_pl".
+        flux_method: nH -> flux conversion: "interpolate" (log-log
+            interpolation of the CSV table, default) or "refit" (analytic
+            A*exp(-B*nH) fitted to the same table)
+        flux_csv_path: Path to a CSV from compute_flux_vs_nH.py (required)
+        flux_type: Which flux column to use — "erg" (erg/cm^2/s, default) or
+            "ph" (photons/cm^2/s).
+        wind_model: Dimensionless wind density profile, one of "smooth_pl",
+            "confinement" or "beta_law". Default "smooth_pl".
         wind_params: Dict of profile parameters (see WIND_MODEL_PARAM_KEYS).
             If None, uses defaults from default_wind_params(wind_model, R).
-        scattered_flux: Constant additive flux offset applied to all ``nfl_*``
-            columns after eclipse handling. Useful for modeling phase-invariant
-            scattered flux floors.
-        mdot: WR mass-loss rate in Msun/yr, setting the absolute wind density.
+        scattered_flux: Constant additive flux offset applied to the band flux
+            after eclipse handling (phase-invariant scattered-light floor).
+        mdot: Mass-loss rate in Msun/yr, setting the absolute wind density.
         v_inf: Wind terminal velocity in km/s.
         mu_wind: Mean mass per hydrogen-equivalent nucleus, converting the wind
             mass column into the N_H the solar-abundance TBabs table expects.
         f_opacity: Effective-opacity factor applied to the Mdot-derived column,
-            absorbing wind photoionization, clumping and WR abundance
-            departures.
+            absorbing wind photoionization, clumping and abundance departures.
+        band: Energy band to simulate. May be omitted when the CSV holds a
+            single band (the model is run one band at a time).
 
     Returns:
-        DataFrame with simulation results. Key columns:
-            - flx: Raw dimensionless mean wind LOS integral per phase
-            - fl: Absolute column density N_H in 1e22 cm^-2
-            - nfl_{band}: Band flux, area-averaged over the emitter disk
+        DataFrame with one row per phase and columns
+            deg, phase        orbital phase in degrees / [0, 1)
+            l3, L3, h3        projected separation and its sky-plane components
+            A2                visible emitter area (grid units)
+            is_eclipsed       geometric total eclipse flag
+            flx               dimensionless mean LOS integral of g
+            fl                absolute mean column density N_H in 1e22 cm^-2
+            nfl_{band}        band flux, area-averaged over the emitter disk
 
     Notes:
         - The density normalization n_0 is fixed from mdot / v_inf, so ``fl``
-          carries real units. The eclipse therefore emerges from wind opacity
-          rather than from a geometric cutoff, and ``R`` means the true
-          photosphere rather than an effective opaque radius.
-        - The nH -> flux conversion is nonlinear, so the band flux is computed
-          per emitter cell and only then area-averaged: <F(N)> != F(<N>) when
-          the column varies steeply across the disk, which it does during
-          ingress/egress and throughout the eclipse core.
+          carries real units and the eclipse emerges from wind opacity rather
+          than from a geometric cutoff; ``R`` is the true photosphere.
+        - The nH -> flux conversion is applied per emitter cell and only then
+          area-averaged, because <F(N)> != F(<N>) when the column varies across
+          the disk (ingress/egress, eclipse core).
     """
-    # Convert angles to radians
-    gma = gma0 * np.pi / 180
-    # Only the input convention changes here: `i` is the internal angle from the
-    # line of sight that every geometry expression below already assumes.
-    i = inclination_to_internal_rad(i0)
-
-    # Wind profile parameter packing (done once per call)
-    if wind_params is None:
-        wind_params = default_wind_params(wind_model, R)
-    # For the profiles anchored at the photosphere, auto-fill R_star from R
-    # if the caller omitted it.
-    if wind_model in R_STAR_TIED_MODELS and "R_star" not in wind_params:
-        wind_params = dict(wind_params)
-        wind_params["R_star"] = float(R)
-    model_id, p1, p2, p3, p4 = pack_wind_params(wind_model, wind_params)
-
-    # Prepare phase values
-    n_iterations = int(360 / dth)
-    gma_values = gma + (np.arange(n_iterations) * (dth * np.pi / 180.0))
-
-    # One numba parallel call covers every phase; the Gauss-Legendre quadrature
-    # integrates the full z-tail, so there is no cutoff radius to choose.
-    (flx_arr, icd_arr, A2_arr, l_arr, L_arr, h_arr, eclipsed_arr,
-     cell_col_arr, cell_area_arr, cell_count_arr) = _simulate_phases_numba(
-        gma_values.astype(np.float64),
-        float(r),
-        float(R),
-        float(d1),
-        float(d2),
-        float(i),
-        float(d2h),
-        int(model_id),
-        float(p1), float(p2), float(p3), float(p4),
-        _GL16_X, _GL16_W,
+    res = _simulate_core(
+        r, R, d1, d2, gma0, i0, dth, d2h, flux_method, flux_csv_path, flux_type,
+        wind_model, wind_params, scattered_flux, mdot, v_inf, mu_wind, f_opacity,
+        band,
     )
     if verbose:
-        print(f"Computed {n_iterations} phases via mega-kernel "
-              f"(GL quadrature, parallel over phases)")
+        print(f"Computed {res['deg'].size} phases via the GL kernel "
+              f"(parallel over phases); band '{res['band']}'")
+    frame = pd.DataFrame({
+        "deg": res["deg"],
+        "phase": res["phase"],
+        "l3": res["l3"],
+        "L3": res["L3"],
+        "h3": res["h3"],
+        "A2": res["A2"],
+        "is_eclipsed": res["is_eclipsed"],
+        "flx": res["flx"],
+        "fl": res["fl"],
+    })
+    frame[f"nfl_{res['band']}"] = res["nfl"]
+    return frame
 
-    deg = gma_values * (180.0 / np.pi)
-    results = pd.DataFrame(
-        {
-            "deg": deg,
-            "ph": np.asarray(gma_values, dtype=float),
-            "phase": (gma_values - (gma0 * np.pi / 180.0)) / (2.0 * np.pi),
-            "A2": np.asarray(A2_arr, dtype=float),
-            "flx": np.asarray(flx_arr, dtype=float),
-            "icd": np.asarray(icd_arr, dtype=float),
-            "time": deg * 348.42,
-            "l3": np.asarray(l_arr, dtype=float),
-            "L3": np.asarray(L_arr, dtype=float),
-            "h3": np.asarray(h_arr, dtype=float),
-            "is_eclipsed": np.asarray(eclipsed_arr, dtype=bool),
-        }
+
+def simulate_band_flux(**kwargs) -> Tuple[np.ndarray, np.ndarray]:
+    """``(phase, band_flux)`` arrays for the same arguments as simulate_lightcurve.
+
+    The lightweight entry point for likelihood evaluation: no DataFrame is
+    built and only the two arrays the fit needs are returned.
+    """
+    res = _simulate_core(
+        r=kwargs.get("r", 0.001), R=kwargs.get("R", 2.0),
+        d1=kwargs.get("d1", 11.0), d2=kwargs.get("d2", 8.0),
+        gma0=kwargs.get("gma0", -90.0), i0=kwargs.get("i0", 64.0),
+        dth=kwargs.get("dth", 1.0), d2h=kwargs.get("d2h", 6.0),
+        flux_method=kwargs.get("flux_method", "interpolate"),
+        flux_csv_path=kwargs.get("flux_csv_path"),
+        flux_type=kwargs.get("flux_type", "erg"),
+        wind_model=kwargs.get("wind_model", "smooth_pl"),
+        wind_params=kwargs.get("wind_params"),
+        scattered_flux=kwargs.get("scattered_flux", 0.0),
+        mdot=kwargs.get("mdot", 4.0e-6), v_inf=kwargs.get("v_inf", 1750.0),
+        mu_wind=kwargs.get("mu_wind", MU_WIND_DEFAULT),
+        f_opacity=kwargs.get("f_opacity", 1.0),
+        band=kwargs.get("band"),
     )
-
-    # ------------------------------------------------------------------
-    # Column-density normalization.
-    #
-    # n_0 is set from Mdot / v_inf, so fl carries real units. This breaks the
-    # scale degeneracy that an orbit-averaged rescaling would leave behind and
-    # lets the eclipse emerge from wind opacity instead of from a geometric
-    # cutoff.
-    # ------------------------------------------------------------------
-    n0 = wind_density_norm_from_mdot(
-        mdot, v_inf, wind_model, wind_params, mu=mu_wind
-    )
-    # fl is in units of 1e22 cm^-2; flx is the LOS integral of g in R_sun.
-    # f_opacity is an effective-opacity factor absorbing wind ionization,
-    # clumping and abundance departures from the solar-abundance TBabs table
-    # (a hyper-ionized wind has far less photoelectric opacity than its mass
-    # column implies).
-    col_scale = float(f_opacity) * n0 * R_SUN_CM / 1.0e22
-    results["fl"] = results["flx"].to_numpy(dtype=float) * col_scale
-
-    # Build one nH -> flux mapping per band.
-    if flux_csv_path is None:
-        raise ValueError(f"flux_csv_path is required for flux_method='{flux_method}'")
-
-    band_maps: Dict[str, Callable[[np.ndarray], np.ndarray]] = {}
-    ctx = _build_flux_context(flux_csv_path, flux_type=flux_type)
-    available_bands = ctx["bands"]  # type: ignore[index]
-    if verbose:
-        print(f"Detected energy bands in CSV: {', '.join(available_bands)}")
-
-    if flux_method == "interpolate":
-        for band in available_bands:
-            band_maps[band] = (
-                lambda n, _b=band: _interpolate_flux_from_context(
-                    n, ctx, _b, warn_extrapolation=False,
-                )
-            )
-    elif flux_method == "refit":
-        exp_fit_cache = ctx["exp_fit"]  # type: ignore[index]
-        # Keep behavior identical to a direct fit_exponential_to_csv call by
-        # constructing the same validated DataFrame once.
-        df_flux, _ = load_flux_vs_nh_csv(flux_csv_path, verbose=False)
-        for band in available_bands:
-            if band in exp_fit_cache:
-                A, B = exp_fit_cache[band]
-            else:
-                A, B = fit_exponential_to_csv(df_flux, band, flux_type=flux_type)
-                exp_fit_cache[band] = (A, B)
-            band_maps[band] = lambda n, _A=A, _B=B: _A * np.exp(-_B * n)
-    else:
-        raise ValueError(
-            f"Invalid flux_method: {flux_method}. "
-            "Must be 'interpolate' or 'refit'"
-        )
-
-    # Per-cell columns, so the nonlinear nH -> flux map is applied before the
-    # area average rather than after it.
-    cell_nh = np.asarray(cell_col_arr, dtype=float) * col_scale
-    cell_A = np.asarray(cell_area_arr, dtype=float)
-    counts = np.asarray(cell_count_arr, dtype=np.int64)
-    valid = np.arange(cell_A.shape[1])[None, :] < counts[:, None]
-    cell_A = np.where(valid, cell_A, 0.0)
-    area_tot = cell_A.sum(axis=1)
-
-    for band, fmap in band_maps.items():
-        try:
-            # <F(N)> over the emitter disk, NOT F(<N>): during ingress and in
-            # the eclipse core the column varies by orders of magnitude across
-            # the disk, and the surviving flux is dominated by the
-            # least-absorbed cells.
-            per_cell = fmap(cell_nh.reshape(-1)).reshape(cell_nh.shape)
-            num = np.einsum("ij,ij->i", np.nan_to_num(per_cell), cell_A)
-            results[f"nfl_{band}"] = np.divide(
-                num, area_tot,
-                out=np.zeros_like(num), where=area_tot > 0,
-            )
-        except Exception as e:
-            warnings.warn(f"Failed to compute flux for band '{band}': {e}")
-
-    # Set all scaled flux columns to 0 when eclipsed.
-    # During eclipse the emitter is physically blocked - flux should be zero,
-    # not computed from the absorption formula (which would give max flux at nH=0).
-    eclipse_mask = results["is_eclipsed"].values
-    if np.any(eclipse_mask):
-        flux_cols = [col for col in results.columns if col.startswith("nfl_")]
-        for col in flux_cols:
-            results.loc[eclipse_mask, col] = 0.0
-
-    if float(scattered_flux) != 0.0:
-        flux_cols = [col for col in results.columns if col.startswith("nfl_")]
-        for col in flux_cols:
-            results[col] = results[col].astype(float) + float(scattered_flux)
-
-    return results
+    return res["phase"], res["nfl"]
 
 
 # =============================================================================
 # Wind density normalization
 # =============================================================================
 #
-# Units note: the LOS integrator returns a dimensionless integral
+# Units note: the kernel returns the dimensionless integral
 #   flx_code = <∫ g(r) dz>_cells
-# where r and z are in solar radii (R_sun = 6.957e10 cm) and g(r) is
-# dimensionless. The physical LOS column density at phase phi is
-#   N_H(phi) = n_0 * R_sun * ∫ g(r(phi, z)) dz
-#           = n_0 * R_sun * flx_code(phi)
-# where n_0 is the "reference" number density such that the physical number
-# density at a point with dimensionless g value g(r) is n(r) = n_0 * g(r).
-#
-# n_0 is fixed from the mass-loss rate by matching the asymptotic r^-2 limit of
-# g to a spherical constant-velocity wind; see wind_density_norm_from_mdot.
-# The number density at any radius is then n(r) = n_0 * g(r; params), so the
-# companion-surface density is n(R_star) = n_0 * g(R_star; params).
+# with r and z in solar radii (R_sun = 6.957e10 cm). The physical column at
+# phase phi is N_H(phi) = n_0 * R_sun * flx_code(phi), where n_0 is the
+# reference number density such that n(r) = n_0 * g(r).
 
 def wind_asymptotic_coefficient(
     wind_model: str, wind_params: Dict[str, float]
@@ -999,9 +915,6 @@ def wind_density_norm_from_mdot(
         n_0 = Mdot / (4 pi R_sun^2 v_inf mu m_H C)
 
     with C from :func:`wind_asymptotic_coefficient`.
-
-    This carries real units, which is what makes the light curve sensitive to
-    the *absolute* size of the system rather than only to ratios such as R/a.
     """
     mdot_cgs = float(mdot_msun_yr) * M_SUN_G / YEAR_S
     v_cgs = float(v_inf_kms) * KM_TO_CM
@@ -1012,241 +925,106 @@ def wind_density_norm_from_mdot(
     return mdot_cgs / denom
 
 
+# =============================================================================
+# CLI
+# =============================================================================
 
 def main():
-    """Main function with command line argument parsing."""
+    """Simulate one light curve from the command line and write it to CSV."""
     parser = argparse.ArgumentParser(
-        description="Simulation of column densities for eclipsing binary systems",
+        description="Simulate the wind-absorbed, eclipsed light curve of a binary",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument(
-        "--r",
-        type=float,
-        default=0.001,
-        help="Radius of smaller star B (compact object) in solar radii",
-    )
-    parser.add_argument(
-        "--R",
-        type=float,
-        default=2.0,
-        help="Radius of larger star A (companion) in solar radii",
-    )
-    parser.add_argument(
-        "--d1",
-        type=float,
-        default=11.0,
-        help="Distance of star B from COM in solar radii",
-    )
-    parser.add_argument(
-        "--d2",
-        type=float,
-        default=8.0,
-        help="Distance of star A from COM in solar radii",
-    )
-    parser.add_argument(
-        "--gma0", type=float, default=-90.0, help="Starting phase angle in degrees"
-    )
-    parser.add_argument(
-        "--i0", type=float, default=64.0,
-        help="Orbital inclination in degrees from the orbital-plane normal "
-             "(90 = edge-on, 0 = face-on)",
-    )
-    parser.add_argument(
-        "--dth", type=float, default=1.0, help="Orbital increment in degrees"
-    )
-    parser.add_argument(
-        "--d2h",
-        type=float,
-        default=6.0,
-        help="Angular cell size (degrees) for the polar grid used in the surface integral",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print a one-line kernel summary during simulation",
-    )
-    parser.add_argument(
-        "--flux_method",
-        type=str,
-        choices=["interpolate", "refit"],
-        default="interpolate",
-        help="Method for converting nH to flux: 'interpolate' (log-log "
-        "interpolation of the CSV table, default) or 'refit' (fit new "
-        "exponentials to the CSV table)",
-    )
-    parser.add_argument(
-        "--flux_csv",
-        type=str,
-        required=True,
-        help="Path to flux vs nH CSV file from compute_flux_vs_nH.py",
-    )
-    parser.add_argument(
-        "--flux_type",
-        type=str,
-        choices=["erg", "ph"],
-        default="erg",
-        help="Which flux column from the CSV to use: "
-        "'erg' (erg/cm^2/s, default) or 'ph' (photons/cm^2/s).",
-    )
-    parser.add_argument(
-        "--mdot",
-        type=float,
-        default=4.0e-6,
-        help="WR mass-loss rate in Msun/yr, setting the absolute wind density. "
-        "Default 4e-6 (Clark & Crowther 2004, clumping-corrected).",
-    )
-    parser.add_argument(
-        "--v-inf",
-        type=float,
-        default=1750.0,
-        help="Wind terminal velocity in km/s. "
-        "Default 1750 (Clark & Crowther 2004).",
-    )
-    parser.add_argument(
-        "--mu-wind",
-        type=float,
-        default=MU_WIND_DEFAULT,
-        help="Mean mass per hydrogen-equivalent nucleus, converting the wind "
-        "mass column into the N_H that the solar-abundance TBabs flux_vs_nH "
-        f"table expects. Default {MU_WIND_DEFAULT}.",
-    )
-    parser.add_argument(
-        "--f-opacity",
-        type=float,
-        default=1.0,
-        help="Effective-opacity factor applied to the Mdot-derived column. "
-        "Absorbs wind photoionization, clumping and WR abundance departures. "
-        "Clark & Crowther's Mdot overpredicts the observed N_H by ~1.5-2 dex, "
-        "so values around 0.01-0.03 reproduce IC 10 X-1. "
-        "Default 1.0 (no correction).",
-    )
-    parser.add_argument(
-        "--wind-model",
-        type=str,
-        choices=list(WIND_MODEL_IDS.keys()),
-        default="smooth_pl",
-        help="Dimensionless wind density profile to use. One of: "
-        "smooth_pl, confinement, beta_law. Default: smooth_pl.",
-    )
-    parser.add_argument(
-        "--Rb",
-        type=float,
-        default=5.0,
-        help="Break radius (solar radii) for smooth_pl. Default: 5.0.",
-    )
-    parser.add_argument(
-        "--p",
-        type=float,
-        default=4.0,
-        help="Inner-region power-law slope for smooth_pl. Default: 4.0.",
-    )
-    parser.add_argument(
-        "--Delta",
-        type=float,
-        default=2.0,
-        # Must match default_wind_params() and the MCMC's WIND_SHAPE_FIXED, or a
-        # CLI-generated model would use a different break sharpness than the one
-        # the MCMC fitted.
-        help="Smoothness parameter for smooth_pl. Larger -> sharper break. Default: 2.0.",
-    )
-    parser.add_argument(
-        "--fconf",
-        type=float,
-        default=10.0,
-        help="Confinement overdensity amplitude for confinement model. Default: 10.0.",
-    )
-    parser.add_argument(
-        "--ell",
-        type=float,
-        default=0.5,
-        help="Confinement scale length (solar radii) for confinement model. Default: 0.5.",
-    )
-    parser.add_argument(
-        "--beta",
-        type=float,
-        default=1.0,
-        help="CAK velocity-law exponent for beta_law. Default: 1.0.",
-    )
-    parser.add_argument(
-        "--H",
-        type=float,
-        default=1.0,
-        help="Inner acceleration scale height (solar radii) for beta_law; the "
-        "effective break radius is R + 3H. Default: 1.0.",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="xrb_lightcurve_output.csv",
-        help="Output file name for results",
-    )
+    parser.add_argument("--r", type=float, default=0.001,
+                        help="Radius of star B (compact object / disk) in solar radii")
+    parser.add_argument("--R", type=float, default=2.0,
+                        help="Radius of star A (companion) in solar radii")
+    parser.add_argument("--d1", type=float, default=11.0,
+                        help="Distance of star B from COM in solar radii")
+    parser.add_argument("--d2", type=float, default=8.0,
+                        help="Distance of star A from COM in solar radii")
+    parser.add_argument("--gma0", type=float, default=-90.0,
+                        help="Starting phase angle in degrees")
+    parser.add_argument("--i0", type=float, default=64.0,
+                        help="Orbital inclination in degrees from the orbital-plane "
+                             "normal (90 = edge-on, 0 = face-on)")
+    parser.add_argument("--dth", type=float, default=1.0,
+                        help="Orbital increment in degrees")
+    parser.add_argument("--d2h", type=float, default=6.0,
+                        help="Angular cell size (degrees) of the polar emitter grid")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print a one-line kernel summary")
+    parser.add_argument("--flux_method", type=str, choices=["interpolate", "refit"],
+                        default="interpolate",
+                        help="nH -> flux conversion: log-log interpolation of the CSV "
+                             "table, or an exponential refit to it")
+    parser.add_argument("--flux_csv", type=str, required=True,
+                        help="Flux vs nH CSV from compute_flux_vs_nH.py")
+    parser.add_argument("--flux_type", type=str, choices=["erg", "ph"], default="erg",
+                        help="Flux column to use: erg (erg/cm^2/s) or ph (photons/cm^2/s)")
+    parser.add_argument("--band", type=str, default=None,
+                        help="Energy band to simulate; optional when the CSV holds one band")
+    parser.add_argument("--mdot", type=float, default=4.0e-6,
+                        help="Mass-loss rate in Msun/yr, setting the absolute wind density "
+                             "(default: Clark & Crowther 2004, clumping-corrected)")
+    parser.add_argument("--v-inf", type=float, default=1750.0,
+                        help="Wind terminal velocity in km/s")
+    parser.add_argument("--mu-wind", type=float, default=MU_WIND_DEFAULT,
+                        help="Mean mass per hydrogen-equivalent nucleus")
+    parser.add_argument("--f-opacity", type=float, default=1.0,
+                        help="Effective-opacity factor on the Mdot-derived column "
+                             "(ionization, clumping, abundances); ~0.01-0.03 for IC 10 X-1")
+    parser.add_argument("--wind-model", type=str, choices=list(WIND_MODEL_IDS),
+                        default="smooth_pl", help="Dimensionless wind density profile")
+    parser.add_argument("--Rb", type=float, default=5.0,
+                        help="Break radius (solar radii) for smooth_pl")
+    parser.add_argument("--p", type=float, default=4.0,
+                        help="Inner-region power-law slope for smooth_pl")
+    # Must match default_wind_params() and the MCMC's WIND_SHAPE_FIXED, or a
+    # CLI-generated model would use a different break sharpness than the fit.
+    parser.add_argument("--Delta", type=float, default=2.0,
+                        help="Break sharpness for smooth_pl (larger = sharper)")
+    parser.add_argument("--fconf", type=float, default=10.0,
+                        help="Overdensity amplitude for confinement")
+    parser.add_argument("--ell", type=float, default=0.5,
+                        help="Compression scale length (solar radii) for confinement")
+    parser.add_argument("--beta", type=float, default=1.0,
+                        help="CAK velocity-law exponent for beta_law")
+    parser.add_argument("--H", type=float, default=1.0,
+                        help="Inner acceleration scale height (solar radii) for beta_law; "
+                             "the effective break radius is R + 3H")
+    parser.add_argument("--output", type=str, default="xrb_lightcurve_output.csv",
+                        help="Output CSV file")
 
     args = parser.parse_args()
 
-    # Collect wind-model parameters
     if args.wind_model == "smooth_pl":
         wind_params = {"Rb": args.Rb, "p": args.p, "Delta": args.Delta}
     elif args.wind_model == "confinement":
         wind_params = {"R_star": args.R, "fconf": args.fconf, "ell": args.ell}
-    elif args.wind_model == "beta_law":
-        wind_params = {"R_star": args.R, "beta": args.beta, "H": args.H}
     else:
-        parser.error(f"Unsupported wind_model: {args.wind_model}")
+        wind_params = {"R_star": args.R, "beta": args.beta, "H": args.H}
 
-    print("Starting XRB Lightcurve Simulation...")
-    print("Parameters:")
-    print(f"  r (emitter radius): {args.r} solar radii")
-    print(f"  R (companion radius): {args.R} solar radii")
-    print(f"  d1 (emitter separation): {args.d1} solar radii")
-    print(f"  d2 (companion separation): {args.d2} solar radii")
-    print(f"  gma0 (starting phase): {args.gma0} degrees")
-    print(f"  i0 (inclination): {args.i0} degrees from the orbital-plane normal "
-          f"(90 = edge-on)")
-    print(f"  dth (orbital increment): {args.dth} degrees")
-    print(f"  d2h (polar cell size): {args.d2h} degrees")
-    print(f"  flux_method: {args.flux_method}")
-    print(f"  flux_csv: {args.flux_csv}")
-    print(f"  flux_type: {args.flux_type}")
-    print(f"  mdot: {args.mdot} Msun/yr")
-    print(f"  v_inf: {args.v_inf} km/s")
-    print(f"  mu_wind: {args.mu_wind}")
-    print(f"  f_opacity: {args.f_opacity}")
-    print(f"  wind_model: {args.wind_model}")
+    print("Starting XRB light-curve simulation with parameters:")
+    for name in ("r", "R", "d1", "d2", "gma0", "i0", "dth", "d2h", "flux_method",
+                 "flux_csv", "flux_type", "band", "mdot", "v_inf", "mu_wind",
+                 "f_opacity", "wind_model"):
+        print(f"  {name}: {getattr(args, name)}")
     print(f"  wind_params: {wind_params}")
-    print(f"  Output file: {args.output}")
-    print()
+    print(f"  output: {args.output}\n")
 
-    # Run simulation
     results = simulate_lightcurve(
-        r=args.r,
-        R=args.R,
-        d1=args.d1,
-        d2=args.d2,
-        gma0=args.gma0,
-        i0=args.i0,
-        dth=args.dth,
-        d2h=args.d2h,
-        verbose=args.verbose,
-        flux_method=args.flux_method,
-        flux_csv_path=args.flux_csv,
-        flux_type=args.flux_type,
-        wind_model=args.wind_model,
-        wind_params=wind_params,
-        mdot=args.mdot,
-        v_inf=args.v_inf,
-        mu_wind=args.mu_wind,
+        r=args.r, R=args.R, d1=args.d1, d2=args.d2, gma0=args.gma0, i0=args.i0,
+        dth=args.dth, d2h=args.d2h, verbose=args.verbose,
+        flux_method=args.flux_method, flux_csv_path=args.flux_csv,
+        flux_type=args.flux_type, band=args.band,
+        wind_model=args.wind_model, wind_params=wind_params,
+        mdot=args.mdot, v_inf=args.v_inf, mu_wind=args.mu_wind,
         f_opacity=args.f_opacity,
     )
-
-    # Save results
     results.to_csv(args.output, index=False)
-    print(f"\nSimulation completed! Results saved to {args.output}")
-    print(f"Total data points: {len(results)}")
-    print(
-        f"Phase range: {results['deg'].min():.2f} to {results['deg'].max():.2f} degrees"
-    )
-
+    print(f"Simulation completed: {len(results)} phases written to {args.output}")
     return results
 
 

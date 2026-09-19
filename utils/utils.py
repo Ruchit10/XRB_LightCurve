@@ -8,15 +8,13 @@ import from this module, so there is a single implementation of:
 
 * the ephemeris (``REF_EPOCH``, ``ORBITAL_PERIOD``) and :func:`frac`
 * observation loading (:func:`read_observation`, :func:`load_data`) and
-  simulation-column discovery (:func:`detect_flux_columns`,
-  :func:`validate_sim_columns`)
+  simulation-column discovery (:func:`detect_flux_columns`)
 * phase binning -- fixed-width (:func:`phase_bin_data`) and adaptive
   constant-counts (:func:`phase_bin_data_snr`)
 * Gaussian phase smoothing (:func:`smooth_lightcurve`) and the eclipse-floor
   estimate (:func:`estimate_scattered_flux`)
 * periodic model interpolation (:func:`prepare_model_interpolator`,
-  :func:`model_from_wrap`, :func:`evaluate_model_at_phases`,
-  :func:`interp_periodic_phases`)
+  :func:`model_from_wrap`, :func:`interp_periodic_phases`)
 * the tabulated-model χ² fit (:func:`fit_simulation`) and the periodic
   phase-shift search it shares with the MCMC likelihood
   (:func:`build_phase_shift_terms`, :func:`apply_best_phase_shift`)
@@ -135,66 +133,12 @@ def get_band_display_name(band: str) -> Tuple[str, str]:
 
 
 def detect_flux_columns(df: pd.DataFrame) -> List[str]:
-    """Detect available flux columns in simulation DataFrame.
+    """Band-flux columns (``nfl_{band}``) present in a simulation DataFrame.
 
-    Looks for columns matching `nfl_{band}` (absorbed flux per band). With
-    the unified wind model there is a single flux column per band (no
-    `_av` / `_cv` split).
-
-    Note: the unscaled `flx` and scaled `fl` column-density columns are
-    excluded — they are not per-band flux values.
-
-    Parameters
-    ----------
-    df : DataFrame
-        Simulation results DataFrame
-
-    Returns
-    -------
-    List of flux column names found in the DataFrame
+    The column-density columns ``flx`` / ``fl`` are not flux values and are
+    excluded.
     """
-    flux_columns = [col for col in df.columns if col.startswith("nfl_")]
-    return sorted(flux_columns)
-
-
-def validate_sim_columns(df: pd.DataFrame, requested_columns: List[str]) -> List[str]:
-    """Validate that requested columns exist in simulation DataFrame.
-
-    Parameters
-    ----------
-    df : DataFrame
-        Simulation results DataFrame
-    requested_columns : list of str
-        Column names requested by user
-
-    Returns
-    -------
-    List of valid column names
-
-    Raises
-    ------
-    ValueError
-        If none of the requested columns exist in the DataFrame
-    """
-    available = detect_flux_columns(df)
-
-    # Check which requested columns exist
-    valid_columns = [col for col in requested_columns if col in df.columns]
-    missing_columns = [col for col in requested_columns if col not in df.columns]
-
-    if missing_columns:
-        print(f"⚠️  Warning: The following columns were not found in simulation file: {missing_columns}")
-        if available:
-            print(f"   Available flux columns: {available}")
-
-    if not valid_columns:
-        raise ValueError(
-            f"None of the requested columns exist in simulation file.\n"
-            f"Requested: {requested_columns}\n"
-            f"Available: {available if available else 'No flux columns found'}"
-        )
-
-    return valid_columns
+    return sorted(col for col in df.columns if col.startswith("nfl_"))
 
 
 # -----------------------------------------------------------------------------
@@ -1034,22 +978,6 @@ def model_from_wrap(
     return out + float(scatter)
 
 
-def evaluate_model_at_phases(
-    sim_df: pd.DataFrame,
-    sim_column: str,
-    phases,
-    shift: float = 0.0,
-    scatter: float = 0.0,
-) -> np.ndarray:
-    """Model flux at *phases* for a given phase shift and additive scatter.
-
-    Convenience wrapper over :func:`prepare_model_interpolator` +
-    :func:`model_from_wrap` for callers that only need a single evaluation.
-    """
-    phase_wrap, flux_wrap = prepare_model_interpolator(sim_df, sim_column)
-    return model_from_wrap(phase_wrap, flux_wrap, phases, shift, scatter)
-
-
 def interp_periodic_phases(
     obs_phases: np.ndarray,
     model_phase: np.ndarray,
@@ -1560,9 +1488,9 @@ def apply_saved_run_config(
         return None
 
     if len(candidates) > 1:
-        # Several fits share this directory. Configs differing only by band (the
-        # `--band all` case) restore identically, so take the first; otherwise
-        # ask the user to disambiguate.
+        # Several fits share this directory. Configs differing only by band
+        # restore identically, so take the first; otherwise ask the user to
+        # disambiguate.
         loaded = []
         for path in candidates:
             try:
