@@ -455,8 +455,10 @@ Shared by both the single-model and MCMC plot paths:
   fits a per-sample phase shift and an additive `f_scatter` but no scale.
   With `--fit-phase-shift` the shift comes from the shared `best_phase_shift`
   search (see *Per-sample phase-shift alignment* below); otherwise it is held
-  at 0. `dof = N - 1` when the shift is fitted, `N` otherwise. Returns
-  `(shift, reduced_χ²)`.
+  at `fixed_shift` (`--phase-shift`, default 0). `dof = N - 1` when the shift
+  is fitted, `N` otherwise. Returns `(shift, reduced_χ²)`. `--phase-window`
+  restricts the observed points, with the same fixed-shift requirement as the
+  MCMC.
 - **`periodic_model(phase, flux)` / `eval_periodic(phase_ext, flux_ext, phases, shift, offset)`**
   — the single periodic interpolator: the curve folded into `[0, 1)`, sorted,
   duplicate abscissae removed, with one wrap point on each side so every query
@@ -670,8 +672,26 @@ further ±7 units. The search costs 0.6 ms per call.
 nuisance minimization (not a sampled parameter), every consumer goes through
 `aligned_model_flux`, so the likelihood, `compute_chi2_for_samples`,
 `compute_bic_metrics` and `plot_best_fit` apply it identically. Disable with
-`--no-fit-phase-shift`. `f_scatter` is phase-invariant and so is unaffected by
+`--no-fit-phase-shift` (shift held at 0) or hold it at a chosen value with
+`--phase-shift SHIFT`. `f_scatter` is phase-invariant and so is unaffected by
 the shift search.
+
+**Fitting part of the orbit.** `--phase-window LO HI` (default `0 1`; `LO > HI`
+wraps through phase 0) keeps only the observed points inside the window; the
+model is still evaluated over the full orbit, which costs nothing extra because
+the kernel already computes only the unique half. The purpose is to fit ingress
+and egress separately: the model is exactly symmetric about mid-eclipse, so two
+independent half-orbit fits of asymmetric data are a clean asymmetry test.
+Because of that same symmetry a partial window **requires a fixed shift**: with
+only one eclipse edge in the data, a narrow eclipse centred nearby and a wide
+one centred further away fit the edge equally well, so the eclipse width (the
+combination of `a`, `R`, `i0`) is degenerate with a free shift. `main()` refuses
+a partial window unless `--phase-shift` or `--no-fit-phase-shift` is given; the
+intended workflow is a full-orbit fit first, then half-orbit fits with its shift
+frozen. The split should sit at the fitted mid-eclipse phase (≈ 0.485 for the
+current ephemeris), and the `f_scatter` prior window must overlap the data
+window. Both options are fit-defining and are restored by `--replot`.
+`chandra_phase_analysis.py` has the same two options for the tabulated fit.
 
 ### Samplers and parallelism
 
@@ -729,6 +749,40 @@ Binning mode is chosen by argument presence, not a mode flag:
 Supplying both `--n-phase-bins` and `--counts-per-bin` is an error. Errors are
 repaired once, by `sanitize_errors` (median valid error, with a warning); data
 without any valid error is rejected, since the likelihood needs σ.
+
+### Argument validation
+
+`validate_args` (and `_validate_args` in `chandra_phase_analysis.py`) rejects
+argument combinations that contradict each other or have no effect, using
+`utils.explicit_cli_dests` to tell options the user typed from defaults and
+values restored by `--replot`. The rules, all `parser.error` (exit 2):
+
+- **Binning:** `--no-phase-bin` excludes both binning options; the two binning
+  options exclude each other; counts and bin numbers are positive;
+  `--min-points-per-bin` (tabulated fit) only with fixed-width bins.
+- **Phase shift and window:** a partial `--phase-window` needs a fixed shift;
+  `--phase-shift-grid-size` only with the search enabled; `--fit-phase-shift`
+  and `--phase-shift` are mutually exclusive (tabulated fit); the
+  `--scatter-eclipse-phase` window must overlap the data window when the
+  scattered flux is estimated from the data.
+- **Contradictions:** `--fit-fopacity` with `--freeze log_fopa`, `--fit-scatter`
+  with `--freeze f_scatter`, `--scatter` together with `--scatter-eclipse-phase`
+  (tabulated fit).
+- **No-effect options:** `--scatter-eclipse-phase` without `--fit-scatter`;
+  `--prior-<name>` for a parameter of another parameterization or wind model, or
+  a shape prior without `--fit-wind-shape` (unless frozen); `--orbital-period`
+  outside the Kepler modes (it only enters Kepler's third law; folding always
+  uses `utils.ORBITAL_PERIOD`); `--chi2-n-samples` without `--save-chi2`;
+  `--smooth-sigma` without `--smooth`; `--csv-chunk-size` with
+  `--no-csv-output`; `--numba-threads-per-worker` without a pool; sampling
+  options (`--n-walkers`, `--n-steps`, `--n-burn`, `--sampler`, `--n-threads`,
+  `--seed`, …) together with `--replot`; fit-only options (`--sim-file`,
+  `--sim-column`, `--fit-phase-shift`, `--phase-shift`, `--scatter`,
+  `--write-model`) without `--fit` in the tabulated fitter.
+- **Ranges:** `--n-walkers` even and ≥ 2·n_dim (emcee's requirement, checked
+  before any data is loaded); `0 ≤ n_burn < n_steps`; `--dth` and `--d2h`
+  positive divisors of 360; `--mdot`, `--v-inf`, `--mu-wind` positive;
+  `--seed` in `[0, 2³²)`; the scatter window and phase window inside `[0, 1]`.
 
 ### Reporting and diagnostics
 

@@ -25,9 +25,10 @@ condensed; the numbers that still matter for interpreting results are kept.
 14. [Phase 31 — Release Trim](#phase-31--release-trim)
 15. [Phase 32 — `beta_law` Wind Profile Restored](#phase-32--beta_law-wind-profile-restored)
 16. [Phase 33 — Kernel Symmetry, Compiled Flux Conversion, Single Band & MCMC Consolidation](#phase-33--kernel-symmetry-compiled-flux-conversion-single-band--mcmc-consolidation)
-17. [Side Investigation — Reference Epoch](#side-investigation--reference-epoch)
-18. [Current File Inventory](#current-file-inventory)
-19. [Current Status & Quick Commands](#current-status--quick-commands)
+17. [Phase 34 — Release Review: Performance, Correctness, Trimming](#phase-34--release-review-performance-correctness-trimming-2026-09-19)
+18. [Side Investigation — Reference Epoch](#side-investigation--reference-epoch)
+19. [Current File Inventory](#current-file-inventory)
+20. [Current Status & Quick Commands](#current-status--quick-commands)
 
 ---
 
@@ -765,6 +766,45 @@ file read identically to the Commit 3 tree (max difference 0.0).
   leaves `requirements.txt` (emcee and arviz pull it in).
 
 Tracked Python: 7712 → 6945 lines across the four commits.
+
+### Commit 5 — Phase windows, fixed phase shift, argument validation
+
+- **`--phase-window LO HI`** (both fitters, default `0 1`, `LO > HI` wraps)
+  keeps only the observed points inside the window; the model is still
+  evaluated over the full orbit (free, the kernel already computes the unique
+  half). Meant for separate ingress and egress fits of asymmetric data, which
+  the exactly symmetric model cannot produce, so the two posteriors are an
+  asymmetry test.
+- **`--phase-shift SHIFT`** holds the shift at a chosen value (`FitData.fixed_shift`,
+  `fit_simulation(fixed_shift=)`); previously the shift was either searched or
+  0. A partial window **requires** a fixed shift: with one eclipse edge in the
+  data the eclipse width is degenerate with a free shift, so both scripts
+  refuse `--phase-window` with the search enabled. Workflow: full-orbit fit,
+  then half-orbit fits with its shift. The scattered-flux window must overlap
+  the data window.
+- **Argument validation** (`validate_args` / `_validate_args`, using
+  `utils.explicit_cli_dests` to distinguish typed options from defaults and
+  restored values): binning exclusivity incl. `--no-phase-bin` and
+  `--min-points-per-bin`; `--fit-fopacity`/`--freeze log_fopa` and
+  `--fit-scatter`/`--freeze f_scatter` contradictions; no-effect options
+  (`--scatter-eclipse-phase` without `--fit-scatter`, `--prior-<name>` for
+  another mode or wind model or without `--fit-wind-shape`, `--orbital-period`
+  outside the Kepler modes, `--chi2-n-samples` without `--save-chi2`,
+  `--smooth-sigma` without `--smooth`, `--csv-chunk-size` with
+  `--no-csv-output`, `--numba-threads-per-worker` without a pool, sampling
+  options with `--replot`, fit-only options without `--fit`, `--scatter` with
+  `--scatter-eclipse-phase`); ranges (`--n-walkers` even and ≥ 2·n_dim before
+  any data is loaded, `--dth`/`--d2h` divisors of 360, positive `--mdot`,
+  `--v-inf`, `--mu-wind`, `--seed` in `[0, 2³²)`). The seed is applied after
+  validation, so a bad seed is a clean argument error.
+
+Verified in `henv`: with the default window the searched χ² is unchanged
+(6774.742 at θ₀) and a fixed shift equal to the searched one reproduces it
+exactly; `--phase-window 0 0.5 --phase-shift 0.985` keeps 835 of 1442 points
+and replots with both options restored; a wrapping window runs; the tabulated
+fit with the fixed searched shift gives the same total χ²; 18 rejected MCMC
+combinations and 8 rejected tabulated-fit combinations exit 2 with the
+intended message, and the valid freeze-one-fit-one wind-shape case runs.
 
 ---
 

@@ -152,6 +152,13 @@ same search: a scan over the full period with a step no larger than the data
 or model spacing, then two dense passes to a resolution of ~2e-5 in phase.
 The MCMC evaluates the model at `--dth 2` (180 phases) by default.
 
+To fit ingress and egress separately, restrict the data with
+`--phase-window LO HI` (both fitters). The model is symmetric about
+mid-eclipse, so a partial window needs the shift held fixed
+(`--phase-shift SHIFT`, taken from a full-orbit fit); the scripts refuse a
+partial window with a free shift. Contradictory or no-effect option
+combinations are rejected up front with a message naming the flags.
+
 ---
 
 ## `xrb_lightcurve.py` parameters

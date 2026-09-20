@@ -78,6 +78,34 @@ def frac(x: np.ndarray | float) -> np.ndarray | float:
     return x - np.floor(x)
 
 
+def check_phase_window(lo: float, hi: float) -> Tuple[float, float]:
+    """Validate a phase window ``[lo, hi)``; returns ``(lo, hi)`` as floats.
+
+    ``(0, 1)`` is the full orbit. Otherwise both bounds must lie in [0, 1] and
+    differ; ``lo > hi`` denotes a window wrapping through phase 0.
+    """
+    lo, hi = float(lo), float(hi)
+    if not (0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0):
+        raise ValueError(f"phase window bounds must lie in [0, 1], got {lo} and {hi}")
+    if lo == hi:
+        raise ValueError("phase window must not be empty (lo == hi); use 0 1 for the full orbit")
+    return lo, hi
+
+
+def is_full_phase_window(lo: float, hi: float) -> bool:
+    """True for the full orbit ``(0, 1)``."""
+    return float(lo) == 0.0 and float(hi) == 1.0
+
+
+def in_phase_window(phase, lo: float, hi: float) -> np.ndarray:
+    """Boolean mask of *phase* values inside ``[lo, hi)``, wrapping through 0 when ``lo > hi``."""
+    lo, hi = check_phase_window(lo, hi)
+    phase = np.mod(np.asarray(phase, dtype=float), 1.0)
+    if is_full_phase_window(lo, hi):
+        return np.ones(phase.shape, dtype=bool)
+    return np.mod(phase - lo, 1.0) < ((hi - lo) % 1.0)
+
+
 def fmt_val(value: float, width: int = 0) -> str:
     """Format a parameter value without silently rounding it to zero.
 
@@ -979,6 +1007,7 @@ def fit_simulation(
     fit_phase_shift: bool = False,
     scatter: float = 0.0,
     n_shift_grid: Optional[int] = None,
+    fixed_shift: float = 0.0,
     verbose: bool = True,
 ) -> Tuple[float, float]:
     """Fit a tabulated simulation light curve to observations by χ².
@@ -1009,6 +1038,9 @@ def fit_simulation(
     n_shift_grid : int, optional
         Coarse trial shifts over [0, 1); see :func:`build_phase_shift_search`
         for the default.
+    fixed_shift : float, default 0.0
+        Phase shift applied when *fit_phase_shift* is False (e.g. the shift of
+        a full-orbit fit when fitting a phase window).
     verbose : bool, default True
         Print the fitted shift, scatter and reduced χ².
 
@@ -1030,8 +1062,8 @@ def fit_simulation(
         search = build_phase_shift_search(phase_obs, n_grid=n_shift_grid, n_model=len(sim_df))
         _, best_shift, chi2 = best_phase_shift(phase_ext, flux_ext, rate_obs, err_obs ** 2, search)
     else:
-        best_shift = 0.0
-        model = eval_periodic(phase_ext, flux_ext, phase_obs)
+        best_shift = float(fixed_shift) % 1.0
+        model = eval_periodic(phase_ext, flux_ext, phase_obs, shift=best_shift)
         chi2 = float(np.sum(((rate_obs - model) / err_obs) ** 2))
 
     n_free = int(fit_phase_shift)
@@ -1041,7 +1073,7 @@ def fit_simulation(
         print(
             f"{'Best-fit phase shift' if fit_phase_shift else 'Chi-square at zero shift'} "
             f"(no flux rescaling):\n"
-            f"  Phase shift = {best_shift:.5f}{'' if fit_phase_shift else ' (fixed)'}\n"
+            f"  Phase shift = {best_shift:.5f}{'' if fit_phase_shift else ' (held fixed)'}\n"
             f"  Scattered flux = {float(scatter):.6g} (fixed, additive)\n"
             f"  Reduced χ² = {reduced_chi2:.3f}  (dof = {dof})"
         )
@@ -1370,14 +1402,17 @@ def find_run_configs(
     return sorted(glob.glob(os.path.join(output_dir, f"{b}_{w}{RUN_CONFIG_SUFFIX}")))
 
 
-def _explicit_cli_dests(parser: argparse.ArgumentParser, argv: List[str]) -> set:
+def explicit_cli_dests(parser: argparse.ArgumentParser, argv: Optional[List[str]] = None) -> set:
     """Argparse dests corresponding to options the user actually typed.
 
     Comparing against ``parser.get_default()`` is not enough: a user who
-    explicitly passes the default value should still beat a saved config.
-    Unambiguous prefixes are resolved as argparse resolves them; anything
-    unrecognized (a negative number used as a value) is ignored.
+    explicitly passes the default value should still beat a saved config, and
+    an option that has no effect in the chosen configuration should be
+    rejected only when it was typed. Unambiguous prefixes are resolved as
+    argparse resolves them; anything unrecognized (a negative number used as a
+    value) is ignored.
     """
+    argv = list(sys.argv[1:] if argv is None else argv)
     opt_to_dest: Dict[str, str] = {
         opt: action.dest
         for action in parser._actions
@@ -1408,8 +1443,7 @@ def apply_saved_run_config(
     band, wind model, data selection, binning and priors. Explicit command-line
     values always win. Returns the config path used, or None.
     """
-    argv = list(sys.argv[1:] if argv is None else argv)
-    explicit = _explicit_cli_dests(parser, argv)
+    explicit = explicit_cli_dests(parser, argv)
 
     candidates = find_run_configs(
         args.output_dir,

@@ -83,6 +83,7 @@ from __future__ import annotations
 import argparse
 import os
 
+import numpy as np
 import pandas as pd
 
 # Every analysis helper lives in utils/ so that this script and
@@ -93,12 +94,16 @@ from utils.utils import (
     ORBITAL_PERIOD,
     REF_EPOCH,
     band_label_from_column,
+    check_phase_window,
     detect_flux_columns,
     estimate_scattered_flux,
     eval_periodic,
+    explicit_cli_dests,
     fit_simulation,
     frac,
+    in_phase_window,
     interp_periodic_phases,
+    is_full_phase_window,
     load_data,
     obs_errors,
     phase_bin_data,
@@ -154,6 +159,72 @@ def _default_model_output(plot_output: str | None) -> str:
         return "model_lightcurve.txt"
     stem, _ = os.path.splitext(str(plot_output))
     return f"{stem}_model.txt"
+
+
+def _validate_args(parser: argparse.ArgumentParser, args, explicit: set) -> None:
+    """Reject argument combinations that contradict each other or have no effect.
+
+    *explicit* is the set of dests the user typed; "no effect" is only an error
+    for options that were actually given.
+    """
+    err = parser.error
+
+    # --- fit-only options -------------------------------------------------------
+    if args.fit and not args.sim_file:
+        err("--fit requires --sim-file.")
+    fit_only = {'sim_file': '--sim-file', 'sim_column': '--sim-column',
+                'fit_phase_shift': '--fit-phase-shift', 'phase_shift': '--phase-shift',
+                'scatter': '--scatter', 'scatter_eclipse_phase': '--scatter-eclipse-phase',
+                'write_model': '--write-model'}
+    if not args.fit:
+        typed = [flag for dest, flag in fit_only.items() if dest in explicit]
+        if typed:
+            err(f"{', '.join(typed)} only {'applies' if len(typed) == 1 else 'apply'} "
+                f"to a fit: add --fit.")
+    if args.fit_phase_shift and args.phase_shift is not None:
+        err("--fit-phase-shift searches the shift; --phase-shift holds it fixed. Use one.")
+    if 'scatter' in explicit and 'scatter_eclipse_phase' in explicit:
+        err("--scatter fixes the scattered flux, so --scatter-eclipse-phase has no effect.")
+    s_lo, s_hi = map(float, args.scatter_eclipse_phase)
+    if not (0.0 <= s_lo <= s_hi <= 1.0):
+        err("--scatter-eclipse-phase must satisfy 0 <= PHASE_MIN <= PHASE_MAX <= 1.")
+
+    # --- phase window ---------------------------------------------------------------
+    try:
+        lo, hi = check_phase_window(*args.phase_window)
+    except ValueError as e:
+        err(f"--phase-window: {e}")
+    partial = not is_full_phase_window(lo, hi)
+    if partial and args.fit_phase_shift:
+        err("A partial --phase-window needs a fixed phase shift. The model is symmetric about "
+            "mid-eclipse, so with only one eclipse edge in the data the eclipse width is "
+            "degenerate with a free shift: drop --fit-phase-shift and pass --phase-shift SHIFT "
+            "(the shift of a full-orbit fit; 0 if omitted).")
+    if partial and args.fit and args.scatter is None:
+        probe = np.linspace(s_lo, s_hi, 201)
+        if not np.any(in_phase_window(probe, lo, hi)):
+            err(f"--scatter-eclipse-phase {s_lo:g} {s_hi:g} lies outside --phase-window "
+                f"{lo:g} {hi:g}; pass --scatter explicitly.")
+
+    # --- binning ----------------------------------------------------------------------
+    if args.no_phase_bin and (args.n_phase_bins is not None or args.counts_per_bin is not None):
+        err("--no-phase-bin excludes --n-phase-bins and --counts-per-bin.")
+    if args.n_phase_bins is not None and args.counts_per_bin is not None:
+        err("Specify either --n-phase-bins (fixed-width) or --counts-per-bin (constant counts), not both.")
+    if args.n_phase_bins is not None and args.n_phase_bins <= 0:
+        err("--n-phase-bins must be > 0.")
+    if args.counts_per_bin is not None and args.counts_per_bin <= 0:
+        err("--counts-per-bin must be > 0.")
+    if 'min_points_per_bin' in explicit and (args.no_phase_bin or args.counts_per_bin is not None):
+        err("--min-points-per-bin only applies to fixed-width binning (--n-phase-bins).")
+    if args.min_points_per_bin < 1:
+        err("--min-points-per-bin must be >= 1.")
+
+    # --- smoothing --------------------------------------------------------------------
+    if 'smooth_sigma' in explicit and not args.smooth:
+        err("--smooth-sigma has no effect without --smooth.")
+    if args.smooth_sigma <= 0:
+        err("--smooth-sigma must be > 0.")
 
 
 def main() -> None:
@@ -257,6 +328,25 @@ def main() -> None:
              "dropping them as gaps; their zero errors are replaced by the median valid error.",
     )
     parser.add_argument(
+        "--phase-window",
+        nargs=2,
+        type=float,
+        default=(0.0, 1.0),
+        metavar=("LO", "HI"),
+        help="Use only the data with phase in [LO, HI) (LO > HI wraps through 0); the "
+             "model overlay still spans the orbit. With --fit, a partial window needs a "
+             "fixed shift (--phase-shift, default 0) because the model is symmetric about "
+             "mid-eclipse and one eclipse edge cannot pin both the shift and the eclipse width.",
+    )
+    parser.add_argument(
+        "--phase-shift",
+        type=float,
+        default=None,
+        metavar="SHIFT",
+        help="Hold the model phase shift at this value during --fit (instead of 0 or the "
+             "--fit-phase-shift search), e.g. the shift of a full-orbit fit.",
+    )
+    parser.add_argument(
         "--min-points-per-bin",
         type=int,
         default=3,
@@ -304,22 +394,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-
-    if args.n_phase_bins is not None and args.counts_per_bin is not None:
-        parser.error(
-            "Specify either --n-phase-bins (fixed-width) or --counts-per-bin "
-            "(constant-SNR), not both."
-        )
-    if args.n_phase_bins is not None and args.n_phase_bins <= 0:
-        parser.error("--n-phase-bins must be > 0.")
-    if args.counts_per_bin is not None and args.counts_per_bin <= 0:
-        parser.error("--counts-per-bin must be > 0.")
-    if args.write_model is not None and not args.fit:
-        parser.error(
-            "--write-model needs a fitted model: add --fit (and --sim-file). "
-            "Without a fit there is no phase shift or scattered-flux floor to "
-            "apply, so the file would just restate --sim-file."
-        )
+    _validate_args(parser, args, explicit_cli_dests(parser))
 
     obs_column = args.obs_column
     print(f"Using observation column: {obs_column}")
@@ -348,6 +423,14 @@ def main() -> None:
     if n_removed > 0:
         print(f"Removed {n_removed} {'NaN' if args.keep_zero_flux else 'zero/NaN'} flux data "
               f"points ({len(df)} remaining)")
+
+    lo, hi = args.phase_window
+    if not is_full_phase_window(lo, hi):
+        n_all = len(df)
+        df = df[in_phase_window(df['phase'].to_numpy(dtype=float), lo, hi)].reset_index(drop=True)
+        print(f"Phase window [{lo:g}, {hi:g}): kept {len(df)} of {n_all} points")
+        if df.empty:
+            parser.error(f"no observed points fall inside --phase-window {lo:g} {hi:g}.")
     
     # Show which columns are present in the loaded data
     if 'error' in df.columns:
@@ -396,9 +479,6 @@ def main() -> None:
         )
 
     if args.fit:
-        if not args.sim_file:
-            parser.error("--fit requires --sim-file to be specified.")
-
         if args.scatter is not None:
             scatter_value = float(args.scatter)
             print(f"Using fixed scattered flux: {scatter_value:.6g}")
@@ -436,6 +516,7 @@ def main() -> None:
             df, sim_df, sim_column,
             fit_phase_shift=args.fit_phase_shift,
             scatter=scatter_value,
+            fixed_shift=(args.phase_shift or 0.0),
         )
 
         if args.write_model is not None:

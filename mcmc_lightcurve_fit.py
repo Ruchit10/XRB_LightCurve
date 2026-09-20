@@ -103,9 +103,13 @@ from utils.utils import (
     apply_saved_run_config,
     best_phase_shift,
     build_phase_shift_search,
+    check_phase_window,
     estimate_scattered_flux,
     eval_periodic,
+    explicit_cli_dests,
     fmt_val,
+    in_phase_window,
+    is_full_phase_window,
     load_observed_lightcurves,
     periodic_model,
     phase_bin_data,
@@ -614,20 +618,23 @@ class FitData:
     flux: np.ndarray
     err: np.ndarray
     err2: np.ndarray
-    shift_search: Optional[PhaseShiftSearch] = None   # None: phase shift held at 0
+    shift_search: Optional[PhaseShiftSearch] = None   # None: phase shift held at fixed_shift
+    fixed_shift: float = 0.0
     is_binned: bool = True
     phase_width: Optional[np.ndarray] = None
 
     @classmethod
     def build(cls, phase, flux, err, fit_phase_shift: bool = True,
               shift_grid_size: Optional[int] = None, n_model: int = 0,
+              fixed_shift: float = 0.0,
               is_binned: bool = True, phase_width=None) -> "FitData":
         phase = np.asarray(phase, dtype=float)
         err = np.asarray(err, dtype=float)
         search = (build_phase_shift_search(phase, n_grid=shift_grid_size, n_model=n_model)
                   if fit_phase_shift else None)
         return cls(phase=phase, flux=np.asarray(flux, dtype=float), err=err, err2=err ** 2,
-                   shift_search=search, is_binned=is_binned, phase_width=phase_width)
+                   shift_search=search, fixed_shift=float(fixed_shift) % 1.0,
+                   is_binned=is_binned, phase_width=phase_width)
 
     @property
     def fit_phase_shift(self) -> bool:
@@ -666,7 +673,8 @@ def aligned_model_flux(theta, spec: ParamSpec, model: DirectLightCurveModel,
         return None, 0.0
     phase_ext, flux_ext = periodic_model(*curve)
     if data.shift_search is None:
-        return eval_periodic(phase_ext, flux_ext, data.phase), 0.0
+        return (eval_periodic(phase_ext, flux_ext, data.phase, shift=data.fixed_shift),
+                float(data.fixed_shift))
     model_at_obs, shift, _ = best_phase_shift(phase_ext, flux_ext, data.flux, data.err2,
                                               data.shift_search)
     return model_at_obs, shift
@@ -865,7 +873,7 @@ def run_mcmc(
         print(f"Per-sample phase-shift search: enabled (coarse grid {s.shift_grid.size}, "
               f"{s.n_levels} x {s.n_fine}-point dense passes, resolution {s.resolution:.2e})")
     else:
-        print("Per-sample phase-shift search: disabled")
+        print(f"Per-sample phase-shift search: disabled (shift held at {data.fixed_shift:.5f})")
     print(f"Active params ({spec.n_dim}): {spec.active_names}")
     if spec.frozen:
         print(f"Frozen: {spec.frozen}")
@@ -1172,15 +1180,14 @@ def plot_best_fit(model, spec: ParamSpec, data: FitData, stats: Dict, band: str,
 
     print(f"Best-fit overlay from the {'MAP' if key == 'map' else 'median'} point estimate: "
           f"chi2/dof = {red_chi2:.6g} (dof = {dof})")
-    if data.fit_phase_shift:
-        print(f"  phase_shift = {shift:.5f}")
+    print(f"  phase_shift = {shift:.5f}{'' if data.fit_phase_shift else ' (held fixed)'}")
     if f_best is not None:
         print(f"  f = {f_best:.4f} (from log_f)"
               + (f", chi2_eff/dof = {red_chi2_eff:.6g}" if np.isfinite(red_chi2_eff) else ""))
     if spec.fit_scatter or 'f_scatter' in spec.frozen:
         print(f"  f_scatter = {f_scatter_best:.6g}")
 
-    overlay_phase = np.mod(model_phases + shift, 1.0) if data.fit_phase_shift else model_phases
+    overlay_phase = np.mod(model_phases + shift, 1.0)
     plot_lightcurve_fit(
         data.phase, data.flux, data.err,
         model_phase=overlay_phase, model_flux=dense, obs_model=obs_model,
@@ -1452,6 +1459,8 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
         'n_walkers': int(args.n_walkers), 'n_steps': int(args.n_steps),
         'n_burn': int(args.n_burn), 'fit_elapsed_s': fit_elapsed, 'seed': args.seed,
         'fit_phase_shift': data.fit_phase_shift,
+        'phase_shift_fixed': None if data.fit_phase_shift else float(data.fixed_shift),
+        'phase_window': [float(v) for v in args.phase_window],
         'phase_shift_grid_size': (int(data.shift_search.shift_grid.size)
                                   if data.shift_search is not None else None),
         'phase_shift_resolution': (float(data.shift_search.resolution)
@@ -1558,6 +1567,8 @@ def write_summary(path: str, band: str, spec: ParamSpec, stats: Dict) -> None:
                     f"walkers={meta.get('n_walkers')}, steps={meta.get('n_steps')}, "
                     f"burn={meta.get('n_burn')}, seed={meta.get('seed')}\n")
             f.write(f"  fit_phase_shift={meta.get('fit_phase_shift')}, "
+                    f"phase_shift_fixed={meta.get('phase_shift_fixed')}, "
+                    f"phase_window={meta.get('phase_window')}, "
                     f"phase_shift_grid={meta.get('phase_shift_grid_size')}, "
                     f"phase_shift_resolution={meta.get('phase_shift_resolution')}\n")
             if np.isfinite(meta.get('fit_elapsed_s', np.nan)):
@@ -1686,6 +1697,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Keep rows with flux <= 0 (zero-count bins) instead of dropping them on "
                              "load. Their zero errors are replaced by the median valid error; keeping "
                              "them lowers the mid-eclipse mean that centres the f_scatter prior.")
+    parser.add_argument("--phase-window", nargs=2, type=float, default=(0.0, 1.0), metavar=("LO", "HI"),
+                        help="Fit only the data with phase in [LO, HI) (LO > HI wraps through 0); the "
+                             "model is still evaluated over the full orbit. A partial window needs a "
+                             "fixed phase shift (--phase-shift or --no-fit-phase-shift): the model is "
+                             "symmetric about mid-eclipse, so with one eclipse edge in the data the "
+                             "eclipse width is degenerate with a free shift. Take the shift from a "
+                             "full-orbit fit.")
 
     norm = parser.add_argument_group(
         'Wind Normalization',
@@ -1718,7 +1736,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "via a = K*M_tot^(1/3), q_m's posterior equals its prior, and M_X / "
                              "M_RH are derived. Freeze q_m to drop the dead dimension.")
     parser.add_argument("--orbital-period", type=float, default=float(ORBITAL_PERIOD),
-                        help="Orbital period in seconds for the Kepler modes")
+                        help="Orbital period in seconds for Kepler's third law (--kepler / "
+                             "--kepler-mtot only); the light curves are folded with utils.ORBITAL_PERIOD")
     parser.add_argument("--freeze", type=str, default=None, metavar="NAME=VAL[,NAME=VAL,...]",
                         help="Pin parameters and drop them from the chain. Names: d1,d2,a,q,r,R,"
                              "i0,M_X,M_RH,M_tot,q_m,f_scatter,log_fopa,Rb,p,fconf,ell,beta,H. "
@@ -1735,8 +1754,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Seed for the walker initialisation, the sampler moves and every "
                              "random subset, so a run can be reproduced exactly")
     parser.add_argument("--no-fit-phase-shift", action="store_true",
-                        help="Disable the per-sample phase-shift alignment (by default every "
-                             "likelihood call minimises chi2 over a phase shift).")
+                        help="Disable the per-sample phase-shift alignment and hold the shift at 0 "
+                             "(by default every likelihood call minimises chi2 over a phase shift).")
+    parser.add_argument("--phase-shift", type=float, default=None, metavar="SHIFT",
+                        help="Hold the model phase shift at this value (no search), e.g. the shift "
+                             "of a full-orbit fit when fitting a --phase-window.")
     parser.add_argument("--phase-shift-grid-size", type=int, default=None,
                         help="Coarse trial shifts per likelihood call before the dense refinement. "
                              "Default: max(number of data points, model phases), at most 400.")
@@ -1818,6 +1840,13 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
                                        error_column=args.obs_error_column,
                                        time_column=args.time_column,
                                        drop_nonpositive_flux=not args.keep_zero_flux)
+    lo, hi = args.phase_window
+    if not is_full_phase_window(lo, hi):
+        n_all = len(obs_df)
+        obs_df = obs_df[in_phase_window(obs_df['phase'].to_numpy(dtype=float), lo, hi)].reset_index(drop=True)
+        print(f"Phase window [{lo:g}, {hi:g}): kept {len(obs_df)} of {n_all} points")
+        if obs_df.empty:
+            raise ValueError(f"No observed points fall inside the phase window [{lo}, {hi}).")
     is_binned = not args.no_phase_bin
     if is_binned:
         cols = dict(rate_column='flux', error_column='flux_err')
@@ -1833,9 +1862,11 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
     err = sanitize_errors(obs_df['flux_err'], context="binned light curve: ")
     width = obs_df['width'].to_numpy(dtype=float) if ('width' in obs_df.columns and is_binned) else None
 
-    data = FitData.build(phase, flux, err, fit_phase_shift=not args.no_fit_phase_shift,
+    fit_shift = not args.no_fit_phase_shift and args.phase_shift is None
+    data = FitData.build(phase, flux, err, fit_phase_shift=fit_shift,
                          shift_grid_size=args.phase_shift_grid_size,
                          n_model=int(round(360.0 / float(args.dth))),
+                         fixed_shift=(args.phase_shift or 0.0),
                          is_binned=is_binned, phase_width=width)
 
     smoothed = None
@@ -1856,13 +1887,150 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
     return data, smoothed, scatter_prior
 
 
+def _flag_names(parser: argparse.ArgumentParser) -> Dict[str, str]:
+    """dest -> the long option the user would type."""
+    out: Dict[str, str] = {}
+    for action in parser._actions:
+        longs = [o for o in action.option_strings if o.startswith("--")]
+        if longs:
+            out[action.dest] = longs[0]
+    return out
+
+
+def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen: Dict[str, float],
+                  explicit: set) -> None:
+    """Reject argument combinations that contradict each other or have no effect.
+
+    *explicit* is the set of dests the user typed (utils.explicit_cli_dests):
+    an option is only an error for "no effect" when it was actually given, so
+    values restored by --replot never trip these checks.
+    """
+    err = parser.error
+    flag = _flag_names(parser)
+    mode = spec.mode
+
+    # --- data and binning ------------------------------------------------------
+    if args.no_phase_bin and (args.n_phase_bins is not None or args.counts_per_bin is not None):
+        err("--no-phase-bin excludes --n-phase-bins and --counts-per-bin.")
+    if args.n_phase_bins is not None and args.counts_per_bin is not None:
+        err("Specify either --n-phase-bins or --counts-per-bin, not both.")
+    if args.n_phase_bins is not None and args.n_phase_bins <= 0:
+        err("--n-phase-bins must be > 0.")
+    if args.counts_per_bin is not None and args.counts_per_bin <= 0:
+        err("--counts-per-bin must be > 0.")
+    try:
+        lo, hi = check_phase_window(*args.phase_window)
+    except ValueError as e:
+        err(f"--phase-window: {e}")
+    partial = not is_full_phase_window(lo, hi)
+
+    # --- phase shift -----------------------------------------------------------
+    fit_shift = not args.no_fit_phase_shift and args.phase_shift is None
+    if partial and fit_shift:
+        err("A partial --phase-window needs a fixed phase shift. The model is symmetric about "
+            "mid-eclipse, so with only one eclipse edge in the data the eclipse width is "
+            "degenerate with a free shift: pass --phase-shift SHIFT (the shift of a full-orbit "
+            "fit) or --no-fit-phase-shift to hold it at 0.")
+    if not fit_shift and 'phase_shift_grid_size' in explicit:
+        err("--phase-shift-grid-size has no effect when the phase shift is held fixed.")
+    if args.phase_shift_grid_size is not None and args.phase_shift_grid_size < 3:
+        err("--phase-shift-grid-size must be >= 3.")
+
+    # --- scattered flux --------------------------------------------------------
+    s_lo, s_hi = map(float, args.scatter_eclipse_phase)
+    if not (0.0 <= s_lo <= s_hi <= 1.0):
+        err("--scatter-eclipse-phase must satisfy 0 <= PHASE_MIN <= PHASE_MAX <= 1.")
+    if 'scatter_eclipse_phase' in explicit and not args.fit_scatter:
+        err("--scatter-eclipse-phase only centres the f_scatter prior; add --fit-scatter.")
+    if args.fit_scatter and partial:
+        probe = np.linspace(s_lo, s_hi, 201)
+        if not np.any(in_phase_window(probe, lo, hi)):
+            err(f"--scatter-eclipse-phase {s_lo:g} {s_hi:g} lies outside --phase-window "
+                f"{lo:g} {hi:g}, so the f_scatter prior cannot be centred on the data.")
+    if args.fit_scatter and 'f_scatter' in frozen:
+        err("--fit-scatter and --freeze f_scatter contradict each other.")
+    if args.fit_fopacity and 'log_fopa' in frozen:
+        err("--fit-fopacity and --freeze log_fopa contradict each other.")
+
+    # --- sampling --------------------------------------------------------------
+    sampling = {'n_walkers', 'n_steps', 'n_burn', 'sampler', 'n_threads',
+                'numba_threads_per_worker', 'seed'}
+    if args.replot:
+        typed = sorted(flag[d] for d in sampling & explicit)
+        if typed:
+            err(f"--replot does not sample; {', '.join(typed)} "
+                f"{'has' if len(typed) == 1 else 'have'} no effect.")
+    else:
+        if args.n_steps <= 0:
+            err("--n-steps must be > 0.")
+        if not (0 <= args.n_burn < args.n_steps):
+            err(f"--n-burn must satisfy 0 <= n_burn < n_steps "
+                f"(got n_burn={args.n_burn}, n_steps={args.n_steps}).")
+        if args.n_walkers < 2 * spec.n_dim or args.n_walkers % 2:
+            err(f"--n-walkers must be even and at least 2 x n_dim = {2 * spec.n_dim} "
+                f"for the {spec.n_dim} sampled parameters {spec.active_names}.")
+        if args.n_threads < 1:
+            err("--n-threads must be >= 1.")
+        if args.numba_threads_per_worker is not None:
+            if args.n_threads <= 1:
+                err("--numba-threads-per-worker only applies to pooled runs (--n-threads > 1).")
+            if args.numba_threads_per_worker < 1:
+                err("--numba-threads-per-worker must be >= 1.")
+        if args.seed is not None and not (0 <= args.seed < 2 ** 32):
+            err("--seed must be in [0, 2^32).")
+
+    # --- model -----------------------------------------------------------------
+    for name in ('dth', 'd2h'):
+        value = getattr(args, name)
+        if value <= 0 or abs(360.0 / value - round(360.0 / value)) > 1e-9:
+            err(f"{flag[name]} must be positive and divide 360 evenly (got {value}).")
+    for name in ('mdot', 'v_inf', 'mu_wind'):
+        if getattr(args, name) <= 0:
+            err(f"{flag[name]} must be > 0.")
+    if args.orbital_period <= 0:
+        err("--orbital-period must be > 0.")
+    if 'orbital_period' in explicit and mode not in ('kepler', 'kepler_mtot'):
+        err("--orbital-period only enters Kepler's third law: use it with --kepler or "
+            "--kepler-mtot (the light curves are folded with utils.ORBITAL_PERIOD regardless).")
+
+    # --- priors ----------------------------------------------------------------
+    active_geometry = set(geometry_names(mode))
+    all_geometry = {n for m in MODES.values() for n in m['scale_names']} | {'r', 'R', 'i0'}
+    for dest in sorted(explicit):
+        if not dest.startswith('prior_'):
+            continue
+        name = dest[len('prior_'):]
+        if name in all_geometry:
+            if name not in active_geometry:
+                owner = next(m for m, cfg in MODES.items() if name in cfg['scale_names'])
+                err(f"{flag[dest]} belongs to the '{owner}' parameterization "
+                    f"({MODES[owner]['flag'] or 'no mode flag'}); the run uses '{mode}'.")
+        elif name in ALL_WIND_SHAPE_NAMES:
+            if name not in WIND_SHAPE_FIT[spec.wind_model]:
+                err(f"{flag[dest]} is not a shape parameter of --wind-model {spec.wind_model} "
+                    f"({WIND_SHAPE_FIT[spec.wind_model]}).")
+            if not spec.fit_wind_shape and name not in frozen:
+                err(f"{flag[dest]} has no effect without --fit-wind-shape.")
+
+    # --- output ----------------------------------------------------------------
+    if 'chi2_n_samples' in explicit and not args.save_chi2:
+        err("--chi2-n-samples has no effect without --save-chi2.")
+    if args.chi2_n_samples is not None and args.chi2_n_samples <= 0:
+        err("--chi2-n-samples must be > 0.")
+    if 'smooth_sigma' in explicit and not args.smooth:
+        err("--smooth-sigma has no effect without --smooth.")
+    if args.smooth_sigma <= 0:
+        err("--smooth-sigma must be > 0.")
+    if 'csv_chunk_size' in explicit and args.no_csv_output:
+        err("--csv-chunk-size has no effect with --no-csv-output.")
+    if args.csv_chunk_size <= 0:
+        err("--csv-chunk-size must be > 0.")
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    if args.seed is not None:
-        # Covers initial_positions, zeus, the chi2 subsample and the wind-profile
-        # draws; run_mcmc hands the same state to emcee.
-        np.random.seed(args.seed)
+    explicit = explicit_cli_dests(parser)
 
     # Restore everything not typed explicitly before validating or deriving.
     restored_config = None
@@ -1875,22 +2043,6 @@ def main():
         if getattr(args, dest, None) is None:
             parser.error(f"{flag} is required (with --replot it is restored from a saved "
                          f"*{RUN_CONFIG_SUFFIX} in --output-dir, if one exists).")
-    if args.n_phase_bins is not None and args.counts_per_bin is not None:
-        parser.error("Specify either --n-phase-bins or --counts-per-bin, not both.")
-    if args.n_phase_bins is not None and args.n_phase_bins <= 0:
-        parser.error("--n-phase-bins must be > 0.")
-    if args.counts_per_bin is not None and args.counts_per_bin <= 0:
-        parser.error("--counts-per-bin must be > 0.")
-    if not args.replot and not (0 <= args.n_burn < args.n_steps):
-        parser.error(f"--n-burn must satisfy 0 <= n_burn < n_steps "
-                     f"(got n_burn={args.n_burn}, n_steps={args.n_steps}).")
-    if args.smooth_sigma <= 0:
-        parser.error("--smooth-sigma must be > 0.")
-    lo, hi = map(float, args.scatter_eclipse_phase)
-    if not (0.0 <= lo <= hi <= 1.0):
-        parser.error("--scatter-eclipse-phase must satisfy 0 <= PHASE_MIN <= PHASE_MAX <= 1.")
-    if args.orbital_period <= 0:
-        parser.error("--orbital-period must be > 0.")
     try:
         mode = mode_from_flags(args.reparam, args.kepler, args.kepler_mtot)
         frozen = parse_freeze_map(args.freeze)
@@ -1900,6 +2052,11 @@ def main():
                                 orbital_period_s=float(args.orbital_period))
     except Exception as e:
         parser.error(str(e))
+    validate_args(parser, args, spec, frozen, explicit)
+    if args.seed is not None:
+        # Covers initial_positions, zeus, the chi2 subsample and the wind-profile
+        # draws; run_mcmc hands the same state to emcee.
+        np.random.seed(args.seed)
 
     geometry_priors = default_geometry_priors(mode)
     geometry_priors.update(_parse_prior_overrides(parser, args, geometry_names(mode)))
