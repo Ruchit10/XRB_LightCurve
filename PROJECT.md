@@ -374,7 +374,9 @@ handles three file shapes:
 
 1. CIAO style with a `# Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t` header.
 2. Standard commented header containing TIME/RATE/FLUX-like names.
-3. Headerless 3-column `time, rate, error` — used **only** when no header is
+3. Headerless `time, rate[, error]` (2 or 3 columns; any other count is an
+   error, because pandas would silently promote a surplus leading column to
+   the index and shift every field by one) — used **only** when no header is
    found. Errors in the header path (unknown observable, header/data
    column-count mismatch, no time column) are raised; they used to be
    swallowed and the file silently re-read as three headerless columns.
@@ -399,7 +401,9 @@ invalid errors patched with the median valid error):
 
 - **`phase_bin_data(df, n_bins=50, min_points_per_bin=3, …)`** — fixed-width
   phase bins; bins below `min_points_per_bin` are dropped. Variable counts per
-  bin.
+  bin. Rows without a finite phase or value are dropped first (`np.digitize`
+  would file a NaN phase in the last bin), and an empty result raises instead
+  of returning a frame without a `phase` column.
 - **`phase_bin_data_snr(df, counts_per_bin=100, …)`** — adaptive
   *constant-counts* bins. Points are sorted by phase and accumulated greedily
   until each bin holds `counts_per_bin` counts, giving every binned point roughly
@@ -407,7 +411,10 @@ invalid errors patched with the median valid error):
   troughs merge into wide bins instead of many noisy narrow ones. Same weighted
   mean; additionally returns counts-weighted `phase` center, `total_counts`,
   `n_points`, and `phase_lo`/`phase_hi`/`width` for horizontal error bars. A
-  trailing under-target bin is merged into its predecessor.
+  trailing under-target bin is merged into its predecessor. The counts must be
+  finite, non-negative and not all zero, otherwise it raises: a NaN or
+  all-zero column never reaches the target and used to collapse the whole
+  light curve into a single bin.
 
 ### Smoothing / residual primitives
 
@@ -458,8 +465,12 @@ Shared by both the single-model and MCMC plot paths:
   MCMC and the tabulated path had separate interpolators whose wrap ranges
   differed: the `[0, 2)` tiling clamped queries below the first model phase.)
   `obs_errors(obs_df)` likewise centralizes uncertainty
-  extraction (given errors else `sqrt(|rate|)`, with zero/negative/non-finite
-  floored) so the fit and the residuals weight points identically.
+  extraction: it requires an error column and applies the one repair rule,
+  `sanitize_errors` (non-finite or non-positive errors replaced by the median
+  valid error, with a warning; no absolute floor and no `sqrt(|rate|)`
+  fallback, both of which depend on the units of the data and zero-weighted or
+  "perfectly fitted" flux points), so the fit and the residuals weight points
+  identically.
 - **`plot_lightcurve_fit(...)`** (`utils/plot_utils.py`) — **the one light-curve
   drawing routine**, shared with `mcmc_lightcurve_fit.plot_best_fit`. It draws
   only what it is handed (observed arrays, an already-shifted overlay curve, the
@@ -667,6 +678,12 @@ the shift search.
   `-inf` (and warns if some are), and emcee starts from the evaluated `State`.
   `main()` rejects `--n-burn ≥ --n-steps`, which used to fail only after the
   full run with an empty chain.
+- `--seed N` makes a run reproducible: `np.random.seed` covers the initial
+  ball, zeus, the `--save-chi2` subsample and the wind-profile draws, and emcee
+  is handed the same global state (`sampler.random_state`). The seed is
+  recorded in the run metadata and the summary.
+- `main()` exits with status 1 on any failure (2 for argument errors), so shell
+  chains and batch jobs can tell a failed fit from a finished one.
 - `--n-threads N > 1` opens a `spawn` multiprocessing pool. The fit context
   (`ParamSpec`, priors, model, `FitData`) is sent to each worker once through
   the pool initializer `_init_worker`, and the sampler calls
@@ -683,10 +700,16 @@ the shift search.
 which resolves the band directory through `resolve_band_directory` (tries, in
 order: `data_dir` itself, `data_dir/{Band}_with_flux/`,
 `data_dir/{band}/single/`, `data_dir/{band}/`), reads via `utils.load_data`,
-remaps to `time, flux, flux_err, obs_id, counts, phase`, and drops
-non-positive / non-finite flux rows (mostly zero-exposure GTI gaps, which carry
-no information and would make `σ²_eff ≈ 0` degenerate under the jitter
-likelihood). It then bins, builds the `FitData`, and computes the smoothed
+remaps to `time, flux, flux_err, obs_id, phase` (plus `counts` only when the
+files carry it: an all-NaN column would pass the constant-counts binner's
+presence check), and drops non-positive / non-finite flux rows (mostly
+zero-exposure GTI gaps, which carry no information and would make
+`σ²_eff ≈ 0` degenerate under the jitter likelihood). `--keep-zero-flux`
+keeps the `flux ≤ 0` rows instead: 15 % of the in-eclipse CIAO bins are
+genuine zero-count 100 s bins, and dropping them raises the eclipse-window
+mean — the `f_scatter` prior centre — by 18 %. Kept rows have zero errors,
+which `sanitize_errors` replaces by the median valid error.
+`chandra_phase_analysis.py` has the same flag for its zero-rate filter. It then bins, builds the `FitData`, and computes the smoothed
 curve and the data-driven `f_scatter` prior when requested.
 
 Binning mode is chosen by argument presence, not a mode flag:
@@ -698,9 +721,9 @@ Binning mode is chosen by argument presence, not a mode flag:
 | `--n-phase-bins N` | fixed-width bins |
 | neither | 50 fixed-width bins (backward-compatible default) |
 
-Supplying both `--n-phase-bins` and `--counts-per-bin` is an error. Any residual
-non-finite / non-positive errors are patched to
-`max(0.1·|flux|, median(valid errors))` with a warning.
+Supplying both `--n-phase-bins` and `--counts-per-bin` is an error. Errors are
+repaired once, by `sanitize_errors` (median valid error, with a warning); data
+without any valid error is rejected, since the likelihood needs σ.
 
 ### Reporting and diagnostics
 
@@ -767,7 +790,7 @@ All three live in `utils/plot_utils.py`.
     reads far more clearly here than in a corner plot.
 - `plot_best_fit` (in `mcmc_lightcurve_fit.py`) — resolves the point estimate
   (MAP when available, else per-parameter medians), evaluates the model through
-  `evaluate_model` (the same entry point the likelihood uses, so geometry mode,
+  `model_curve` (the same entry point the likelihood uses, so geometry mode,
   wind shape, frozen values and the additive `f_scatter` are resolved once),
   finds the best phase shift, then hands the arrays to `plot_lightcurve_fit`.
   Result: a 2-panel (3:1) figure with the MAP overlay over the data, the optional
@@ -797,6 +820,31 @@ always win over the saved values, so a single option can be overridden in place
 the observed point count against `n_obs` in the chain metadata and warns on a
 mismatch. `--band` and `--flux-csv` are therefore only required when *not*
 replotting.
+
+Three rules keep the restore honest (`utils.apply_saved_run_config`):
+
+- **Output-control options are never restored** (`_RUN_CONFIG_NEVER_RESTORE`:
+  `no_plots`, `no_geometry_plots`, `quiet`, `smooth`, `smooth_sigma`,
+  `save_chi2`, `chi2_n_samples`, `compute_bic`, `compact_output`,
+  `no_csv_output`, `csv_chunk_size`, `n_threads`, `numba_threads_per_worker`,
+  `seed`, plus `replot` and `output_dir`). `store_true` flags cannot be negated
+  on the command line, so restoring them made a fit run with `--no-plots`
+  impossible to replot with figures. Only options that define the fit — data,
+  binning, model, priors, sampler settings — come back.
+- **Mutually exclusive siblings are not restored** when one member was typed:
+  `--replot --n-phase-bins 30` on a `--counts-per-bin` run no longer trips the
+  exclusivity check (the `n_obs` warning then says the binning differs), and
+  likewise for `--reparam`/`--kepler`/`--kepler-mtot`.
+- **Results without the `wind_normalization` stamp are refused.** Every run
+  config and chain NPZ written since Phase 34 carries
+  `wind_normalization = "physical-mdot-vinf"` next to the inclination
+  convention. Directories sampled under the retired `lam` normalization lack
+  it; re-evaluating their MAP with the physical normalization would report a
+  χ²/dof, overlays and BIC for a model the posterior never saw (the old
+  `mcmc_results/` fits did exactly that silently, with `N_H` 20–50 × 10²²
+  instead of the chain's 0.53), so `--replot` exits with an error asking for a
+  refit. The self-healing run config for pre-config directories is written
+  only after a replot has succeeded.
 
 ---
 

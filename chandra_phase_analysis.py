@@ -254,6 +254,12 @@ def main() -> None:
              "precedence over both binning options.",
     )
     parser.add_argument(
+        "--keep-zero-flux",
+        action="store_true",
+        help="Keep rows whose rate/flux is exactly zero (zero-count bins) instead of "
+             "dropping them as gaps; their zero errors are replaced by the median valid error.",
+    )
+    parser.add_argument(
         "--min-points-per-bin",
         type=int,
         default=3,
@@ -339,12 +345,17 @@ def main() -> None:
     )
     print(f"Loaded {len(df)} data point(s) from {df['obs'].nunique()} observation(s).")
     
-    # Remove observations with zero or NaN flux (gaps in observations)
+    # NaN rows are always dropped; rows with exactly zero rate/flux (zero-count
+    # bins, usually zero-exposure gaps) unless --keep-zero-flux.
     n_before = len(df)
-    df = df[(df['rate'] != 0) & (df['rate'].notna())].reset_index(drop=True)
+    keep = df['rate'].notna()
+    if not args.keep_zero_flux:
+        keep &= df['rate'] != 0
+    df = df[keep].reset_index(drop=True)
     n_removed = n_before - len(df)
     if n_removed > 0:
-        print(f"Removed {n_removed} zero/NaN flux data points ({len(df)} remaining)")
+        print(f"Removed {n_removed} {'NaN' if args.keep_zero_flux else 'zero/NaN'} flux data "
+              f"points ({len(df)} remaining)")
     
     # Show which columns are present in the loaded data
     if 'error' in df.columns:

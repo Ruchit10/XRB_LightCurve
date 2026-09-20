@@ -244,6 +244,21 @@ default of 1.0. The Clark & Crowther mass-loss rate overpredicts the observed
 The light curve constrains only `M_tot`; `q_m` is exactly unidentifiable, and
 sampling `(M_X, M_RH)` lays that flat direction diagonally across both axes.
 
+**Reproducing a run** — pass `--seed N`; the walker initialisation, the
+sampler and every random subset then follow that seed.
+
+**Zero-count bins** — rows with zero flux are dropped on load by default;
+`--keep-zero-flux` (both fitters) keeps them, with their zero errors replaced
+by the median valid error.
+
+**`--replot` refuses a result directory** — directories written before the
+physical wind normalization carry no `wind_normalization` stamp and cannot be
+re-evaluated with the current model; refit them.
+
+**"no valid measurement errors"** — the χ² likelihood needs σ per point. Name
+the error column with `--obs-error-column` or add a `# Columns:` header; there
+is deliberately no `sqrt(rate)` or fixed-floor fallback.
+
 ## License
 
 Provided as-is for educational and research purposes.

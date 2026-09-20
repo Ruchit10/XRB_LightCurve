@@ -289,7 +289,7 @@ def read_observation(
        auto-detection (falling back to a ``rate_err``-derived error for
        proportional columns such as ``flux_t``), and *counts_column* when
        present.
-    2. No header: three whitespace-separated columns ``time, rate, error``.
+    2. No header: two or three whitespace-separated columns ``time, rate[, error]``.
 
     Errors in the header path (unknown observable, header/data column-count
     mismatch, no time column) are raised rather than silently falling back to
@@ -302,8 +302,15 @@ def read_observation(
     """
     header = _header_columns(file_path)
     if header is None:
-        df = pd.read_csv(file_path, sep=r"\s+", comment="#", header=None,
-                         names=["time", "rate", "error"])
+        df = pd.read_csv(file_path, sep=r"\s+", comment="#", header=None)
+        # With `names=` pandas would silently promote surplus leading columns
+        # to the index, shifting time/rate/error by one column.
+        if df.shape[1] not in (2, 3):
+            raise ValueError(
+                f"{file_path}: a headerless file must have 2 or 3 columns "
+                f"(time, rate[, error]); found {df.shape[1]}. Name the columns with a "
+                f"'# Columns: ...' header line instead.")
+        df.columns = ["time", "rate", "error"][: df.shape[1]]
         df["phase"] = frac((df["time"] - REF_EPOCH) / ORBITAL_PERIOD)
         df["obs"] = label
         return df
@@ -429,16 +436,21 @@ def load_observed_lightcurves(
     flux_column: str = "FLUX",
     error_column: Optional[str] = None,
     time_column: Optional[str] = None,
+    drop_nonpositive_flux: bool = True,
 ) -> pd.DataFrame:
     """Load every observed light-curve file for one energy band.
 
     Wraps :func:`load_data` (via :func:`resolve_band_directory`) and remaps the
     columns to the fitting convention ``flux`` / ``flux_err`` / ``obs_id``.
-    Zero and non-finite fluxes are dropped.
+    Non-finite fluxes are always dropped. Rows with ``flux <= 0`` (zero-count
+    bins, whose error is also 0) are dropped unless *drop_nonpositive_flux* is
+    False, in which case :func:`sanitize_errors` gives them the median valid
+    error.
 
     Returns
     -------
-    DataFrame with columns: time, flux, flux_err, obs_id, counts, phase
+    DataFrame with columns: time, flux, flux_err, obs_id, phase, and counts
+    when the files carry it.
     """
     band_dir = resolve_band_directory(band, data_dir)
     print(f"Loading {band} band data from: {band_dir}")
@@ -455,19 +467,29 @@ def load_observed_lightcurves(
         'time': raw['time'].astype(float),
         'flux': raw['rate'].astype(float),
         'flux_err': raw['error'].astype(float) if 'error' in raw.columns else np.nan,
-        'obs_id': raw['obs'] if 'obs' in raw.columns else 'data',
-        'counts': raw['counts'].astype(float) if 'counts' in raw.columns else np.nan,
+        'obs_id': raw['obs'],
+        'phase': raw['phase'].astype(float),
     })
-    if 'phase' in raw.columns:
-        combined['phase'] = raw['phase'].astype(float)
-    else:
-        combined['phase'] = frac((combined['time'] - REF_EPOCH) / ORBITAL_PERIOD)
+    if 'counts' in raw.columns:
+        # Only when the files carry counts: an all-NaN column would pass the
+        # presence check of the constant-counts binner.
+        combined['counts'] = raw['counts'].astype(float)
 
     n_before = len(combined)
-    valid = (combined['flux'] > 0) & np.isfinite(combined['flux']) & np.isfinite(combined['time'])
+    valid = np.isfinite(combined['flux']) & np.isfinite(combined['time'])
+    if drop_nonpositive_flux:
+        valid &= combined['flux'] > 0
     combined = combined.loc[valid].reset_index(drop=True)
     if n_before - len(combined) > 0:
-        print(f"Dropped {n_before - len(combined)} zero/non-finite flux rows before fitting")
+        what = "non-positive/non-finite" if drop_nonpositive_flux else "non-finite"
+        print(f"Dropped {n_before - len(combined)} {what} flux rows before fitting")
+    if not drop_nonpositive_flux:
+        n_zero = int(np.sum(combined['flux'] <= 0))
+        if n_zero:
+            print(f"Kept {n_zero} rows with flux <= 0 (zero-count bins); their errors are "
+                  f"repaired by sanitize_errors")
+    if 'error' in raw.columns:
+        combined['flux_err'] = sanitize_errors(combined['flux_err'], context=f"{band} band light curves: ")
 
     n_files = len(glob.glob(os.path.join(band_dir, "*.txt")))
     print(f"Loaded {len(combined)} data points from {n_files} file(s) for {band} band")
@@ -553,8 +575,9 @@ def phase_bin_data(
     bin_edges = np.linspace(0, 1, n_bins + 1)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
-    # Assign each point to a bin
-    df = df.copy()
+    # Assign each point to a bin. Rows without a finite phase or value are
+    # dropped first: np.digitize would file a NaN phase in the last bin.
+    df = df[np.isfinite(df['phase']) & np.isfinite(df[rate_column])].copy()
     df['_bin'] = np.digitize(df['phase'], bin_edges) - 1
     df['_bin'] = df['_bin'].clip(0, n_bins - 1)  # Handle edge case at phase=1
 
@@ -577,6 +600,10 @@ def phase_bin_data(
                 'n_points': len(bin_df)
             })
 
+    if not binned_data:
+        raise ValueError(
+            f"phase_bin_data: no bin reached min_points_per_bin={min_points_per_bin} "
+            f"({len(df)} finite points into {n_bins} bins); use fewer bins or no binning.")
     result = pd.DataFrame(binned_data)
 
     # Preserve observation label if present (use 'binned')
@@ -632,16 +659,19 @@ def phase_bin_data_snr(
     if rate_column not in df.columns:
         raise ValueError(f"rate column '{rate_column}' not found in DataFrame")
 
-    work = df.copy()
-    work = work[np.isfinite(work['phase']) & np.isfinite(work[rate_column])].copy()
+    work = df[np.isfinite(df['phase']) & np.isfinite(df[rate_column])].copy()
     if work.empty:
-        return pd.DataFrame(
-            columns=['phase', rate_column, error_column, 'n_points',
-                     'total_counts', 'phase_lo', 'phase_hi', 'width']
-        )
+        raise ValueError("phase_bin_data_snr: no rows with a finite phase and value to bin.")
 
-    work[counts_column] = pd.to_numeric(work[counts_column], errors='coerce').fillna(0.0)
-    work[counts_column] = np.where(work[counts_column] > 0.0, work[counts_column], 0.0)
+    # The counts must be real: a NaN or all-zero column would never reach the
+    # target and the whole light curve would silently become a single bin.
+    counts = pd.to_numeric(work[counts_column], errors='coerce').to_numpy(dtype=float)
+    if not np.all(np.isfinite(counts)) or np.any(counts < 0) or not np.any(counts > 0):
+        raise ValueError(
+            f"phase_bin_data_snr: counts column '{counts_column}' must be finite, non-negative "
+            f"and not all zero (non-finite: {int(np.sum(~np.isfinite(counts)))}, "
+            f"negative: {int(np.sum(counts < 0))}, positive: {int(np.sum(counts > 0))}).")
+    work[counts_column] = counts
     work = work.sort_values('phase').reset_index(drop=True)
 
     target = float(counts_per_bin)
@@ -676,7 +706,7 @@ def phase_bin_data_snr(
         mean_rate, mean_err = weighted_mean(rate_vals, err_vals)
 
         phase_vals = bin_df['phase'].to_numpy(dtype=float)
-        bin_counts = np.maximum(bin_df[counts_column].to_numpy(dtype=float), 0.0)
+        bin_counts = bin_df[counts_column].to_numpy(dtype=float)
         total_counts = float(np.sum(bin_counts))
         if total_counts > 0:
             phase_center = float(np.average(phase_vals, weights=bin_counts))
@@ -886,24 +916,47 @@ def interp_periodic_phases(
     return eval_periodic(*periodic_model(model_phase, model_flux), obs_phases)
 
 
+def sanitize_errors(errors, context: str = "") -> np.ndarray:
+    """Measurement errors with non-finite or non-positive entries patched.
+
+    Bad entries are replaced by the median of the valid errors and a warning
+    says how many were patched. There is deliberately no absolute floor and no
+    Poisson ``sqrt(rate)`` fallback: both depend on the units of the data (a
+    ``1e-3`` floor zero-weights a flux point of ``1e-13``, and ``sqrt`` of a
+    flux is not a count error). If no error is valid a ``ValueError`` is
+    raised: a χ² fit without measurement errors is not meaningful. This is the
+    one repair rule, applied at the load boundary
+    (:func:`load_observed_lightcurves`, ``mcmc_lightcurve_fit.load_fit_data``)
+    and by :func:`obs_errors`.
+    """
+    err = np.array(errors, dtype=float, copy=True)
+    bad = ~np.isfinite(err) | (err <= 0)
+    if bad.any():
+        valid = err[~bad]
+        if valid.size == 0:
+            raise ValueError(f"{context}no valid measurement errors (all non-finite or <= 0).")
+        fill = float(np.median(valid))
+        err[bad] = fill
+        warnings.warn(f"{context}patched {int(bad.sum())} of {err.size} non-finite/non-positive "
+                      f"errors with the median valid error {fill:.4g}.")
+    return err
+
+
 def obs_errors(
     obs_df: pd.DataFrame,
     rate_column: str = "rate",
     error_column: str = "error",
 ) -> np.ndarray:
-    """Observation uncertainties, with the χ²-safety guards applied.
+    """Observation uncertainties for the χ² fit and the residual panel.
 
-    Uses the provided errors when available, otherwise sqrt(|rate|); zero,
-    negative and non-finite values are floored so they cannot blow up χ².
-    Shared by :func:`fit_simulation` and the plotting helpers so both weight the
-    data identically.
+    Requires an error column (see :func:`sanitize_errors` for the repair
+    rule) and raises ``ValueError`` when the observations carry none.
     """
-    rate = obs_df[rate_column].to_numpy(dtype=float)
-    if error_column in obs_df.columns and not obs_df[error_column].isnull().all():
-        err = obs_df[error_column].to_numpy(dtype=float)
-    else:
-        err = np.sqrt(np.abs(rate))
-    return np.where((err <= 0) | ~np.isfinite(err), 1e-3, err)
+    if error_column not in obs_df.columns or obs_df[error_column].isnull().all():
+        raise ValueError(
+            "The observations carry no measurement errors; a chi2 fit needs them "
+            "(check --obs-error-column and the file header).")
+    return sanitize_errors(obs_df[error_column])
 
 
 # -----------------------------------------------------------------------------
@@ -1223,15 +1276,37 @@ def save_samples_csv_chunked(
 
 RUN_CONFIG_SUFFIX = "_run_config.json"
 
-# `replot` must never be restored: a saved fit recorded replot=False, so
-# restoring it would cancel the replot. `output_dir` is defined by where the
-# config was found, not by what the original run typed.
-_RUN_CONFIG_NEVER_RESTORE = frozenset({"replot", "output_dir"})
+# Options that define the *fit* are restored by --replot; options that only
+# control this invocation's output are not. `replot` itself must never be
+# restored (a saved fit recorded replot=False, which would cancel the replot)
+# and `output_dir` is defined by where the config was found. store_true flags
+# cannot be negated on the command line, so restoring no_plots/save_chi2/...
+# would make a fit run with --no-plots impossible to replot with figures.
+_RUN_CONFIG_NEVER_RESTORE = frozenset({
+    "replot", "output_dir",
+    "no_plots", "no_geometry_plots", "quiet", "smooth", "smooth_sigma",
+    "save_chi2", "chi2_n_samples", "compute_bic", "compact_output",
+    "no_csv_output", "csv_chunk_size", "n_threads", "numba_threads_per_worker",
+    "seed",
+})
+
+# Mutually exclusive option groups: typing one member on --replot must not
+# restore a saved sibling, which would trip the exclusivity check.
+_RUN_CONFIG_EXCLUSIVE_GROUPS = (
+    frozenset({"n_phase_bins", "counts_per_bin", "no_phase_bin"}),
+    frozenset({"reparam", "kepler", "kepler_mtot"}),
+)
 
 # Stamped into every new run config. i0 was formerly measured from the line of
 # sight, so a chain written before the switch stores the complement of what the
 # priors and plots now mean; --replot cannot detect that from the numbers alone.
 INCLINATION_CONVENTION = "i0-from-orbital-normal"
+
+# Stamped into every run config and chain file. Results sampled under the
+# retired `lam` normalization cannot be re-evaluated with the physical
+# Mdot / v_inf normalization: chi2, overlays and BIC would describe a different
+# model than the posterior, so --replot refuses them.
+WIND_NORMALIZATION = "physical-mdot-vinf"
 
 
 def _jsonable(value):
@@ -1263,6 +1338,7 @@ def save_run_config(output_dir: str, band: str, wind_model: str, args) -> Option
         "band": band,
         "wind_model": wind_model,
         "inclination_convention": INCLINATION_CONVENTION,
+        "wind_normalization": WIND_NORMALIZATION,
         "args": {k: _jsonable(v) for k, v in sorted(vars(args).items())},
     }
     try:
@@ -1388,6 +1464,13 @@ def apply_saved_run_config(
             f"model now expects, so any chi2 reported from this chain is "
             f"meaningless. Refit before trusting the output."
         )
+    if config.get("wind_normalization") != WIND_NORMALIZATION:
+        parser.error(
+            f"{os.path.basename(config_path)} predates the physical wind normalization "
+            f"(no 'wind_normalization: {WIND_NORMALIZATION}' stamp). Its chain was sampled "
+            f"under a different model, so --replot would report chi2, overlays and BIC for a "
+            f"model the posterior never saw. Refit instead."
+        )
 
     # dest -> the flag the user would type ('prior_M_X' is spelled '--prior-MX').
     dest_to_flag: Dict[str, str] = {}
@@ -1397,9 +1480,14 @@ def apply_saved_run_config(
             dest_to_flag[action.dest] = longs[0]
     known_dests = {a.dest for a in parser._actions}
 
+    blocked = set(_RUN_CONFIG_NEVER_RESTORE)
+    for group in _RUN_CONFIG_EXCLUSIVE_GROUPS:
+        if explicit & group:
+            blocked |= group
+
     restored: List[Tuple[str, object]] = []
     for dest, value in saved_args.items():
-        if dest in _RUN_CONFIG_NEVER_RESTORE or dest in explicit or dest not in known_dests:
+        if dest in blocked or dest in explicit or dest not in known_dests:
             continue
         # Compare in JSON space: a tuple default round-trips as a list, which is
         # not a real change and should not be reported as one.

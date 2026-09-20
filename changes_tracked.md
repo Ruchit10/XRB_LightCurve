@@ -652,6 +652,71 @@ counting constructions over 20 likelihood calls: 0), so the Phase 33 item
    figure, in the model dump and in the chi2 table is comparable with the
    tabulated fit.
 
+### Commit 3 — Replot rules, one error rule, input validation, exit codes, `--seed`
+
+Replot (`utils.apply_saved_run_config`):
+
+7. **Output-control flags are never restored.** `store_true` flags cannot be
+   negated on the command line, so a fit run with `--no-plots` could never be
+   replotted with figures and a `--save-chi2` run recomputed its table on
+   every replot. `_RUN_CONFIG_NEVER_RESTORE` now lists every output option;
+   only what defines the fit comes back.
+8. **Exclusive-group siblings are not restored** when one member is typed
+   (`--replot --n-phase-bins 30` on a `--counts-per-bin` run used to die on
+   the exclusivity check); the self-healing run config for pre-config
+   directories is written only after a successful replot, not before.
+9. **Normalization stamp.** Run configs and chain files carry
+   `wind_normalization = "physical-mdot-vinf"`; results without it (every
+   pre-Phase-34 directory, including the `lam`-mode `mcmc_results/`) are
+   refused with an explicit message. Replotting them silently evaluated the
+   MAP under a different model (`N_H` 20–50 × 10²² against the chain's 0.53).
+
+Robustness:
+
+10. `phase_bin_data_snr` validates the counts (finite, non-negative, not all
+    zero) instead of `fillna(0)`, which collapsed a light curve without
+    counts into one bin; `load_observed_lightcurves` emits `counts` only when
+    the files carry it.
+11. **One error rule.** `sanitize_errors` (median valid error for non-finite
+    or non-positive entries, warning, `ValueError` when no error is valid)
+    replaces three rules: the binners' median patch, `load_fit_data`'s
+    `max(0.1·|flux|, median)` and `obs_errors`' count-rate constants (a `1e-3`
+    absolute floor that zero-weighted a `1e-13` flux point and a `sqrt(|rate|)`
+    fallback that turned a 50 %-off model into χ²/dof = 2e-14). `obs_errors`
+    now requires an error column.
+12. The headerless reader rejects files with other than 2–3 columns; with
+    `names=` pandas silently promoted a surplus leading column to the index,
+    shifting `time/rate/error` by one.
+13. `phase_bin_data` drops NaN phases first (they landed in the last bin) and
+    raises when no bin reaches `min_points_per_bin` (the result used to lack a
+    `phase` column).
+14. The flux table keeps the *numeric* `nH_1e22` column and rejects repeated
+    `nH` rows: an object-dtype column sorted lexicographically and the
+    compiled interpolator returned NaN or wrong fluxes without a message.
+15. `_simulate_core` rejects `r ≥ R` (the eclipse test assumes the emitter
+    disk is the smaller one) and `d1 + d2 ≤ 0`.
+16. `main()` exits 1 on failure instead of printing and returning 0.
+17. `--seed` seeds the initial ball, emcee (handed the global state), zeus
+    and every random subset; two runs with the same seed give identical
+    samples.
+18. `--keep-zero-flux` (both fitters) keeps rows with zero flux on load
+    instead of dropping them as gaps. The review measured that 15 % of the
+    in-eclipse CIAO bins are genuine zero-count bins and that dropping them
+    raises the eclipse-window mean, the `f_scatter` prior centre, by 18 %; the
+    default still drops them, the flag makes the choice explicit. Kept rows
+    have zero errors, which `sanitize_errors` replaces by the median valid
+    error.
+
+Verified in `henv` (30 checks, `g3_verify`): identical samples for equal seeds
+and different ones otherwise; a `--no-plots` fit replots with figures; an
+exclusive-group override replots with the `n_obs` warning; a config or chain
+without the stamp is refused (exit 2 / 1) and the real `mcmc_results/` replot
+is refused without touching the directory; NaN/zero counts, 4-column
+headerless files, no-error data, empty binning, duplicate `nH` rows and
+`r ≥ R` all raise; an object-dtype table sorts numerically; a missing data
+directory exits 1; the tabulated fit runs on both data layouts and the tests
+pass 6/6.
+
 ---
 
 ## Side Investigation — Reference Epoch

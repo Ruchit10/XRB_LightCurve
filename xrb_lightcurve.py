@@ -532,7 +532,9 @@ def load_flux_vs_nh_csv(
     any_flux = np.zeros(len(df), dtype=bool)
     for band in bands:
         any_flux |= pd.to_numeric(df[f"flux_{band}_{flux_type}"], errors="coerce").notna().to_numpy()
-    df = df[keep.to_numpy() & any_flux]
+    # Keep the numeric column, not the raw one: a stray non-numeric token makes
+    # the whole column object dtype, which would later sort lexicographically.
+    df = df.assign(nH_1e22=nh)[keep.to_numpy() & any_flux]
     if len(df) == 0:
         raise ValueError("No valid data points in CSV after filtering")
     return df, bands
@@ -574,6 +576,10 @@ def _build_flux_context(csv_path: str, flux_type: str) -> Dict[str, object]:
             continue
         nh_csv = nh_base[valid]
         flux_csv = flux_vals[valid]
+        if np.any(np.diff(nh_csv) <= 0):
+            raise ValueError(
+                f"{csv_path}: nH values for band '{band}' must be unique (repeated rows break "
+                f"the log-log interpolation); found {int(np.sum(np.diff(nh_csv) <= 0))} repeats.")
         band_data[band] = {
             "nh": nh_csv,
             "flux": flux_csv,
@@ -717,6 +723,12 @@ def _simulate_core(
         raise ValueError(
             f"Invalid flux_method: {flux_method}. Must be 'interpolate' or 'refit'"
         )
+    if not (0.0 < r < R):
+        raise ValueError(
+            f"Need 0 < r < R (got r={r}, R={R}): the eclipse test assumes the emitter disk "
+            f"is smaller than the companion.")
+    if d1 + d2 <= 0.0:
+        raise ValueError(f"Need d1 + d2 > 0 (got d1={d1}, d2={d2}).")
 
     # Only the input convention changes here: `incl` is the internal angle from
     # the line of sight that the kernel's geometry assumes.

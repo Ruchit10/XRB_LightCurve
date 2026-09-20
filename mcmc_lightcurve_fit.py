@@ -52,6 +52,7 @@ import copy
 import multiprocessing as mp
 import os
 import re
+import sys
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -97,6 +98,7 @@ from xrb_lightcurve import (
 from utils.utils import (
     ORBITAL_PERIOD,
     RUN_CONFIG_SUFFIX,
+    WIND_NORMALIZATION,
     PhaseShiftSearch,
     apply_saved_run_config,
     best_phase_shift,
@@ -109,6 +111,7 @@ from utils.utils import (
     phase_bin_data,
     phase_bin_data_snr,
     run_config_path,
+    sanitize_errors,
     save_run_config,
     save_samples_csv_chunked,
     smooth_lightcurve,
@@ -895,6 +898,10 @@ def run_mcmc(
         else:
             sampler = emcee.EnsembleSampler(
                 n_walkers, spec.n_dim, log_prob_fn, args=args, pool=pool)
+            # emcee seeds its private RandomState from OS entropy; take the
+            # global state instead so --seed (np.random.seed in main) covers
+            # the moves as well as the initial ball. zeus uses np.random itself.
+            sampler.random_state = np.random.get_state()
             state = emcee.State(pos, log_prob=lp0)   # already evaluated above
             if progress and HAS_TQDM:
                 for _ in tqdm(sampler.sample(state, iterations=n_steps),
@@ -1447,6 +1454,7 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
         frozen_names=np.array(list(spec.frozen.keys()), dtype=str),
         frozen_values=np.array(list(spec.frozen.values()), dtype=float),
         orbital_period_s=float(spec.orbital_period_s),
+        wind_normalization=WIND_NORMALIZATION,
         n_obs=float(len(data.flux)))   # --replot compares this with the data it loads
     print(f"Full chain saved to: {path}")
 
@@ -1456,7 +1464,7 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
     stats['_run_meta'] = {
         'sampler': args.sampler, 'likelihood': spec.likelihood,
         'n_walkers': int(args.n_walkers), 'n_steps': int(args.n_steps),
-        'n_burn': int(args.n_burn), 'fit_elapsed_s': fit_elapsed,
+        'n_burn': int(args.n_burn), 'fit_elapsed_s': fit_elapsed, 'seed': args.seed,
         'fit_phase_shift': data.fit_phase_shift,
         'phase_shift_grid_size': (int(data.shift_search.shift_grid.size)
                                   if data.shift_search is not None else None),
@@ -1491,6 +1499,12 @@ def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
              'orbital_period_s': spec.orbital_period_s, 'frozen': dict(spec.frozen)}
     if os.path.exists(chain_path):
         meta = np.load(chain_path, allow_pickle=True)
+        if str(meta.get('wind_normalization', 'missing')) != WIND_NORMALIZATION:
+            print(f"Error: {chain_path} was sampled under a different wind normalization "
+                  f"(stamp: {meta.get('wind_normalization', 'missing')!s}, current: "
+                  f"{WIND_NORMALIZATION}); its posterior cannot be re-evaluated with the "
+                  f"current model. Refit instead.")
+            return None
         chain = meta['chain']
         saved['mode'] = str(meta.get('mode', saved['mode']))
         saved['likelihood'] = str(meta.get('likelihood', saved['likelihood']))
@@ -1556,7 +1570,7 @@ def write_summary(path: str, band: str, spec: ParamSpec, stats: Dict) -> None:
             f.write("Run configuration:\n")
             f.write(f"  sampler={meta.get('sampler')}, likelihood={meta.get('likelihood')}, "
                     f"walkers={meta.get('n_walkers')}, steps={meta.get('n_steps')}, "
-                    f"burn={meta.get('n_burn')}\n")
+                    f"burn={meta.get('n_burn')}, seed={meta.get('seed')}\n")
             f.write(f"  fit_phase_shift={meta.get('fit_phase_shift')}, "
                     f"phase_shift_grid={meta.get('phase_shift_grid_size')}, "
                     f"phase_shift_resolution={meta.get('phase_shift_resolution')}\n")
@@ -1682,6 +1696,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "Mutually exclusive with --n-phase-bins.")
     parser.add_argument("--no-phase-bin", action="store_true",
                         help="Fit the raw 100 s points; pair with --likelihood jitter.")
+    parser.add_argument("--keep-zero-flux", action="store_true",
+                        help="Keep rows with flux <= 0 (zero-count bins) instead of dropping them on "
+                             "load. Their zero errors are replaced by the median valid error; keeping "
+                             "them lowers the mid-eclipse mean that centres the f_scatter prior.")
 
     norm = parser.add_argument_group(
         'Wind Normalization',
@@ -1727,6 +1745,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-walkers", type=int, default=32, help="Number of walkers")
     parser.add_argument("--n-steps", type=int, default=5000, help="Number of steps")
     parser.add_argument("--n-burn", type=int, default=1000, help="Burn-in steps to discard")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed for the walker initialisation, the sampler moves and every "
+                             "random subset, so a run can be reproduced exactly")
     parser.add_argument("--no-fit-phase-shift", action="store_true",
                         help="Disable the per-sample phase-shift alignment (by default every "
                              "likelihood call minimises chi2 over a phase shift).")
@@ -1808,7 +1829,8 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
     and the data-driven f_scatter prior when requested."""
     obs_df = load_observed_lightcurves(band, args.data_dir, flux_column=args.obs_column,
                                        error_column=args.obs_error_column,
-                                       time_column=args.time_column)
+                                       time_column=args.time_column,
+                                       drop_nonpositive_flux=not args.keep_zero_flux)
     is_binned = not args.no_phase_bin
     if is_binned:
         cols = dict(rate_column='flux', error_column='flux_err')
@@ -1819,15 +1841,10 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
 
     phase = obs_df['phase'].to_numpy(dtype=float)
     flux = obs_df['flux'].to_numpy(dtype=float)
-    err = obs_df['flux_err'].to_numpy(dtype=float).copy()
+    # Binned errors are > 0 whenever the inputs were; the one repair rule
+    # covers degenerate bins and refuses data without errors altogether.
+    err = sanitize_errors(obs_df['flux_err'], context="binned light curve: ")
     width = obs_df['width'].to_numpy(dtype=float) if ('width' in obs_df.columns and is_binned) else None
-
-    invalid = ~np.isfinite(err) | (err <= 0)
-    if invalid.any():
-        valid = err[~invalid]
-        floor = float(np.median(valid)) if valid.size else float(np.finfo(float).eps)
-        err[invalid] = np.maximum(0.1 * np.abs(flux[invalid]), floor)
-        warnings.warn(f"Replaced {invalid.sum()} invalid errors with max(10% flux, median valid error)")
 
     data = FitData.build(phase, flux, err, fit_phase_shift=not args.no_fit_phase_shift,
                          shift_grid_size=args.phase_shift_grid_size,
@@ -1855,6 +1872,10 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.seed is not None:
+        # Covers initial_positions, zeus, the chi2 subsample and the wind-profile
+        # draws; run_mcmc hands the same state to emcee.
+        np.random.seed(args.seed)
 
     # Restore everything not typed explicitly before validating or deriving.
     restored_config = None
@@ -1917,15 +1938,16 @@ def main():
             return get_active_priors(s, geometry_priors, shape_prior_overrides, scatter_prior)
 
         if args.replot:
-            # Self-healing: results predating run-config saving get one written,
-            # so the next --replot needs no arguments.
-            if restored_config is None and not os.path.exists(run_config_path(args.output_dir, band, args.wind_model)):
-                save_run_config(args.output_dir, band, args.wind_model, args)
             result = replot_from_existing(band, args, spec, model, data, smoothed, priors_for)
             if result is None:
                 print(f"Could not load existing results for {band}_{args.wind_model}")
-                return
+                sys.exit(1)
             stats, spec = result
+            # Self-healing: results predating run-config saving get one written
+            # once a replot has succeeded with these options, so the next
+            # --replot needs no arguments.
+            if restored_config is None and not os.path.exists(run_config_path(args.output_dir, band, args.wind_model)):
+                save_run_config(args.output_dir, band, args.wind_model, args)
         else:
             # Written before sampling so the configuration survives a crash.
             save_run_config(args.output_dir, band, args.wind_model, args)
@@ -1934,7 +1956,7 @@ def main():
         print(f"ERROR {'replotting' if args.replot else 'fitting'} {band} band ({args.wind_model}): {e}")
         import traceback
         traceback.print_exc()
-        return
+        sys.exit(1)
 
     write_summary(os.path.join(args.output_dir, "mcmc_summary.txt"), band, spec, stats)
     print("\nReplotting complete!" if args.replot else "\nMCMC fitting complete!")
