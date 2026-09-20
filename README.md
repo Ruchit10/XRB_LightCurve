@@ -1,7 +1,8 @@
-# XRB Lightcurve — wind-absorption modelling for eclipsing X-ray binaries
+# CLOAK — Column-density and Line-of-sight Occultation & Absorption Kernel
 
 Forward model and inference stack for the X-ray light curve of an eclipsing
-high-mass X-ray binary, developed for **IC 10 X-1**. The compact object orbits
+high-mass X-ray binary, developed for **IC 10 X-1** and released as the
+`cloak` Python package. The compact object orbits
 inside the companion's stellar wind; the observed modulation is the combination
 of a geometric eclipse and phase-dependent photoelectric absorption in that
 wind.
@@ -81,6 +82,11 @@ integrator and the only path that produces the per-cell columns the flux
 conversion needs. `emcee` is required for MCMC; `zeus`, `arviz`, `corner` and
 `tqdm` are optional.
 
+Run every tool from the repository root as a module, `python -m cloak.<module>`
+(`python cloak/<module>.py` works too); the examples below use that form. The
+test suite is `python -m unittest discover -s tests` and needs only the tracked
+example flux table.
+
 ---
 
 ## Pipeline
@@ -91,7 +97,7 @@ Light curves are generated from column densities, so an XSPEC-derived
 `flux vs nH` table is required first:
 
 ```bash
-python compute_flux_vs_nH.py \
+python -m cloak.flux_table \
     --specdir spectra/ic10x1 --band broad \
     --out_csv flux_vs_nH_broad.csv \
     --out_png flux_vs_nH_broad.png \
@@ -106,7 +112,7 @@ simulator then needs `--band` / `band=` to pick one.)
 ### 2. Generate a model light curve
 
 ```bash
-python xrb_lightcurve.py \
+python -m cloak.kernel \
     --flux_csv flux_vs_nH_broad.csv \
     --wind-model smooth_pl \
     --R 2.0 --r 0.001 --d1 11.0 --d2 8.0 --i0 78.0 \
@@ -122,7 +128,7 @@ From Python, `simulate_lightcurve(...)` returns the per-phase DataFrame and
 Single-model χ² fit against observed data:
 
 ```bash
-python chandra_phase_analysis.py \
+python -m cloak.phase_analysis \
     --data-dir lightcurves/broad/ --obs-column flux_t --time-column t_raw \
     --counts-per-bin 100 --sim-file sim_broad.csv \
     --fit --fit-phase-shift --output fit_broad.png --write-model
@@ -131,7 +137,7 @@ python chandra_phase_analysis.py \
 Full posterior via MCMC:
 
 ```bash
-python mcmc_lightcurve_fit.py \
+python -m cloak.mcmc_fit \
     --band broad --flux-csv flux_vs_nH_broad.csv \
     --data-dir lightcurves/broad/ \
     --obs-column flux_t --time-column t_raw --n-phase-bins 150 \
@@ -141,7 +147,7 @@ python mcmc_lightcurve_fit.py \
 ```
 
 `lightcurves/broad/` stands for a directory of light-curve files (real CIAO
-products, or the output of `synthetic_data/make_lightcurve.py`); the
+products, or the output of `cloak/synthetic/lightcurve.py`); the
 repository ships synthetic data only. See `python <script>.py --help` for
 every option.
 
@@ -165,7 +171,7 @@ combinations are rejected up front with a message naming the flags.
 
 ---
 
-## `xrb_lightcurve.py` parameters
+## `cloak/kernel.py` parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -177,7 +183,7 @@ combinations are rejected up front with a message naming the flags.
 | `--i0` | 64.0 | Inclination from the orbital-plane normal (90 = edge-on, 0 = face-on) |
 | `--dth` | 1.0 | Orbital increment (degrees) |
 | `--d2h` | 6.0 | Angular cell size of the polar grid (degrees) |
-| `--flux_csv` | *required* | Flux vs nH CSV from `compute_flux_vs_nH.py` |
+| `--flux_csv` | *required* | Flux vs nH CSV from `cloak/flux_table.py` |
 | `--band` | *auto* | Band to simulate; only needed if the CSV holds more than one |
 | `--flux_method` | `interpolate` | `interpolate` or `refit` (see below) |
 | `--flux_type` | `erg` | `erg` (erg/cm²/s) or `ph` (photons/cm²/s) |
@@ -227,13 +233,15 @@ flux conversion averaged over the disk (**not** the conversion of `fl`).
 
 | Path | Role |
 |------|------|
-| `xrb_lightcurve.py` | Forward model — generates model light curves |
-| `compute_flux_vs_nH.py` | XSPEC flux vs nH table (upstream of the model) |
-| `mcmc_lightcurve_fit.py` | Full MCMC posterior inference |
-| `chandra_phase_analysis.py` | Single-model χ² fit, CLI front end |
-| `plot_results.py` | Standalone plots from a simulation CSV |
-| `utils/utils.py` | Data loading, phase binning, smoothing, χ² fit |
-| `utils/plot_utils.py` | All plotting routines, shared by both fit scripts |
+| `cloak/kernel.py` | Forward model — generates model light curves |
+| `cloak/flux_table.py` | XSPEC flux vs nH table (upstream of the model) |
+| `cloak/mcmc_fit.py` | Full MCMC posterior inference |
+| `cloak/phase_analysis.py` | Single-model χ² fit, CLI front end |
+| `cloak/plot_results.py` | Standalone plots from a simulation CSV |
+| `cloak/utils.py` | Data loading, phase binning, smoothing, χ² fit |
+| `cloak/plots.py` | All plotting routines, shared by both fit scripts |
+| `cloak/synthetic/` | Generators: fake spectrum (PyXspec `fakeit`) and CIAO-layout synthetic light curves with a truth record |
+| `tests/` | `test_flux_methods.py`, `test_pipeline.py` |
 | `synthetic_data/` | Synthetic spectrum (PyXspec `fakeit`) and CIAO-layout light curves with a truth record, for injection–recovery tests; also holds the tracked example flux table and generated synthetic products |
 | `changes_tracked.md` | Development history |
 

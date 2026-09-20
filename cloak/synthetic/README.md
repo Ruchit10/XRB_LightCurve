@@ -1,30 +1,32 @@
 # Synthetic data
 
 Generators for injection–recovery tests. Everything they write is read by the
-existing pipeline unchanged, and the energy bands are `utils.utils.CHANDRA_BANDS`,
-the same edges `compute_flux_vs_nH.py` and the fitters use.
+existing pipeline unchanged, and the energy bands are `cloak.utils.CHANDRA_BANDS`,
+the same edges `cloak/flux_table.py` and the fitters use.
 
 ```
-make_spectrum.py  ──fakeit──▶  fake PHA  ──compute_flux_vs_nH.py──▶  flux vs nH table
+cloak/synthetic/spectrum.py  ──fakeit──▶  fake PHA  ──cloak/flux_table.py──▶  flux vs nH table
                                    │                                        │
                                    └── band_factors.json (flux per rate) ──┐│
                                                                            ▼▼
-make_lightcurve.py ──forward model + Poisson──▶  CIAO-layout light curve + *_truth.json
+cloak/synthetic/lightcurve.py ──forward model + Poisson──▶  CIAO-layout light curve + *_truth.json
                                                                            │
-                                            chandra_phase_analysis.py / mcmc_lightcurve_fit.py
+                                            cloak/phase_analysis.py / cloak/mcmc_fit.py
 ```
 
 ## 1. Spectrum (needs PyXspec)
 
 ```bash
-python synthetic_data/make_spectrum.py --out-dir synthetic_data/out/spec \
+python -m cloak.synthetic.spectrum --out-dir synthetic_data/spec \
+    --rmf acis.rmf --arf acis.arf \
     --model tbabs --nH 0.75 --PhoIndex 1.86 --norm 1e-4 --exposure 100000 --seed 1
-python compute_flux_vs_nH.py --specdir synthetic_data/out/spec --band broad \
-    --out_csv synthetic_data/out/flux_vs_nH_broad.csv --out_png synthetic_data/out/flux_vs_nH_broad.png
+python -m cloak.flux_table --specdir synthetic_data/spec --band broad \
+    --out_csv synthetic_data/flux_vs_nH_broad.csv --out_png synthetic_data/flux_vs_nH_broad.png
 ```
 
-`make_spectrum.py` fakes an absorbed power law through the IC 10 X-1 combined
-ACIS response (override with `--rmf/--arf`, optional `--bkg`), copies the RMF
+`cloak/synthetic/spectrum.py` fakes an absorbed power law through the response pair given
+with `--rmf/--arf` (the IC 10 X-1 work used Chandra's combined ACIS-S response,
+which is not distributed; optional `--bkg`), copies the RMF
 and ARF next to the fake PHA so the output directory is self-contained, and
 prints, per band, the model flux, the fake count rate and their ratio. That
 ratio is the `--flux-per-rate` the light-curve generator needs. Without HEASoft, use an
@@ -35,13 +37,13 @@ ObsID 15803; other observations span 0.85–1.49e-11).
 ## 2. Light curve
 
 ```bash
-python synthetic_data/make_lightcurve.py --flux-csv synthetic_data/out/flux_vs_nH_broad.csv \
+python -m cloak.synthetic.lightcurve --flux-csv synthetic_data/flux_vs_nH_broad.csv \
     --band broad --R 2 --r 0.001 --d1 11 --d2 8 --i0 78 --f-opacity 0.02 \
     --phase-shift 0.985 --scatter 3e-13 --n-orbits 2 --gap-fraction 0.1 --seed 1 \
-    --output synthetic_data/out/broad/synth_broad.txt
+    --output synthetic_data/broad/synth_broad.txt
 ```
 
-All forward-model keywords of `xrb_lightcurve.py` are accepted with the same
+All forward-model keywords of `cloak/kernel.py` are accepted with the same
 defaults (spelled with hyphens here: `--flux-csv`, `--flux-method`,
 `--flux-type`). The model flux at each bin is shifted by `--phase-shift`
 (mid-eclipse lands at data phase `0.5 + shift`), lifted by `--scatter`,
@@ -59,16 +61,16 @@ with `--keep-zero-flux`. The truth file records every injected value plus
 ## 3. Recover
 
 ```bash
-python xrb_lightcurve.py --flux_csv synthetic_data/out/flux_vs_nH_broad.csv --band broad \
-    --R 2 --r 0.001 --d1 11 --d2 8 --i0 78 --f-opacity 0.02 --output synthetic_data/out/model_broad.csv
-python chandra_phase_analysis.py --data-dir synthetic_data/out/broad --obs-column flux_t \
+python -m cloak.kernel --flux_csv synthetic_data/flux_vs_nH_broad.csv --band broad \
+    --R 2 --r 0.001 --d1 11 --d2 8 --i0 78 --f-opacity 0.02 --output synthetic_data/model_broad.csv
+python -m cloak.phase_analysis --data-dir synthetic_data/broad --obs-column flux_t \
     --time-column t_raw --counts-per-bin 100 --keep-zero-flux --fit \
-    --sim-file synthetic_data/out/model_broad.csv --sim-column nfl_broad --fit-phase-shift --scatter 3e-13
+    --sim-file synthetic_data/model_broad.csv --sim-column nfl_broad --fit-phase-shift --scatter 3e-13
 
-python mcmc_lightcurve_fit.py --band broad --flux-csv synthetic_data/out/flux_vs_nH_broad.csv \
-    --data-dir synthetic_data/out/broad --obs-column flux_t --time-column t_raw \
+python -m cloak.mcmc_fit --band broad --flux-csv synthetic_data/flux_vs_nH_broad.csv \
+    --data-dir synthetic_data/broad --obs-column flux_t --time-column t_raw \
     --n-phase-bins 150 --keep-zero-flux --reparam --fit-wind-shape --fit-fopacity \
-    --likelihood jitter --seed 1 --compute-bic --output-dir synthetic_data/out/mcmc_broad
+    --likelihood jitter --seed 1 --compute-bic --output-dir synthetic_data/mcmc_broad
 ```
 
 Pass the injected floor as `--scatter`: the tabulated fitter's default

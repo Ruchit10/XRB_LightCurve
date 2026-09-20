@@ -5,21 +5,21 @@ Generate a fake absorbed power-law spectrum with PyXspec ``fakeit``.
 The fake PHA (plus a fake background when one is given) is written to
 ``--out-dir`` together with copies of the RMF and ARF, so the fake spectrum's
 header (RESPFILE/ANCRFILE, relative names) resolves from that directory and
-``compute_flux_vs_nH.py --specdir <out-dir>`` builds the ``flux vs nH`` table
+``cloak/flux_table.py --specdir <out-dir>`` builds the ``flux vs nH`` table
 from it exactly as from a real spectrum. The script also
 reports, for every Chandra band, the model flux, the fake count rate and their
-ratio -- the flux-per-count-rate factor that ``make_lightcurve.py`` needs
+ratio -- the flux-per-count-rate factor that ``cloak/synthetic/lightcurve.py`` needs
 (``--flux-per-rate``) -- and writes them to ``<out-dir>/band_factors.json``.
 
 Requires PyXspec (HEASoft) and a response pair (RMF + ARF) of the instrument
 to simulate; the responses are not distributed with the code.
 
 Example:
-  python synthetic_data/make_spectrum.py --out-dir synthetic_data/spec \\
+  python -m cloak.synthetic.spectrum --out-dir synthetic_data/spec \\
       --rmf acis.rmf --arf acis.arf \\
       --model tbabs --nH 0.75 --PhoIndex 1.86 --norm 1e-4 --exposure 100000 --seed 1
-  python compute_flux_vs_nH.py --specdir synthetic_data/out/spec --band broad \\
-      --out_csv synthetic_data/out/flux_vs_nH_broad.csv
+  python -m cloak.flux_table --specdir synthetic_data/spec --band broad \\
+      --out_csv synthetic_data/flux_vs_nH_broad.csv
 """
 from __future__ import annotations
 
@@ -29,9 +29,11 @@ import os
 import shutil
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if __package__ in (None, ""):   # run as a plain script: python cloak/synthetic/spectrum.py
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 
-from utils.utils import CHANDRA_BANDS  # noqa: E402
+from cloak.utils import CHANDRA_BANDS  # noqa: E402
 
 # PyXspec is imported in main(), after argument parsing, so --help works without HEASoft.
 AllData = AllModels = FakeitSettings = Model = Xset = None
@@ -92,7 +94,7 @@ def main() -> None:
         if not os.path.exists(path):
             parser.error(f"file not found: {path}")
     if any(key in args.name.lower() for key in ("bkg", "background")):
-        parser.error("--name must not contain 'bkg' or 'background': compute_flux_vs_nH.py identifies "
+        parser.error("--name must not contain 'bkg' or 'background': cloak/flux_table.py identifies "
                      "the background spectrum by those words in the file name.")
     if args.exposure <= 0 or args.norm <= 0 or args.nH < 0:
         parser.error("--exposure and --norm must be > 0 and --nH >= 0")
@@ -151,7 +153,7 @@ def main() -> None:
     for name, f in factors.items():
         print(f"{name:8s} {f['flux_erg']:18.4e} {f['rate_cts_s']:14.5f} {f['flux_per_rate']:16.4e}")
     print(f"Factors saved to {os.path.join(args.out_dir, 'band_factors.json')}")
-    print(f"Next: python compute_flux_vs_nH.py --specdir {args.out_dir} --band <band> --out_csv <table.csv>")
+    print(f"Next: python -m cloak.flux_table --specdir {args.out_dir} --band <band> --out_csv <table.csv>")
 
 
 if __name__ == "__main__":

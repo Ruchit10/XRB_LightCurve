@@ -1,7 +1,8 @@
-# IC 10 X-1 Wind Absorption Light-Curve Project
+# CLOAK — Column-density and Line-of-sight Occultation & Absorption Kernel
 
 Current-state reference for the simulation / fitting / inference stack in this
-repository. Historical evolution (including code that has since been removed)
+repository (the `cloak` package), developed on the eclipsing wind-fed X-ray
+binary IC 10 X-1. Historical evolution (including code that has since been removed)
 lives in [changes_tracked.md](changes_tracked.md).
 
 ---
@@ -10,9 +11,9 @@ lives in [changes_tracked.md](changes_tracked.md).
 
 1. [Science goal](#science-goal)
 2. [Architecture at a glance](#architecture-at-a-glance)
-3. [`xrb_lightcurve.py` — forward model](#xrb_lightcurvepy--forward-model)
-4. [`utils/` + `chandra_phase_analysis.py` — data, folding, binning, smoothing](#utils--chandra_phase_analysispy--data-folding-binning-smoothing)
-5. [`mcmc_lightcurve_fit.py` — Bayesian inference](#mcmc_lightcurve_fitpy--bayesian-inference)
+3. [`cloak/kernel.py` — forward model](#cloakkernelpy--forward-model)
+4. [`cloak/utils.py` + `cloak/phase_analysis.py` — data, folding, binning, smoothing](#cloakutilspy--cloakphase_analysispy--data-folding-binning-smoothing)
+5. [`cloak/mcmc_fit.py` — Bayesian inference](#cloakmcmc_fitpy--bayesian-inference)
 6. [Spectral / XSPEC side](#spectral--xspec-side)
 7. [Data layout](#data-layout)
 8. [Outputs](#outputs)
@@ -58,25 +59,25 @@ occulted (`min l ≈ 3.9 R☉ > R + r`): the dip is wind absorption.
 ## Architecture at a glance
 
 ```
-compute_flux_vs_nH.py  ──►  flux_vs_nH_*.csv        (XSPEC: nH → band flux)
+cloak/flux_table.py  ──►  flux_vs_nH_*.csv        (XSPEC: nH → band flux)
                                     │
-FITS light curves ──► utils/  ──►  data/…/*.txt      (time, counts, rate, flux_t)
+CIAO light curves (or cloak/synthetic/lightcurve.py) ──► lightcurves/*.txt  (time, counts, rate, flux_t[, exposure])
                                     │                        │
                                     ▼                        ▼
-                            xrb_lightcurve.py     chandra_phase_analysis.py
+                            cloak/kernel.py     cloak/phase_analysis.py
                           (geometry + wind LOS      (CLI front end: single-model
                            → nfl_{band} per phase)    χ² fit of a model CSV)
                                     │                        │
                                     └────────┬───────────────┘
                                              ▼
-                                  mcmc_lightcurve_fit.py
+                                  cloak/mcmc_fit.py
                                 (emcee/zeus posterior over
                                  geometry + wind shape + nuisance)
 
                     both analysis scripts sit on top of:
-        utils/utils.py       ephemeris, loading, binning, smoothing,
+        cloak/utils.py       ephemeris, loading, binning, smoothing,
                              periodic model interpolation, fit_simulation
-        utils/plot_utils.py  plot_lightcurve_fit  ← the one drawing routine
+        cloak/plots.py  plot_lightcurve_fit  ← the one drawing routine
                              (+ plot_phase / plot_corner / plot_trace /
                               add_residual_panel / plot_orbit_geometry /
                               plot_geometry_vs_phase / plot_wind_profile /
@@ -88,9 +89,9 @@ band, each simulation yields one `nfl_{band}` column, and each MCMC run fits one
 band with one wind model.
 
 Neither analysis script imports the other. Everything they share lives in
-`utils/`:
+the two library modules of the package:
 
-* **`utils/utils.py`** — ephemeris (`REF_EPOCH`, `ORBITAL_PERIOD`, `frac`),
+* **`cloak/utils.py`** — ephemeris (`REF_EPOCH`, `ORBITAL_PERIOD`, `frac`),
   observation reading (`read_observation`, `load_data`,
   `resolve_band_directory`, `load_observed_lightcurves`), both binners
   (`phase_bin_data`, `phase_bin_data_snr` — their value columns keep the
@@ -104,21 +105,21 @@ Neither analysis script imports the other. Everything they share lives in
   `best_phase_shift`), `save_samples_csv_chunked`, and CLI run-config
   persistence (`save_run_config`, `apply_saved_run_config`). Standard library
   plus numpy / pandas only.
-* **`utils/plot_utils.py`** — `plot_lightcurve_fit` is the **single** light-curve
+* **`cloak/plots.py`** — `plot_lightcurve_fit` is the **single** light-curve
   drawing routine (the one that used to be inlined in
-  `mcmc_lightcurve_fit.plot_best_fit`). Callers evaluate their own model and hand
+  `cloak.mcmc_fit.plot_best_fit`). Callers evaluate their own model and hand
   it arrays: `plot_best_fit` resolves the posterior point estimate and the
   per-sample phase shift; `plot_phase` interpolates a simulation CSV. Because
   both routes end in one function, the data, overlay, smoothed curve, residual
   panel and title χ²/dof cannot drift apart. It also holds the geometry figures
   (`plot_orbit_geometry`, `plot_geometry_vs_phase`, `plot_wind_profile`) and the
-  per-band simulation grid (`plot_simulation_bands`), which `plot_results.py`
-  and `mcmc_lightcurve_fit.py` both drive.
+  per-band simulation grid (`plot_simulation_bands`), which `cloak/plot_results.py`
+  and `cloak/mcmc_fit.py` both drive.
 
-`chandra_phase_analysis.py` is now only the CLI (≈460 lines, down from ~1640)
-and re-exports every moved name, so `from chandra_phase_analysis import *` — the
+`cloak/phase_analysis.py` is now only the CLI (≈460 lines, down from ~1640)
+and re-exports every moved name, so `from cloak.phase_analysis import *` — the
 notebooks' import style — is unchanged. It deliberately does **not** import
-`xrb_lightcurve.py`: it consumes a model CSV, keeping the data layer decoupled
+`cloak/kernel.py`: it consumes a model CSV, keeping the data layer decoupled
 from the simulator.
 
 Plot titles carry only the **energy band** and **χ²/dof**. Best-fit parameter
@@ -127,7 +128,7 @@ annotated inside the axes.
 
 ---
 
-## `xrb_lightcurve.py` — forward model
+## `cloak/kernel.py` — forward model
 
 Pure simulator: binary geometry → per-phase wind column → band flux. No data,
 no fitting.
@@ -265,7 +266,7 @@ simulate_band_flux(**kwargs)              -> (phase, flux)   # likelihood fast p
 ```
 
 Both entry points forward their keywords to `_simulate_core`, whose keyword-only
-signature is the single definition of the defaults: the `xrb_lightcurve.py`
+signature is the single definition of the defaults: the `cloak/kernel.py`
 CLI, the MCMC's `DirectLightCurveModel.sim_kwargs` and its argparse defaults
 all read `SIM_DEFAULTS` (and the wind-shape CLI defaults come from
 `default_wind_params`). A misspelled keyword raises `TypeError` — until Phase
@@ -275,7 +276,7 @@ and silently ran the default for an unknown key.
 `band` may be omitted when the flux table holds a single band; with a
 multi-band table it is required. Both entry points share `_simulate_core`, so
 the likelihood sees exactly the curve the DataFrame reports
-(`utils/test_flux_methods.py` asserts this).
+(`tests/tests/test_flux_methods.py` asserts this).
 
 **Inclination convention.** `i0` is the standard astronomical inclination:
 degrees from the orbital-plane normal, so `i0 = 90°` is edge-on (eclipses
@@ -370,12 +371,12 @@ Clark & Crowther (2004) Ṁ overpredicts the observed `N_H` for IC 10 X-1 by
 
 ---
 
-## `utils/` + `chandra_phase_analysis.py` — data, folding, binning, smoothing
+## `cloak/utils.py` + `cloak/phase_analysis.py` — data, folding, binning, smoothing
 
-The shared analysis layer (`utils/utils.py`), the shared plotting layer
-(`utils/plot_utils.py`), and the single-model (non-MCMC) CLI that drives them
-(`chandra_phase_analysis.py`). Every name below is importable either from its
-`utils` module or, unchanged, from `chandra_phase_analysis` (which re-exports
+The shared analysis layer (`cloak/utils.py`), the shared plotting layer
+(`cloak/plots.py`), and the single-model (non-MCMC) CLI that drives them
+(`cloak/phase_analysis.py`). Every name below is importable either from its
+`cloak.utils` module or, unchanged, from `cloak.phase_analysis` (which re-exports
 them for the notebooks).
 
 ### Ephemeris
@@ -491,7 +492,7 @@ Shared by both the single-model and MCMC plot paths:
   and the XSPEC flux-vs-nH table, so a free y-scale would silently absorb an error in that
   normalization instead of exposing it; the only y-direction freedom is the
   *additive* `scatter` floor, supplied by the caller (measured at mid-eclipse)
-  rather than fitted. This matches `mcmc_lightcurve_fit.py`, which likewise
+  rather than fitted. This matches `cloak/mcmc_fit.py`, which likewise
   fits a per-sample phase shift and an additive `f_scatter` but no scale.
   With `--fit-phase-shift` the shift comes from the shared `best_phase_shift`
   search (see *Per-sample phase-shift alignment* below); otherwise it is held
@@ -519,8 +520,8 @@ Shared by both the single-model and MCMC plot paths:
   fallback, both of which depend on the units of the data and zero-weighted or
   "perfectly fitted" flux points), so the fit and the residuals weight points
   identically.
-- **`plot_lightcurve_fit(...)`** (`utils/plot_utils.py`) — **the one light-curve
-  drawing routine**, shared with `mcmc_lightcurve_fit.plot_best_fit`. It draws
+- **`plot_lightcurve_fit(...)`** (`cloak/plots.py`) — **the one light-curve
+  drawing routine**, shared with `cloak.mcmc_fit.plot_best_fit`. It draws
   only what it is handed (observed arrays, an already-shifted overlay curve, the
   model at the observed phases), which is what lets the MCMC path and the
   tabulated-simulation path share it. Observations get error bars when binned
@@ -542,7 +543,7 @@ Shared by both the single-model and MCMC plot paths:
 
 ---
 
-## `mcmc_lightcurve_fit.py` — Bayesian inference
+## `cloak/mcmc_fit.py` — Bayesian inference
 
 Wraps the forward model in an emcee/zeus posterior sampler with configurable
 parameterization, frozen parameters, wind-shape fitting, nuisance terms, and
@@ -679,8 +680,8 @@ merges geometry + jitter + shape + scatter priors and drops frozen entries.
 Unfitted, unfrozen wind-shape parameters take the **simulator defaults**
 (`default_wind_params`, which also ties `R_star` to `R`), never prior means:
 freezing one shape parameter therefore leaves the others unchanged, and
-`xrb_lightcurve.py` with the same `--freeze` values reproduces the fitted
-curve exactly. The registries are checked against `xrb_lightcurve` at import
+`cloak/kernel.py` with the same `--freeze` values reproduces the fitted
+curve exactly. The registries are checked against `cloak.kernel` at import
 (`WIND_MODELS` keys = `WIND_MODEL_IDS`, `WIND_SHAPE_FIT` ⊆
 `WIND_MODEL_PARAM_KEYS`).
 
@@ -735,7 +736,7 @@ intended workflow is a full-orbit fit first, then half-orbit fits with its shift
 frozen. The split should sit at the fitted mid-eclipse phase (≈ 0.485 for the
 current ephemeris), and the `f_scatter` prior window must overlap the data
 window. Both options are fit-defining and are restored by `--replot`.
-`chandra_phase_analysis.py` has the same two options for the tabulated fit.
+`cloak/phase_analysis.py` has the same two options for the tabulated fit.
 
 ### Samplers and parallelism
 
@@ -815,7 +816,7 @@ error column proceed on `std/√n` bin errors with a warning.
 
 ### Argument validation
 
-`validate_args` (and `_validate_args` in `chandra_phase_analysis.py`) rejects
+`validate_args` (and `_validate_args` in `cloak/phase_analysis.py`) rejects
 argument combinations that contradict each other or have no effect, using
 `utils.explicit_cli_dests` to tell options the user typed from defaults and
 values restored by `--replot`. The rules, all `parser.error` (exit 2):
@@ -902,7 +903,7 @@ values restored by `--replot`. The rules, all `parser.error` (exit 2):
 ### Plots
 
 `plot_corner`, `plot_trace` and the drawing behind `plot_best_fit` live in
-`utils/plot_utils.py`; `plot_geometry_diagnostics` in `mcmc_lightcurve_fit.py`.
+`cloak/plots.py`; `plot_geometry_diagnostics` in `cloak/mcmc_fit.py`.
 
 - `plot_corner` — posterior corner plot with 16/50/84 quantiles.
 - `plot_trace` — per-parameter walker traces with the burn-in marker.
@@ -929,7 +930,7 @@ values restored by `--replot`. The rules, all `parser.error` (exit 2):
     inside `min l3` is unconstrained by the data. Shape parameters are only
     interpretable jointly (`Rb` and `p` trade off strongly), so the constraint
     reads far more clearly here than in a corner plot.
-- `plot_best_fit` (in `mcmc_lightcurve_fit.py`) — resolves the point estimate
+- `plot_best_fit` (in `cloak/mcmc_fit.py`) — resolves the point estimate
   (MAP when available, else per-parameter medians), evaluates the model through
   `model_curve` (the same entry point the likelihood uses, so geometry mode,
   wind shape, frozen values and the additive `f_scatter` are resolved once),
@@ -954,7 +955,7 @@ samples CSV (an unstamped legacy result) is refused. Result directories written
 before Phase 34 carry no stamp and are refused (see below).
 
 **Every option not given explicitly is restored from `*_run_config.json`**, so
-`python mcmc_lightcurve_fit.py --replot` on its own reproduces the original
+`python -m cloak.mcmc_fit --replot` on its own reproduces the original
 band, wind model, `--flux-csv`, `--data-dir`, `--obs-column`/`--time-column`,
 binning, `--dth`/`--d2h`, the wind normalization, priors and model flags. This matters because
 those options change the *observed arrays*: replotting with different binning
@@ -1000,7 +1001,7 @@ Three rules keep the restore honest (`utils.apply_saved_run_config`):
 
 ## Spectral / XSPEC side
 
-**`compute_flux_vs_nH.py`** is the key upstream product. It loads a spectrum
+**`cloak/flux_table.py`** is the key upstream product. It loads a spectrum
 (PHA + background + responses) from `--specdir`, fits
 `{phabs,tbabs,wabs}×powerlaw` over `--fit_emin/--fit_emax`, freezes the
 powerlaw, then sweeps `nH` over a log grid and integrates the flux of **one**
@@ -1057,14 +1058,14 @@ The loaders accept three file layouts, all whitespace-delimited `*.txt`:
 | Layout | Columns | Notes |
 | ------ | ------- | ----- |
 | CIAO (real light curves) | `# Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t` | `flux_t = rate × c`; no `flux_t_err` (derived from `rate_err`); exposure recovered as `counts / rate`; a zero-count row cannot be told from a GTI gap. |
-| Synthetic | CIAO columns + `exposure` | Written by `synthetic_data/make_lightcurve.py`; zero-count rows are known to be observed. |
+| Synthetic | CIAO columns + `exposure` | Written by `cloak/synthetic/lightcurve.py`; zero-count rows are known to be observed. |
 | Legacy | `TIME COUNTS COUNT_RATE COUNT_RATE_ERR EXPOSURE NET_COUNTS NET_RATE ERR_RATE FLUX FLUX_ERR` | `EXPOSURE` used directly; `EXPOSURE = 0` rows dropped as unobserved. |
 | Headerless | `time rate [error]` | Seconds since MJDREF; no counts, so inverse-variance bins. |
 
 `--data-dir` takes a directory of such files or a parent with `{band}/`,
 `{band}/single/` or `{Band}_with_flux/` sub-folders. Phase is always
 recomputed from the time column with `REF_EPOCH` / `ORBITAL_PERIOD`
-(IC 10 X-1 ephemeris; change the constants in `utils/utils.py` for another
+(IC 10 X-1 ephemeris; change the constants in `cloak/utils.py` for another
 system). The one-off scripts that produced the legacy layout from CIAO FITS
 products (`convert_fits_to_txt.py`, `add_flux_simple.py`,
 `get_average_count_rates.py`) and the author's command log
@@ -1075,17 +1076,17 @@ products (`convert_fits_to_txt.py`, `add_flux_simple.py`,
 ## Synthetic data (`synthetic_data/`)
 
 Generators for injection–recovery tests; everything they write is read by the
-pipeline unchanged and the bands are `utils.utils.CHANDRA_BANDS`.
+pipeline unchanged and the bands are `cloak.utils.CHANDRA_BANDS`.
 
-- **`make_spectrum.py`** (PyXspec) fakes an absorbed power law through the IC 10
+- **`cloak/synthetic/spectrum.py`** (PyXspec) fakes an absorbed power law through the IC 10
   X-1 combined ACIS response with `AllData.fakeit` (`--nH`, `--PhoIndex`,
   `--norm`, `--exposure`, optional real background, `--seed` via `Xset.seed`)
   into `--out-dir`, which then serves as `--specdir` for
-  `compute_flux_vs_nH.py`. It also reports, per band, the model flux
+  `cloak/flux_table.py`. It also reports, per band, the model flux
   (`AllModels.calcFlux`), the fake net count rate and their ratio, the
   flux-per-count-rate factor written to `band_factors.json`.
-- **`make_lightcurve.py`** evaluates the forward model at known parameters
-  (every `xrb_lightcurve.py` keyword, same defaults), shifts it by
+- **`cloak/synthetic/lightcurve.py`** evaluates the forward model at known parameters
+  (every `cloak/kernel.py` keyword, same defaults), shifts it by
   `--phase-shift` (mid-eclipse lands at data phase `0.5 + shift`), adds
   `--scatter`, converts flux to expected counts per `--dt` bin with
   `--flux-per-rate` (default `1.13e-11`, the real broad-band `flux_t/rate`),
@@ -1135,26 +1136,26 @@ Per `(band, wind_model)` in `--output-dir`, prefixed `{band}_{wind_model}_`:
 
 ```bash
 # 1. Build the XSPEC flux-vs-nH table, one band per file (needs XSPEC / henv)
-python compute_flux_vs_nH.py --specdir spectra/ic10x1 --model tbabs \
+python -m cloak.flux_table --specdir spectra/ic10x1 --model tbabs \
     --band broad \
     --out_csv flux_vs_nH_tbabs_broad.csv --out_png flux_vs_nH_tbabs_broad.png \
     --nH_min 1e20 --nH_max 1e24 --nH_points 60
 
 # 2. Generate a single simulated light curve
-python xrb_lightcurve.py --flux_method interpolate \
+python -m cloak.kernel --flux_method interpolate \
     --flux_csv flux_vs_nH_tbabs_broad.csv \
     --wind-model smooth_pl --Rb 5 --p 4 --Delta 2 \
     --i0 78.0 --f-opacity 0.02 --output sim_broad.csv
 
 # 3. Fold the data and χ²-fit that one model (phase shift free; flux never rescaled)
-python chandra_phase_analysis.py \
+python -m cloak.phase_analysis \
     --data-dir lightcurves/broad \
     --obs-column flux_t --time-column t_raw \
     --fit --sim-file sim_broad.csv --fit-phase-shift \
     --smooth --n-phase-bins 100 --output fit_broad.png
 
 # 4. MCMC — geometry only, adaptive constant-SNR bins
-python mcmc_lightcurve_fit.py --band broad \
+python -m cloak.mcmc_fit --band broad \
     --flux-csv flux_vs_nH_tbabs_broad.csv \
     --data-dir lightcurves \
     --obs-column flux_t --time-column t_raw \
@@ -1164,7 +1165,7 @@ python mcmc_lightcurve_fit.py --band broad \
     --compute-bic --smooth --output-dir mcmc_results/broad/smooth_pl/geom
 
 # 5. MCMC — Kepler masses + wind shape + scattered-flux floor
-python mcmc_lightcurve_fit.py --band broad \
+python -m cloak.mcmc_fit --band broad \
     --flux-csv flux_vs_nH_tbabs_broad.csv \
     --data-dir lightcurves \
     --obs-column flux_t --time-column t_raw \
@@ -1177,7 +1178,7 @@ python mcmc_lightcurve_fit.py --band broad \
     --compute-bic --output-dir mcmc_results/broad/smooth_pl/kepler_shape
 
 # 6. Raw unbinned + jitter (no binning at all)
-python mcmc_lightcurve_fit.py --band soft \
+python -m cloak.mcmc_fit --band soft \
     --flux-csv flux_vs_nH_tbabs_soft.csv \
     --data-dir lightcurves \
     --obs-column flux_t --time-column t_raw \
@@ -1185,7 +1186,7 @@ python mcmc_lightcurve_fit.py --band soft \
     --output-dir mcmc_results/soft/raw_jitter
 
 # 7. Freeze a parameter (1-D chain on the rest)
-python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
+python -m cloak.mcmc_fit --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
     --reparam --freeze q=0.5,Rb=6.0 --n-steps 2000 \
     --output-dir mcmc_results/broad/frozen
 
@@ -1193,15 +1194,15 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
 #    Everything is restored from <band>_<wind>_run_config.json, so this is the
 #    whole command -- band, flux table, data selection, binning and priors all
 #    come from the original fit:
-python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results/broad/smooth_pl/geom
+python -m cloak.mcmc_fit --replot --output-dir mcmc_results/broad/smooth_pl/geom
 
 #    Override a single option in place (explicit flags beat the saved config;
 #    output options are never restored, so type --smooth with its width):
-python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results --smooth --smooth-sigma 0.02
+python -m cloak.mcmc_fit --replot --output-dir mcmc_results --smooth --smooth-sigma 0.02
 
 #    For a stamped result whose run config is missing, pass the original
 #    options once; a config is then written automatically for next time.
-python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
+python -m cloak.mcmc_fit --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
     --data-dir lightcurves --obs-column flux_t --time-column t_raw \
     --wind-model smooth_pl --counts-per-bin 100 \
     --replot --compute-bic --output-dir mcmc_results/broad/smooth_pl/geom
@@ -1213,11 +1214,11 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
 
 Conda env `henv` (heasoft/XSPEC + Python deps). [requirements.txt](requirements.txt)
 lists everything pip-installable: `numpy`, `pandas`, `numba` (**required**;
-`xrb_lightcurve.py` raises `ImportError` without it), `matplotlib`, `emcee`,
+`cloak/kernel.py` raises `ImportError` without it), `matplotlib`, `emcee`,
 `corner`, `tqdm`, and the optional `zeus-mcmc` (`--sampler zeus`), `arviz`
 (convergence summaries) and `astropy` (FITS conversion helper). `scipy` is not
 imported directly (emcee and arviz pull it in). XSPEC Python (`pyxspec`) comes
-from HEASoft and is needed by `compute_flux_vs_nH.py` and the fake-spectrum
+from HEASoft and is needed by `cloak/flux_table.py` and the fake-spectrum
 generator only. Python ≥ 3.9 (the code compiles under 3.8; the practical floor
 is the numba/numpy wheels). Figures are written with the `Agg` backend by the
 MCMC fitter; the other scripts show a window only when `--output` is omitted.
@@ -1229,22 +1230,32 @@ MCMC fitter; the other scripts show a window only when `--output` is omitted.
 ### Core
 | File | Lines | Role |
 | ---- | ----- | ---- |
-| [xrb_lightcurve.py](xrb_lightcurve.py) | ~1050 | Forward model: profiles, Numba LOS kernel (half the orbit by phase reflection) and per-cell flux conversion, `simulate_lightcurve` / `simulate_band_flux`, `SIM_DEFAULTS`, physical normalization. |
-| [mcmc_lightcurve_fit.py](mcmc_lightcurve_fit.py) | ~2140 | emcee/zeus MCMC: `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
-| [chandra_phase_analysis.py](chandra_phase_analysis.py) | ~510 | CLI front end for the single-model χ² fit; re-exports the shared `utils/` API. |
-| [utils/utils.py](utils/utils.py) | ~1670 | Shared layer: ephemeris, loading, `sanitize_errors`, both binners, smoothing, the periodic interpolator + phase-shift search, `fit_simulation`, model-dump blocks, run-config persistence. |
-| [utils/plot_utils.py](utils/plot_utils.py) | ~900 | All plotting, built on the single `plot_lightcurve_fit`. |
-| [compute_flux_vs_nH.py](compute_flux_vs_nH.py) | ~360 | XSPEC `flux vs nH` table generator (one band per table). |
-| [plot_results.py](plot_results.py) | 104 | Thin CLI over `utils/plot_utils.py` for simulation CSVs (`--geometric`, `--orbit`). |
-| [synthetic_data/](synthetic_data/) | ~410 | `make_spectrum.py` (PyXspec `fakeit` + per-band flux-per-rate factors) and `make_lightcurve.py` (CIAO-layout light curves from the forward model with a truth record). |
+| [cloak/kernel.py](cloak/kernel.py) | ~1050 | Forward model: profiles, Numba LOS kernel (half the orbit by phase reflection) and per-cell flux conversion, `simulate_lightcurve` / `simulate_band_flux`, `SIM_DEFAULTS`, physical normalization. |
+| [cloak/mcmc_fit.py](cloak/mcmc_fit.py) | ~2140 | emcee/zeus MCMC: `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
+| [cloak/phase_analysis.py](cloak/phase_analysis.py) | ~530 | CLI front end for the single-model χ² fit; re-exports the shared `cloak.utils` API. |
+| [cloak/utils.py](cloak/utils.py) | ~1670 | Shared layer: ephemeris, loading, `sanitize_errors`, both binners, smoothing, the periodic interpolator + phase-shift search, `fit_simulation`, model-dump blocks, run-config persistence. |
+| [cloak/plots.py](cloak/plots.py) | ~900 | All plotting, built on the single `plot_lightcurve_fit`. |
+| [cloak/flux_table.py](cloak/flux_table.py) | ~360 | XSPEC `flux vs nH` table generator (one band per table). |
+| [cloak/plot_results.py](cloak/plot_results.py) | 104 | Thin CLI over `cloak/plots.py` for simulation CSVs (`--geometric`, `--orbit`). |
+| [cloak/synthetic/](cloak/synthetic/) | ~430 | `spectrum.py` (PyXspec `fakeit` + per-band flux-per-rate factors) and `lightcurve.py` (CIAO-layout light curves with an `exposure` column from the forward model, with a truth record). |
+| [synthetic_data/](synthetic_data/) | data | Tracked synthetic products: the example flux table and generated light curves / tables / truth records. |
+| [tests/](tests/) | ~300 | `test_flux_methods.py`, `test_pipeline.py` (`python -m unittest discover -s tests`). |
 
-### Utilities (`utils/`)
-`utils/` is a package (`__init__.py`). Two modules are library code imported by
-the analysis scripts — `utils.py` and `plot_utils.py` (see Core above).
-`test_flux_methods.py` is the regression test (it runs on the tracked
-`synthetic_data/flux_vs_nH_tbabs_broad.csv`). `CHANDRA_BANDS` in `utils.py`
-is the single definition of the energy bands used by the flux-table generator,
-the synthetic-data scripts and the plot labels.
+### Package layout (`cloak/`)
+Everything importable lives in the `cloak` package: the library modules
+`cloak/utils.py` and `cloak/plots.py`, the forward model `cloak/kernel.py`,
+and the command-line tools `cloak/flux_table.py`, `cloak/mcmc_fit.py`,
+`cloak/phase_analysis.py`, `cloak/plot_results.py` and the generators in
+`cloak/synthetic/`. Every tool runs as `python -m cloak.<module>` from the
+repository root and also as `python cloak/<module>.py` from anywhere (a guard
+puts the repository root on `sys.path` when a module is run as a script).
+`tests/` holds `test_flux_methods.py` (flux-method regression on the tracked
+`synthetic_data/flux_vs_nH_tbabs_broad.csv`) and `test_pipeline.py` (kernel
+symmetries, periodic helpers, window rules, both fitters end to end on a
+synthetic light curve); run `python -m unittest discover -s tests`.
+`CHANDRA_BANDS` in `cloak/utils.py` is the single definition of the energy
+bands used by the flux-table generator, the synthetic-data scripts and the
+plot labels.
 
 ### Not part of the release (on disk, ignored by git)
 `.gitignore` lists them: `data/` (Chandra light curves, spectra, responses),

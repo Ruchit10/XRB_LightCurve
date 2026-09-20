@@ -21,7 +21,11 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from utils.utils import fit_exponential
+if __package__ in (None, ""):   # run as a plain script: python cloak/kernel.py
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+from cloak.utils import fit_exponential
 
 try:
     from numba import njit, prange
@@ -524,7 +528,7 @@ def _cell_flux_exp(cell_col, cell_area, cell_count, col_scale, A_coef, B_coef):
 
 
 # =============================================================================
-# Flux-vs-nH table (compute_flux_vs_nH.py output)
+# Flux-vs-nH table (cloak/flux_table.py output)
 # =============================================================================
 
 def get_available_bands_from_csv(df: pd.DataFrame, flux_type: str = "erg") -> list:
@@ -539,7 +543,7 @@ def get_available_bands_from_csv(df: pd.DataFrame, flux_type: str = "erg") -> li
 
 def load_flux_vs_nh_csv(csv_path: str, flux_type: str = "erg") -> Tuple[pd.DataFrame, list]:
     """
-    Load a flux vs nH CSV from compute_flux_vs_nH.py.
+    Load a flux vs nH CSV from cloak/flux_table.py.
 
     Returns ``(df, bands)`` with rows restricted to a valid, positive
     ``nH_1e22`` and at least one finite flux value among the detected bands.
@@ -741,7 +745,7 @@ def _simulate_core(
     argument raises ``TypeError`` instead of silently running the default.
     """
     if flux_csv_path is None:
-        raise ValueError("flux_csv_path is required (table from compute_flux_vs_nH.py)")
+        raise ValueError("flux_csv_path is required (table from cloak/flux_table.py)")
     if flux_method not in ("interpolate", "refit"):
         raise ValueError(
             f"Invalid flux_method: {flux_method}. Must be 'interpolate' or 'refit'"
@@ -868,7 +872,7 @@ def simulate_lightcurve(verbose: bool = False, **kwargs) -> pd.DataFrame:
         flux_method: nH -> flux conversion: "interpolate" (log-log
             interpolation of the CSV table, default) or "refit" (analytic
             A*exp(-B*nH) fitted to the same table)
-        flux_csv_path: Path to a CSV from compute_flux_vs_nH.py (required)
+        flux_csv_path: Path to a CSV from cloak/flux_table.py (required)
         flux_type: Which flux column to use — "erg" (erg/cm^2/s, default) or
             "ph" (photons/cm^2/s).
         wind_model: Dimensionless wind density profile, one of "smooth_pl",
@@ -1020,7 +1024,7 @@ def main():
                         help="nH -> flux conversion: log-log interpolation of the CSV "
                              "table, or an exponential refit to it")
     parser.add_argument("--flux_csv", type=str, required=True,
-                        help="Flux vs nH CSV from compute_flux_vs_nH.py")
+                        help="Flux vs nH CSV from cloak/flux_table.py")
     parser.add_argument("--flux_type", type=str, choices=["erg", "ph"], default=D["flux_type"],
                         help="Flux column to use: erg (erg/cm^2/s) or ph (photons/cm^2/s)")
     parser.add_argument("--band", type=str, default=None,

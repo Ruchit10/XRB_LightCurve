@@ -890,6 +890,42 @@ from a prior that puts half the initial ball at `-inf`; a wrapping window with
 runs against the PyXspec stand-in (response, background, `calcFlux` and
 `fakeit` semantics mirrored from the live audit); pyflakes clean.
 
+### Commit 10 — Rename into the `cloak` package
+
+The flat scripts became one importable package named after the model
+(CLOAK: Column-density and Line-of-sight Occultation & Absorption Kernel).
+Pure moves plus reference rewrites; no behaviour change.
+
+| Before | After | Run as |
+| ------ | ----- | ------ |
+| `xrb_lightcurve.py` | `cloak/kernel.py` | `python -m cloak.kernel` |
+| `compute_flux_vs_nH.py` | `cloak/flux_table.py` | `python -m cloak.flux_table` |
+| `mcmc_lightcurve_fit.py` | `cloak/mcmc_fit.py` | `python -m cloak.mcmc_fit` |
+| `chandra_phase_analysis.py` | `cloak/phase_analysis.py` | `python -m cloak.phase_analysis` |
+| `plot_results.py` | `cloak/plot_results.py` | `python -m cloak.plot_results` |
+| `utils/utils.py` | `cloak/utils.py` | (library) |
+| `utils/plot_utils.py` | `cloak/plots.py` | (library) |
+| `utils/__init__.py` | `cloak/__init__.py` | package docstring, `__version__` |
+| `synthetic_data/make_spectrum.py` | `cloak/synthetic/spectrum.py` | `python -m cloak.synthetic.spectrum` |
+| `synthetic_data/make_lightcurve.py` | `cloak/synthetic/lightcurve.py` | `python -m cloak.synthetic.lightcurve` |
+| `synthetic_data/README.md` | `cloak/synthetic/README.md` | |
+| `utils/test_flux_methods.py` | `tests/test_flux_methods.py` | `python tests/test_flux_methods.py` |
+| — | `tests/test_pipeline.py` | `python -m unittest discover -s tests` |
+
+`synthetic_data/` is now the data directory for synthetic products (its
+generators moved into the package). Each CLI module carries a guard that puts
+the repository root on `sys.path` when it is run as a plain script, so
+`python cloak/mcmc_fit.py` works from any directory as well; spawn-based
+worker pools inherit the path. Imports are `from cloak.utils import ...`,
+`from cloak.plots import ...`, `from cloak.kernel import ...`. Documentation,
+help strings and the synthetic README were rewritten for the new names;
+history in this file keeps the old ones. `tests/test_pipeline.py` (12 tests)
+exercises the kernel symmetries, the periodic helpers, the window rules, the
+tabulated fit's shift recovery, a tiny MCMC fit with replot and two rejected
+argument combinations, all on synthetic data; both test modules pass, every
+module runs with `-m` and as a script, and `--replot` of an earlier result
+works through the new entry point.
+
 ### Commit 9 — Release split: real data, notebooks, legacy and helper scripts untracked
 
 - Untracked (kept on disk, now ignored): `data/` (88 Chandra light curves of

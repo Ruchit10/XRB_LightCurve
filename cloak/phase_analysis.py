@@ -25,58 +25,58 @@ File Format:
 Examples
 ~~~~~~~~
 # Load all .txt files from a custom directory:
-$ python chandra_phase_analysis.py --data-dir my_observations --output phase_plot.png
+$ python -m cloak.phase_analysis --data-dir my_observations --output phase_plot.png
 
 # Use specific observation column (e.g., NET_RATE instead of default):
-$ python chandra_phase_analysis.py --data-dir data --obs-column NET_RATE --output plot.png
+$ python -m cloak.phase_analysis --data-dir data --obs-column NET_RATE --output plot.png
 
 # Use FLUX column from observations with specific error column:
-$ python chandra_phase_analysis.py --data-dir data --obs-column FLUX --obs-error-column FLUX_ERR --output plot.png
+$ python -m cloak.phase_analysis --data-dir data --obs-column FLUX --obs-error-column FLUX_ERR --output plot.png
 
 # Fit simulation to observations (the simulation's single nfl_* column is used):
-$ python chandra_phase_analysis.py --data-dir data --fit --sim-file simulation.csv --output fit.png
+$ python -m cloak.phase_analysis --data-dir data --fit --sim-file simulation.csv --output fit.png
 
 # Name the flux column explicitly:
-$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+$ python -m cloak.phase_analysis --data-dir data --fit --sim-file sim.csv \\
     --sim-column nfl_broad --output fit.png
 
 # Fit with specific observation column, phase shift held at 0:
-$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+$ python -m cloak.phase_analysis --data-dir data --fit --sim-file sim.csv \\
     --obs-column FLUX --sim-column nfl_broad --output fit.png
 
 # Fit the phase shift as well (flux normalization is never rescaled):
-$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+$ python -m cloak.phase_analysis --data-dir data --fit --sim-file sim.csv \\
     --obs-column NET_RATE --sim-column nfl_broad --fit-phase-shift --output fit.png
 
 # Adaptive constant-counts binning (equal Poisson weight per point):
-$ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
+$ python -m cloak.phase_analysis --data-dir data/IC_10_X1_LC_CIAO/broad \\
     --obs-column flux_t --time-column t_raw --counts-per-bin 100 \\
     --fit --sim-file sim.csv --fit-phase-shift --output fit.png
 
 # Write the fitted model light curve alongside the plot (fit.png -> fit_model.txt):
-$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+$ python -m cloak.phase_analysis --data-dir data --fit --sim-file sim.csv \\
     --sim-column nfl_broad --fit-phase-shift --output fit.png --write-model
 
 # ... or to an explicit path:
-$ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
+$ python -m cloak.phase_analysis --data-dir data --fit --sim-file sim.csv \\
     --sim-column nfl_broad --fit-phase-shift --write-model broad_model.txt
 
 # Load CIAO-layout data (flux_t column, t_raw as the time):
-$ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
+$ python -m cloak.phase_analysis --data-dir data/IC_10_X1_LC_CIAO/broad \\
     --obs-column flux_t --time-column t_raw --output ciao_plot.png
 
 # Fit CIAO-layout data to a simulation:
-$ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
+$ python -m cloak.phase_analysis --data-dir data/IC_10_X1_LC_CIAO/broad \\
     --obs-column flux_t --time-column t_raw --fit --sim-file sim.csv --output ciao_fit.png
 
 Implementation note
 ~~~~~~~~~~~~~~~~~~~
 This file is now only the command-line front end. The analysis routines live in
-``utils/utils.py`` (loading, phase binning, smoothing, periodic model
+``cloak/utils.py`` (loading, phase binning, smoothing, periodic model
 interpolation, the χ² fit) and every plot is drawn by
-``utils/plot_utils.plot_lightcurve_fit`` — the same function
-``mcmc_lightcurve_fit.py`` uses — so the two scripts share one implementation.
-All of those names are re-exported here, so ``from chandra_phase_analysis import
+``cloak.plots.plot_lightcurve_fit`` — the same function
+``cloak/mcmc_fit.py`` uses — so the two scripts share one implementation.
+All of those names are re-exported here, so ``from cloak.phase_analysis import
 *`` still works.
 
 Dependencies: numpy, pandas, matplotlib (in requirements.txt).
@@ -90,11 +90,15 @@ import sys
 import numpy as np
 import pandas as pd
 
-# Every analysis helper lives in utils/ so that this script and
-# mcmc_lightcurve_fit.py share one implementation instead of importing from each
-# other. The names are re-exported below, so `from chandra_phase_analysis import
+# Every analysis helper lives in cloak/utils.py and cloak/plots.py so that this script and
+# cloak/mcmc_fit.py share one implementation instead of importing from each
+# other. The names are re-exported below, so `from cloak.phase_analysis import
 # *` (used by the notebooks) keeps working unchanged.
-from utils.utils import (
+if __package__ in (None, ""):   # run as a plain script: python cloak/phase_analysis.py
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+from cloak.utils import (
     ORBITAL_PERIOD,
     REF_EPOCH,
     apply_phase_window,
@@ -123,7 +127,7 @@ from utils.utils import (
     validate_phase_window_args,
     write_model_lightcurve,
 )
-from utils.plot_utils import (
+from cloak.plots import (
     add_residual_panel,
     plot_lightcurve_fit,
     plot_phase,
@@ -181,7 +185,7 @@ def _validate_args(parser: argparse.ArgumentParser, args, explicit: set) -> None
     if 'scatter' in explicit and 'scatter_eclipse_phase' in explicit:
         err("--scatter fixes the scattered flux, so --scatter-eclipse-phase has no effect.")
 
-    # --- phase window and binning (rules shared with mcmc_lightcurve_fit) ------------
+    # --- phase window and binning (rules shared with cloak.mcmc_fit) ------------
     validate_phase_window_args(
         err, args, fit_shift_enabled=args.fit_phase_shift,
         fixed_shift_hint="drop --fit-phase-shift and pass --phase-shift SHIFT (the shift of a "
@@ -270,7 +274,7 @@ def main() -> None:
              "additive --scatter floor.",
     )
     
-    # Phase binning options. As in mcmc_lightcurve_fit.py, the mode is selected
+    # Phase binning options. As in cloak/mcmc_fit.py, the mode is selected
     # by which argument is present rather than by a separate --bin-mode flag.
     parser.add_argument(
         "--n-phase-bins",
@@ -303,7 +307,7 @@ def main() -> None:
              "exposure is known (an exposure column, or counts and rate) they belong in the "
              "exposure-weighted bins; a CIAO-layout file cannot tell an observed empty bin from an "
              "unobserved GTI gap, which is why dropping is the default. Same rule as "
-             "mcmc_lightcurve_fit.py.",
+             "cloak/mcmc_fit.py.",
     )
     parser.add_argument(
         "--phase-window",

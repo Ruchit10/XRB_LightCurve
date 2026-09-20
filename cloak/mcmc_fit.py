@@ -2,7 +2,7 @@
 """
 MCMC Light Curve Fitting for X-ray Binary Systems
 --------------------------------------------------
-Fits the wind-absorbed, eclipsed light-curve model of ``xrb_lightcurve.py`` to
+Fits the wind-absorbed, eclipsed light-curve model of ``cloak/kernel.py`` to
 phase-folded Chandra data with an ensemble sampler (emcee or zeus), one energy
 band and one wind model per run.
 
@@ -34,17 +34,17 @@ length together with f_opacity leaves the light curve invariant, so the absolute
 scale (and M_tot) is set by the priors on R and f_opacity, not by the data.
 
 Usage:
-    python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_broad.csv \\
+    python -m cloak.mcmc_fit --band broad --flux-csv flux_vs_nH_broad.csv \\
         --wind-model smooth_pl --fit-wind-shape --fit-fopacity --reparam \\
         --likelihood jitter --sampler zeus
 
-    python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_broad.csv \\
+    python -m cloak.mcmc_fit --band broad --flux-csv flux_vs_nH_broad.csv \\
         --wind-model beta_law --fit-wind-shape --fit-fopacity --kepler-mtot \\
         --freeze q_m=0.6
 
     # Regenerate every figure from a finished run; all other options are
     # restored from <band>_<wind_model>_run_config.json in --output-dir.
-    python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results/broad
+    python -m cloak.mcmc_fit --replot --output-dir mcmc_results/broad
 """
 
 import argparse
@@ -86,7 +86,11 @@ try:
 except ImportError:
     HAS_ARVIZ = False
 
-from xrb_lightcurve import (
+if __package__ in (None, ""):   # run as a plain script: python cloak/mcmc_fit.py
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+from cloak.kernel import (
     simulate_lightcurve,
     simulate_band_flux,
     SIM_DEFAULTS,
@@ -96,7 +100,7 @@ from xrb_lightcurve import (
     evaluate_g_profile,
     flux_table_bands,
 )
-from utils.utils import (
+from cloak.utils import (
     ORBITAL_PERIOD,
     RUN_CONFIG_SUFFIX,
     WIND_NORMALIZATION,
@@ -128,7 +132,7 @@ from utils.utils import (
 import matplotlib
 matplotlib.use("Agg")   # every figure is saved to a file; no display needed (SSH, clusters)
 
-from utils.plot_utils import (
+from cloak.plots import (
     plot_corner,
     plot_geometry_vs_phase,
     plot_lightcurve_fit,
@@ -223,7 +227,7 @@ PARAM_LABELS: Dict[str, str] = {
     'H': r'$H$ (R$_\odot$)',
 }
 
-# Wind model descriptions (matches xrb_lightcurve.WIND_MODEL_IDS keys).
+# Wind model descriptions (matches cloak.kernel.WIND_MODEL_IDS keys).
 WIND_MODELS = {
     'smooth_pl':   'Smoothly Broken Power-Law Wind',
     'confinement': 'Inner-Confinement / Compression Wind',
@@ -233,15 +237,15 @@ WIND_MODELS = {
 # Shape parameters that become free MCMC dimensions under --fit-wind-shape.
 # R_star (confinement, beta_law) is tied to the geometry parameter R; any other
 # shape parameter (smooth_pl's poorly identifiable Delta) keeps the simulator
-# default from xrb_lightcurve.default_wind_params.
+# default from cloak.kernel.default_wind_params.
 WIND_SHAPE_FIT = {
     'smooth_pl':   ['Rb', 'p'],
     'confinement': ['fconf', 'ell'],
     'beta_law':    ['beta', 'H'],
 }
-assert set(WIND_MODELS) == set(WIND_MODEL_IDS), "WIND_MODELS must describe every xrb_lightcurve wind model"
+assert set(WIND_MODELS) == set(WIND_MODEL_IDS), "WIND_MODELS must describe every cloak.kernel wind model"
 for _model, _names in WIND_SHAPE_FIT.items():
-    assert set(_names) <= set(WIND_MODEL_PARAM_KEYS[_model]), f"WIND_SHAPE_FIT[{_model!r}] names unknown to xrb_lightcurve"
+    assert set(_names) <= set(WIND_MODEL_PARAM_KEYS[_model]), f"WIND_SHAPE_FIT[{_model!r}] names unknown to cloak.kernel"
 
 # Default priors for wind-shape parameters; override with --prior-<name>.
 # beta ~ 0.8-1 is the CAK range for OB/WR winds; H is the acceleration scale
@@ -1744,7 +1748,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "run one band at a time). Required, except with --replot, where it "
                              "is restored from the saved run config.")
     parser.add_argument("--flux-csv", type=str, default=None,
-                        help="Flux vs nH CSV (from compute_flux_vs_nH.py). Required, except with "
+                        help="Flux vs nH CSV (from cloak/flux_table.py). Required, except with "
                              "--replot, where it is restored from the saved run config.")
     parser.add_argument("--wind-model", type=str, choices=list(WIND_MODELS), default='smooth_pl',
                         help="Wind density model: " + ", ".join(f"{k} ({v})" for k, v in WIND_MODELS.items()))
@@ -2010,7 +2014,7 @@ def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen
     flag = dest_to_flag(parser)
     mode = spec.mode
 
-    # --- data, binning, phase window (rules shared with chandra_phase_analysis) ---
+    # --- data, binning, phase window (rules shared with cloak.phase_analysis) ---
     validate_binning_args(err, args)
     fit_shift = shift_is_searched(args)
     validate_phase_window_args(

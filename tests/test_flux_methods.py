@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for the two flux conversion methods in xrb_lightcurve.py
+Test script for the two flux conversion methods in cloak/kernel.py
 
 This script tests:
 1. Interpolation mode (log-log interpolation of the XSPEC flux vs nH table)
@@ -9,12 +9,12 @@ This script tests:
 for every registered wind model (smooth_pl, confinement, beta_law), so a
 profile that produces non-finite columns or fluxes is caught here.
 
-Both modes require a flux vs nH CSV produced by compute_flux_vs_nH.py.
+Both modes require a flux vs nH CSV produced by cloak/flux_table.py.
 
 Usage:
-    python utils/test_flux_methods.py            # uses synthetic_data/flux_vs_nH_tbabs_broad.csv
-    python utils/test_flux_methods.py --mode interpolate
-    python utils/test_flux_methods.py --wind-model beta_law
+    python tests/tests/test_flux_methods.py            # uses synthetic_data/flux_vs_nH_tbabs_broad.csv
+    python tests/tests/test_flux_methods.py --mode interpolate
+    python tests/tests/test_flux_methods.py --wind-model beta_law
 """
 
 import argparse
@@ -23,15 +23,15 @@ import sys
 
 import numpy as np
 
-# Running this as a script puts utils/ on sys.path rather than the repo root,
+# Running this as a script puts tests/ on sys.path rather than the repo root,
 # so add the parent directory explicitly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import the simulation module
 try:
-    from xrb_lightcurve import simulate_lightcurve, simulate_band_flux, WIND_MODEL_IDS
+    from cloak.kernel import simulate_lightcurve, simulate_band_flux, WIND_MODEL_IDS
 except ImportError:
-    print("Error: Could not import xrb_lightcurve module")
+    print("Error: Could not import cloak.kernel module")
     print("Make sure you're in the repository root and the correct conda environment")
     sys.exit(1)
 
@@ -110,7 +110,7 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test flux conversion methods in xrb_lightcurve.py"
+        description="Test flux conversion methods in cloak/kernel.py"
     )
     parser.add_argument(
         "--mode",
@@ -122,7 +122,7 @@ def main():
         "--csv",
         default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              "synthetic_data", "flux_vs_nH_tbabs_broad.csv"),
-        help="Path to flux vs nH CSV file from compute_flux_vs_nH.py",
+        help="Path to flux vs nH CSV file from cloak/flux_table.py",
     )
     parser.add_argument(
         "--wind-model",

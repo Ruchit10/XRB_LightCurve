@@ -3,13 +3,13 @@
 Plotting helpers for the XRB light-curve codebase.
 --------------------------------------------------
 :func:`plot_lightcurve_fit` is the **single** light-curve drawing routine. It is
-the one that used to live in ``mcmc_lightcurve_fit.plot_best_fit``, generalized
+the one that used to live in ``cloak.mcmc_fit.plot_best_fit``, generalized
 so every caller can use it:
 
-* ``mcmc_lightcurve_fit.plot_best_fit`` resolves the posterior point estimate,
+* ``cloak.mcmc_fit.plot_best_fit`` resolves the posterior point estimate,
   evaluates the physical model and the per-sample phase shift, then hands the
   resulting arrays here.
-* ``chandra_phase_analysis`` (via the :func:`plot_phase` wrapper below)
+* ``cloak.phase_analysis`` (via the :func:`plot_phase` wrapper below)
   interpolates a tabulated simulation light curve and hands the arrays here.
 
 Because both routes end in the same function, the observed data, the model
@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from utils.utils import (
+from cloak.utils import (
     band_label_from_column,
     detect_energy_bands,
     get_band_display_name,
@@ -357,7 +357,7 @@ def plot_phase(
     wind mass-loss rate and the XSPEC flux-vs-nH table); the only y-direction
     adjustment is the additive *scatter* floor. There is no multiplicative
     scale factor — see
-    :func:`utils.utils.fit_simulation`.
+    :func:`cloak.utils.fit_simulation`.
 
     Parameters
     ----------
@@ -383,7 +383,7 @@ def plot_phase(
     is_binned : bool, default False
         Whether the data has been phase-binned. If True, plots with error bars.
     smooth_df : DataFrame, optional
-        Output of :func:`utils.utils.smooth_lightcurve`.
+        Output of :func:`cloak.utils.smooth_lightcurve`.
     scatter : float, default 0.0
         Constant additive scattered-flux floor added to the model overlay.
     """
@@ -490,7 +490,7 @@ def plot_trace(sampler, band: str, wind_model: str, output_path: str,
 #                the quantity the eclipse test compares against R +/- r.
 #   fl           absolute wind column density N_H (1e22 cm^-2)
 #   is_eclipsed  per-phase geometric eclipse flag
-# Two panels of the old plot_results.plot_geometric_parameters are deliberately
+# Two panels of the old cloak.plot_results.plot_geometric_parameters are deliberately
 # not reproduced: "Time vs Phase" is linear by construction, and A2 is the
 # polar-grid cell area, an artifact of the integration mesh rather than physics.
 

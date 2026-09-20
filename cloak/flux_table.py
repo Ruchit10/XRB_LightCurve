@@ -18,10 +18,10 @@ Chandra bands: broad 0.5-7.0, soft 0.5-2.0, medium 1.2-2.0, hard 2.0-7.0 keV.
 
 Requires PyXspec (HEASoft): initialise HEASoft first, e.g. under the `henv`
 conda environment. Everything else needs only numpy, pandas and matplotlib
-(`utils.utils` is numpy/pandas only, so this script never imports numba).
+(`cloak.utils` is numpy/pandas only, so this script never imports numba).
 
 Example:
-  python compute_flux_vs_nH.py --specdir spectra/ic10x1 --model tbabs \\
+  python -m cloak.flux_table --specdir spectra/ic10x1 --model tbabs \\
       --band broad --out_csv flux_vs_nH_broad.csv --out_png flux_vs_nH_broad.png \\
       --nH_min 1e20 --nH_max 1e24 --nH_points 60
 
@@ -42,7 +42,11 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from utils.utils import CHANDRA_BANDS, fit_exponential
+if __package__ in (None, ""):   # run as a plain script: python cloak/flux_table.py
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+from cloak.utils import CHANDRA_BANDS, fit_exponential
 
 # PyXspec is imported in main(), after argument parsing, so --help and argument
 # errors work without an initialised HEASoft.
@@ -336,7 +340,7 @@ def main():
     )
     parser.add_argument("--specdir", type=str, required=True,
                         help="Directory containing the PHA/PI (+ background, RMF, ARF) spectrum files, "
-                             "e.g. the output directory of synthetic_data/make_spectrum.py")
+                             "e.g. the output directory of cloak/synthetic/spectrum.py")
     parser.add_argument("--model", type=str, choices=ABSORPTION_MODELS, default="tbabs",
                         help="Absorption model, multiplied by a power law")
     parser.add_argument("--statistic", type=str, choices=["chi", "cstat"], default="chi",

@@ -3,28 +3,28 @@
 Generate a synthetic Chandra-style light curve from the forward model.
 
 The model band flux is evaluated at known parameters (the same keywords as
-``xrb_lightcurve.py``), shifted in phase and lifted by a scattered-flux floor,
+``cloak/kernel.py``), shifted in phase and lifted by a scattered-flux floor,
 converted to an expected count rate with a flux-per-count-rate factor, and
 Poisson-sampled in ``--dt`` s bins over one or more observing visits with
 optional gaps. The output uses the CIAO layout the fitters read unchanged::
 
     # Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t
 
-so ``mcmc_lightcurve_fit.py --data-dir <dir> --obs-column flux_t --time-column
-t_raw`` and ``chandra_phase_analysis.py`` work on it as on real data. A
+so ``cloak/mcmc_fit.py --data-dir <dir> --obs-column flux_t --time-column
+t_raw`` and ``cloak/phase_analysis.py`` work on it as on real data. A
 ``<output>_truth.json`` next to the file records every injected value.
 
 Examples
 ~~~~~~~~
 # One full orbit at the IC 10 X-1 working parameters, 100 s bins:
-python synthetic_data/make_lightcurve.py --flux-csv flux_vs_nH_broad.csv --band broad \\
+python -m cloak.synthetic.lightcurve --flux-csv flux_vs_nH_broad.csv --band broad \\
     --R 2 --r 0.001 --d1 11 --d2 8 --i0 78 --f-opacity 0.02 \\
     --phase-shift 0.985 --scatter 3e-13 --seed 1 \\
-    --output synthetic_data/out/broad/synth_broad.txt
+    --output synthetic_data/broad/synth_broad.txt
 
 # Three visits (start:duration in s after REF_EPOCH) with 10 % of the bins
 # lost to random 3 ks gaps, beta_law wind, no noise:
-python synthetic_data/make_lightcurve.py --flux-csv flux_vs_nH_broad.csv --band broad \\
+python -m cloak.synthetic.lightcurve --flux-csv flux_vs_nH_broad.csv --band broad \\
     --wind-model beta_law --beta 0.8 --H 1.5 --visits 0:150000,400000:60000,900000:90000 \\
     --gap-fraction 0.1 --gap-duration 3000 --noiseless --output out/synth.txt
 
@@ -43,16 +43,18 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if __package__ in (None, ""):   # run as a plain script: python cloak/synthetic/lightcurve.py
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 
-from xrb_lightcurve import (  # noqa: E402
+from cloak.kernel import (  # noqa: E402
     SIM_DEFAULTS,
     WIND_MODEL_IDS,
     WIND_MODEL_PARAM_KEYS,
     default_wind_params,
     simulate_band_flux,
 )
-from utils.utils import (  # noqa: E402
+from cloak.utils import (  # noqa: E402
     CHANDRA_BANDS,
     MJDREF_CHANDRA,
     ORBITAL_PERIOD,
@@ -64,7 +66,7 @@ from utils.utils import (  # noqa: E402
 
 # Flux per unit count rate (flux_t / rate), erg cm^-2 s^-1 per count s^-1, of
 # the broad-band IC 10 X-1 light curve of ObsID 15803 (other ObsIDs span
-# 0.85-1.49e-11). Replace with the value make_spectrum.py reports for your
+# 0.85-1.49e-11). Replace with the value cloak/synthetic/spectrum.py reports for your
 # synthetic spectrum and band.
 DEFAULT_FLUX_PER_RATE = 1.13e-11
 
@@ -175,7 +177,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Synthetic CIAO-layout light curve from the forward model at known parameters.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--flux-csv", required=True, help="flux vs nH table (compute_flux_vs_nH.py)")
+    parser.add_argument("--flux-csv", required=True, help="flux vs nH table (cloak/flux_table.py)")
     parser.add_argument("--band", type=str, choices=list(CHANDRA_BANDS), default="broad",
                         help="energy band; the table must contain it")
     parser.add_argument("--output", required=True, help="output light-curve file (.txt); truth goes to <stem>_truth.json")
@@ -184,7 +186,7 @@ def main() -> None:
     obs = parser.add_argument_group("Observation")
     obs.add_argument("--flux-per-rate", type=float, default=DEFAULT_FLUX_PER_RATE,
                      help="flux per unit count rate for this band, erg cm^-2 s^-1 per count s^-1 "
-                          "(make_spectrum.py reports it per band)")
+                          "(cloak/synthetic/spectrum.py reports it per band)")
     obs.add_argument("--dt", type=float, default=100.0, help="time bin (s)")
     obs.add_argument("--visits", type=str, default=None,
                      help="visits as start:duration[,start:duration...] in seconds after REF_EPOCH; "
@@ -247,7 +249,7 @@ def main() -> None:
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(out_dir, exist_ok=True)
-    header = ("# Synthetic light curve from xrb_lightcurve (synthetic_data/make_lightcurve.py)\n"
+    header = ("# Synthetic light curve from cloak.kernel (cloak/synthetic/lightcurve.py)\n"
               f"# band {args.band}; wind_model {args.wind_model}; phase_shift {args.phase_shift}; "
               f"scatter {args.scatter:g}; flux_per_rate {args.flux_per_rate:g}; seed {args.seed}\n"
               "# Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t, exposure\n# \n")
@@ -287,7 +289,7 @@ def main() -> None:
     print(f"  total counts {counts.sum():.0f}, zero-count bins {int(np.sum(counts == 0))}, "
           f"mean rate {net_rate.mean():.4f} cts/s, mid-eclipse at data phase {truth['mid_eclipse_data_phase']:.3f}")
     print(f"  truth: {stem}_truth.json")
-    print(f"Fit with: python mcmc_lightcurve_fit.py --band {args.band} --flux-csv {args.flux_csv} "
+    print(f"Fit with: python -m cloak.mcmc_fit --band {args.band} --flux-csv {args.flux_csv} "
           f"--data-dir {out_dir} --obs-column flux_t --time-column t_raw ...")
 
 

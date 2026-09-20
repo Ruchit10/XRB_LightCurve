@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Standalone plotting of xrb_lightcurve simulation CSVs.
+Standalone plotting of cloak.kernel simulation CSVs.
 ------------------------------------------------------
-Thin CLI over ``utils/plot_utils.py``. The plotting itself lives there so that
-``mcmc_lightcurve_fit.py`` can produce the same geometry figures from a
+Thin CLI over ``cloak/plots.py``. The plotting itself lives there so that
+``cloak/mcmc_fit.py`` can produce the same geometry figures from a
 posterior point estimate.
 
 Usage
 ~~~~~
 # Per-band model light curves
-$ python plot_results.py sim.csv --output bands.png
+$ python -m cloak.cloak.plot_results sim.csv --output bands.png
 
 # Geometry: projected separation vs the eclipse thresholds, sky-plane
 # components, N_H(phase) and the resulting band flux
-$ python plot_results.py sim.csv --geometric --R 2.0 --r 0.001 --output geom.png
+$ python -m cloak.cloak.plot_results sim.csv --geometric --R 2.0 --r 0.001 --output geom.png
 
 # Projected orbit / eclipse diagram (needs the geometry parameters)
-$ python plot_results.py sim.csv --orbit --R 2.0 --r 0.001 \
+$ python -m cloak.cloak.plot_results sim.csv --orbit --R 2.0 --r 0.001 \
     --d1 11.0 --d2 8.0 --i0 64.0 --output orbit.png
 """
 from __future__ import annotations
@@ -26,12 +26,16 @@ import sys
 
 import pandas as pd
 
-from utils.utils import (
+if __package__ in (None, ""):   # run as a plain script: python cloak/plot_results.py
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+from cloak.utils import (
     BAND_INFO,
     detect_energy_bands,
     get_band_display_name,
 )
-from utils.plot_utils import (
+from cloak.plots import (
     plot_geometry_vs_phase,
     plot_orbit_geometry,
     plot_simulation_bands,
@@ -101,7 +105,7 @@ def main() -> None:
             fig = plot_simulation_bands(df, output_path=args.output)
     except KeyError as e:
         print(f"Error: {args.data_file} lacks the column {e} the requested figure needs; "
-              f"use a CSV written by the simulator (xrb_lightcurve.py).", file=sys.stderr)
+              f"use a CSV written by the simulator (cloak/kernel.py).", file=sys.stderr)
         sys.exit(1)
     if args.output is None and fig is not None:
         # The plotting routines return the figure when no path is given.

@@ -17,8 +17,8 @@ tqdm>=4.64.0
 zeus-mcmc>=2.5.0
 arviz>=0.14.0
 
-# Optional: FITS light-curve conversion (utils/convert_fits_to_txt.py).
+# Optional: FITS light-curve conversion (extras/convert_fits_to_txt.py).
 astropy>=5.0
 
-# Not installable via pip: compute_flux_vs_nH.py requires XSPEC / PyXspec
+# Not installable via pip: cloak/flux_table.py requires XSPEC / PyXspec
 # from a HEASoft installation.

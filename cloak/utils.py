@@ -3,7 +3,7 @@
 Shared non-plotting helpers for the XRB light-curve codebase.
 -------------------------------------------------------------
 Every routine here was previously defined (and in some cases duplicated) inside
-``chandra_phase_analysis.py`` / ``mcmc_lightcurve_fit.py``. Both scripts now
+``cloak/phase_analysis.py`` / ``cloak/mcmc_fit.py``. Both scripts now
 import from this module, so there is a single implementation of:
 
 * the ephemeris (``REF_EPOCH``, ``ORBITAL_PERIOD``) and :func:`frac`
@@ -63,7 +63,7 @@ PHASE_SHIFT_MAX_GRID = 400
 PHASE_SHIFT_FINE_POINTS = 33
 PHASE_SHIFT_LEVELS = 2
 
-# Phase grid for the drawn model overlay, shared by plot_utils.plot_phase and
+# Phase grid for the drawn model overlay, shared by plots.plot_phase and
 # write_model_lightcurve so the dumped curve is exactly the plotted one.
 MODEL_OVERLAY_N_POINTS = 721
 
@@ -250,7 +250,7 @@ def fit_exponential(nh: np.ndarray, flux: np.ndarray) -> Tuple[float, float]:
 
     Fitting ``log flux = log A - B nh`` gives every point equal weight
     regardless of magnitude, appropriate for data spanning many decades. Shared
-    by the simulator's ``refit`` flux method and by ``compute_flux_vs_nH.py``'s
+    by the simulator's ``refit`` flux method and by ``cloak/flux_table.py``'s
     figure annotation, so the law drawn on the table is the law the model uses.
     """
     nh = np.asarray(nh, dtype=float)
@@ -1189,7 +1189,7 @@ def sanitize_errors(errors, context: str = "") -> np.ndarray:
     flux is not a count error). If no error is valid a ``ValueError`` is
     raised: a χ² fit without measurement errors is not meaningful. This is the
     one repair rule, applied at the load boundary (:func:`load_observed_lightcurves`,
-    ``chandra_phase_analysis.main``, ``mcmc_lightcurve_fit.load_fit_data``) and
+    ``cloak.phase_analysis.main``, ``cloak.mcmc_fit.load_fit_data``) and
     by :func:`obs_errors`; the binners receive already-valid errors.
     """
     err = np.array(errors, dtype=float, copy=True)
@@ -1315,7 +1315,7 @@ def write_model_blocks(f, model_phase, model_flux, obs_phase, obs_flux, obs_err,
     whitespace-delimited tables under ``#`` comments, so
     ``np.genfromtxt(..., names=True)`` reads either after selecting its rows.
     Shared by :func:`write_model_lightcurve` (tabulated fit) and
-    ``mcmc_lightcurve_fit._write_bestfit_model_txt``.
+    ``cloak.mcmc_fit._write_bestfit_model_txt``.
     """
     model_phase = np.asarray(model_phase, dtype=float)
     model_flux = np.asarray(model_flux, dtype=float)
@@ -1350,7 +1350,7 @@ def tabulated_model_arrays(
     """The tabulated model as drawn and dumped: ``(model_phase, model_flux,
     obs_phase, obs_model)`` for the given shift and additive floor.
 
-    One evaluation shared by ``plot_utils.plot_phase`` and
+    One evaluation shared by ``plots.plot_phase`` and
     :func:`write_model_lightcurve`, so the plotted overlay and the dumped curve
     are the same arrays.
     """
