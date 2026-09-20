@@ -94,17 +94,17 @@ from xrb_lightcurve import (
     evaluate_g_profile,
 )
 from utils.utils import (
-    DEFAULT_PHASE_SHIFT_EVAL_POINTS,
-    DEFAULT_PHASE_SHIFT_GRID_SIZE,
     ORBITAL_PERIOD,
     RUN_CONFIG_SUFFIX,
-    apply_best_phase_shift,
+    PhaseShiftSearch,
     apply_saved_run_config,
-    build_phase_shift_terms,
+    best_phase_shift,
+    build_phase_shift_search,
     estimate_scattered_flux,
+    eval_periodic,
     fmt_val,
-    interp_periodic_phases,
     load_observed_lightcurves,
+    periodic_model,
     phase_bin_data,
     phase_bin_data_snr,
     run_config_path,
@@ -260,6 +260,10 @@ SAMPLER_TYPES = {
     'emcee': 'emcee Ensemble Sampler (stretch moves)',
     'zeus': 'zeus Ensemble Slice Sampler',
 }
+
+# --save-chi2 subset when every row needs a model call (jitter likelihood);
+# with the chi2 likelihood the table is read from the chain at no cost.
+CHI2_TABLE_DEFAULT_SAMPLES = 2000
 
 
 def _compute_kepler_prefactor(orbital_period_s: float) -> float:
@@ -540,13 +544,14 @@ def get_active_priors(
 class DirectLightCurveModel:
     """Evaluate the physical light curve for one band by calling the simulator.
 
-    At ~30 ms per light curve (Gauss-Legendre kernel, per-cell flux conversion
-    compiled) direct evaluation is fast enough for MCMC and is the only path
-    that supports per-sample wind-shape parameters.
+    At a few ms per light curve (Gauss-Legendre kernel over half the orbit, the
+    other half by phase reflection, per-cell flux conversion compiled) direct
+    evaluation is fast enough for MCMC and is the only path that supports
+    per-sample wind-shape parameters.
     """
 
     def __init__(self, band: str, flux_csv_path: str, wind_model: str = 'smooth_pl',
-                 dth: float = 5.0, flux_method: str = "interpolate",
+                 dth: float = 2.0, flux_method: str = "interpolate",
                  sim_params: Optional[Dict] = None):
         self.band = band.lower()
         self.flux_csv_path = flux_csv_path
@@ -580,17 +585,16 @@ class DirectLightCurveModel:
                        if f_opacity is None else float(f_opacity)),
         )
 
-    def evaluate(self, d1, d2, r, R, i0, obs_phases: np.ndarray,
-                 wind_params: Optional[Dict[str, float]] = None,
-                 f_opacity: Optional[float] = None) -> np.ndarray:
-        """Band flux interpolated onto *obs_phases*; NaNs if the simulation fails."""
+    def curve(self, d1, d2, r, R, i0,
+              wind_params: Optional[Dict[str, float]] = None,
+              f_opacity: Optional[float] = None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Native ``(phase, flux)`` arrays on the kernel's phase grid, or None if
+        the simulation fails."""
         try:
-            model_phase, model_flux = simulate_band_flux(
-                **self.sim_kwargs(d1, d2, r, R, i0, wind_params, f_opacity))
+            return simulate_band_flux(**self.sim_kwargs(d1, d2, r, R, i0, wind_params, f_opacity))
         except Exception as e:
             warnings.warn(f"Model evaluation failed: {e}")
-            return np.full_like(np.asarray(obs_phases, dtype=float), np.nan)
-        return interp_periodic_phases(obs_phases, model_phase, model_flux)
+            return None
 
 
 @dataclass
@@ -600,39 +604,30 @@ class FitData:
     flux: np.ndarray
     err: np.ndarray
     err2: np.ndarray
-    phase_shift_terms: Dict[str, object]
+    shift_search: Optional[PhaseShiftSearch] = None   # None: phase shift held at 0
     is_binned: bool = True
     phase_width: Optional[np.ndarray] = None
 
     @classmethod
     def build(cls, phase, flux, err, fit_phase_shift: bool = True,
-              grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
-              eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
+              shift_grid_size: Optional[int] = None, n_model: int = 0,
               is_binned: bool = True, phase_width=None) -> "FitData":
         phase = np.asarray(phase, dtype=float)
         err = np.asarray(err, dtype=float)
-        return cls(
-            phase=phase, flux=np.asarray(flux, dtype=float), err=err, err2=err ** 2,
-            phase_shift_terms=build_phase_shift_terms(
-                fit_phase_shift, phase, grid_size=grid_size, eval_points=eval_points),
-            is_binned=is_binned, phase_width=phase_width,
-        )
+        search = (build_phase_shift_search(phase, n_grid=shift_grid_size, n_model=n_model)
+                  if fit_phase_shift else None)
+        return cls(phase=phase, flux=np.asarray(flux, dtype=float), err=err, err2=err ** 2,
+                   shift_search=search, is_binned=is_binned, phase_width=phase_width)
 
     @property
     def fit_phase_shift(self) -> bool:
-        return bool(self.phase_shift_terms.get("enabled", False))
-
-    @property
-    def eval_phases(self) -> np.ndarray:
-        """Phases the model is evaluated on before alignment."""
-        if self.fit_phase_shift:
-            return np.asarray(self.phase_shift_terms["phase_eval_grid"], dtype=float)
-        return self.phase
+        return self.shift_search is not None
 
 
-def evaluate_model(theta, spec: ParamSpec, model: DirectLightCurveModel,
-                   phases: np.ndarray) -> Optional[np.ndarray]:
-    """Physical model (including the additive f_scatter floor) at *phases*.
+def model_curve(theta, spec: ParamSpec, model: DirectLightCurveModel
+                ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Physical model (including the additive f_scatter floor) on the kernel's
+    native phase grid, as ``(phase, flux)``.
 
     Returns None when the sample is unphysical or the simulation fails. Every
     consumer -- likelihood, per-sample chi2, BIC, best-fit overlay -- goes
@@ -641,12 +636,11 @@ def evaluate_model(theta, spec: ParamSpec, model: DirectLightCurveModel,
     d1, d2, r, R, i0 = spec.geometry(theta)
     if not np.all(np.isfinite([d1, d2, r, R, i0])):
         return None
-    flux = model.evaluate(d1, d2, r, R, i0, phases,
-                          wind_params=spec.wind_params(theta, R),
-                          f_opacity=spec.f_opacity(theta))
-    if np.any(~np.isfinite(flux)):
+    curve = model.curve(d1, d2, r, R, i0, wind_params=spec.wind_params(theta, R),
+                        f_opacity=spec.f_opacity(theta))
+    if curve is None or not np.all(np.isfinite(curve[1])):
         return None
-    return np.asarray(flux, dtype=float) + spec.f_scatter(theta)
+    return curve[0], np.asarray(curve[1], dtype=float) + spec.f_scatter(theta)
 
 
 def aligned_model_flux(theta, spec: ParamSpec, model: DirectLightCurveModel,
@@ -654,14 +648,18 @@ def aligned_model_flux(theta, spec: ParamSpec, model: DirectLightCurveModel,
     """Model at the observed phases after the per-sample phase-shift search.
 
     Returns ``(model_at_obs_phases, best_shift)``; the model is None when it
-    could not be evaluated.
+    could not be evaluated. The kernel's native curve is interpolated once,
+    directly onto the (shifted) observed phases.
     """
-    model_flux = evaluate_model(theta, spec, model, data.eval_phases)
-    if model_flux is None or not data.fit_phase_shift:
-        return model_flux, 0.0
-    return apply_best_phase_shift(
-        data.eval_phases, model_flux, data.phase, data.flux, data.err2,
-        data.phase_shift_terms)
+    curve = model_curve(theta, spec, model)
+    if curve is None:
+        return None, 0.0
+    phase_ext, flux_ext = periodic_model(*curve)
+    if data.shift_search is None:
+        return eval_periodic(phase_ext, flux_ext, data.phase), 0.0
+    model_at_obs, shift, _ = best_phase_shift(phase_ext, flux_ext, data.flux, data.err2,
+                                              data.shift_search)
+    return model_at_obs, shift
 
 
 # =============================================================================
@@ -755,13 +753,26 @@ def degrees_of_freedom(spec: ParamSpec, n_obs: int) -> int:
 # Sampling
 # =============================================================================
 
-def _init_numba_worker(max_numba_threads: int = 1):
-    """Pool initializer: cap Numba threads per worker to avoid oversubscription."""
+# Fit context of a pool worker, installed once by _init_worker. emcee and zeus
+# otherwise pickle every argument of the log-probability function into each
+# task, i.e. the whole FitData (hundreds of KB for unbinned data) per sample.
+_WORKER: Dict[str, object] = {}
+
+
+def _init_worker(max_numba_threads: int, spec, priors, model, data) -> None:
+    """Pool initializer: cap Numba threads per worker and store the fit context."""
     try:
         import numba
         numba.set_num_threads(max(1, int(max_numba_threads)))
     except Exception:
         pass
+    _WORKER.update(spec=spec, priors=priors, model=model, data=data)
+
+
+def _log_probability_worker(theta) -> float:
+    """log_probability with the context installed by _init_worker."""
+    return log_probability(theta, _WORKER['spec'], _WORKER['priors'],
+                           _WORKER['model'], _WORKER['data'])
 
 
 def initial_positions(spec: ParamSpec, priors, n_walkers: int) -> np.ndarray:
@@ -826,10 +837,10 @@ def run_mcmc(
     print(f"Parameterization: {spec.mode}  | Likelihood: {LIKELIHOOD_TYPES[spec.likelihood]}")
     print(f"Wind model: {WIND_MODELS[spec.wind_model]} ({spec.wind_model})"
           f"  | fit_wind_shape={spec.fit_wind_shape}")
-    if data.fit_phase_shift:
-        terms = data.phase_shift_terms
-        print(f"Per-sample phase-shift search: enabled (grid={len(terms['shift_grid'])}, "
-              f"eval_points={len(terms['phase_eval_grid'])})")
+    if data.shift_search is not None:
+        s = data.shift_search
+        print(f"Per-sample phase-shift search: enabled (coarse grid {s.shift_grid.size}, "
+              f"{s.n_levels} x {s.n_fine}-point dense passes, resolution {s.resolution:.2e})")
     else:
         print("Per-sample phase-shift search: disabled")
     print(f"Active params ({spec.n_dim}): {spec.active_names}")
@@ -837,6 +848,7 @@ def run_mcmc(
         print(f"Frozen: {spec.frozen}")
 
     pool = None
+    log_prob_fn, args = log_probability, (spec, priors, model, data)
     if n_threads > 1:
         cpus = int(cpu_count() or 1)
         ntb = (max(1, cpus // int(n_threads)) if numba_threads_per_worker is None
@@ -844,20 +856,22 @@ def run_mcmc(
         print(f"[info] Pooled MCMC: {n_threads} worker processes, "
               f"numba.set_num_threads({ntb}) per worker (logical CPUs ~ {cpus}).")
         pool = mp.get_context("spawn").Pool(
-            processes=n_threads, initializer=_init_numba_worker, initargs=(ntb,))
+            processes=n_threads, initializer=_init_worker,
+            initargs=(ntb, spec, priors, model, data))
+        # Only theta crosses the pipe: the fit context lives in the workers.
+        log_prob_fn, args = _log_probability_worker, ()
 
-    args = (spec, priors, model, data)
     start = time.time()
     try:
         if sampler_type == 'zeus':
             if not HAS_ZEUS:
                 raise ImportError("zeus not installed. Install with: pip install zeus-mcmc")
             sampler = zeus_sampler.EnsembleSampler(
-                n_walkers, spec.n_dim, log_probability, args=args, pool=pool)
+                n_walkers, spec.n_dim, log_prob_fn, args=args, pool=pool)
             sampler.run_mcmc(pos, n_steps, progress=progress)
         else:
             sampler = emcee.EnsembleSampler(
-                n_walkers, spec.n_dim, log_probability, args=args, pool=pool)
+                n_walkers, spec.n_dim, log_prob_fn, args=args, pool=pool)
             if progress and HAS_TQDM:
                 for _ in tqdm(sampler.sample(pos, iterations=n_steps),
                               total=n_steps, desc="MCMC Sampling"):
@@ -990,28 +1004,46 @@ def print_diagnostics(sampler, sampler_type: str, names: List[str]) -> Dict[str,
 
 def compute_chi2_for_samples(model, spec: ParamSpec, samples: np.ndarray, data: FitData,
                              output_path: str, n_samples: Optional[int] = None,
-                             verbose: bool = True) -> None:
-    """Per-sample chi2 (classical, and effective-variance for jitter runs) to CSV."""
+                             verbose: bool = True, log_prob: Optional[np.ndarray] = None,
+                             priors: Optional[Dict[str, Dict[str, float]]] = None) -> None:
+    """Per-sample chi2 (classical, and effective-variance for jitter runs) to CSV.
+
+    With the ``chi2`` likelihood the classical chi2 is already in the chain:
+    ``log_prob = log_prior - chi2 / 2`` exactly, so given *log_prob* and
+    *priors* every sample is tabulated without a model call. The jitter
+    likelihood needs the model for ``chi2_eff``; there *n_samples* defaults to
+    ``CHI2_TABLE_DEFAULT_SAMPLES`` random samples.
+    """
     n_total = len(samples)
-    if n_samples is None or n_samples > n_total:
+    from_chain = (spec.likelihood == 'chi2' and log_prob is not None
+                  and priors is not None and len(log_prob) == n_total)
+    if n_samples is None and not from_chain:
+        n_samples = CHI2_TABLE_DEFAULT_SAMPLES
+    if n_samples is None or n_samples >= n_total:
         indices = np.arange(n_total)
     else:
         indices = np.sort(np.random.choice(n_total, size=n_samples, replace=False))
     if verbose:
-        print(f"Computing chi-square for {len(indices)} samples...")
+        print(f"Computing chi-square for {len(indices)} samples"
+              f"{' from the stored log-probabilities' if from_chain else ''}...")
     dof = degrees_of_freedom(spec, len(data.flux))
     use_eff = spec.likelihood == 'jitter'
-    iterator = tqdm(indices, desc="Computing χ²") if (HAS_TQDM and verbose) else indices
+    iterator = (tqdm(indices, desc="Computing χ²")
+                if (HAS_TQDM and verbose and not from_chain) else indices)
 
     rows = []
     for idx in iterator:
         theta = samples[idx]
         d1, d2, r, R, i0 = spec.geometry(theta)
-        try:
-            terms = chi2_terms(theta, spec, model, data)
-            chi2, chi2_eff = terms['chi2'], terms['chi2_eff']
-        except Exception:
-            chi2, chi2_eff = np.nan, np.nan
+        if from_chain:
+            chi2 = -2.0 * (float(log_prob[idx]) - log_prior(theta, priors, spec))
+            chi2_eff = np.nan
+        else:
+            try:
+                terms = chi2_terms(theta, spec, model, data)
+                chi2, chi2_eff = terms['chi2'], terms['chi2_eff']
+            except Exception:
+                chi2, chi2_eff = np.nan, np.nan
         row = [idx, d1, d2, r, R, i0, chi2, chi2 / dof if dof > 0 else np.nan]
         if use_eff:
             row += [chi2_eff, chi2_eff / dof if dof > 0 else np.nan]
@@ -1092,10 +1124,12 @@ def plot_best_fit(model, spec: ParamSpec, data: FitData, stats: Dict, band: str,
     the figure.
     """
     theta, key = point_estimate_theta(stats, spec)
-    model_phases = np.linspace(0.0, 1.0, 360)
-    dense = evaluate_model(theta, spec, model, model_phases)
-    if dense is None:
+    curve = model_curve(theta, spec, model)
+    if curve is None:
+        model_phases = np.linspace(0.0, 1.0, 360, endpoint=False)
         dense = np.full_like(model_phases, np.nan)
+    else:
+        model_phases, dense = curve
     terms = chi2_terms(theta, spec, model, data)
     obs_model = terms['model']
     if obs_model is None:
@@ -1160,11 +1194,6 @@ def _write_bestfit_model_txt(path: str, *, spec: ParamSpec, data: FitData, stats
     order = np.argsort(np.asarray(overlay_phase, dtype=float))
     mp_ = np.asarray(overlay_phase, dtype=float)[order]
     mf = np.asarray(model_flux, dtype=float)[order]
-    # The dense grid spans phase 0 and 1 inclusive; after wrapping through the
-    # shift the two coincide at bit level, so drop the duplicate abscissa.
-    if mp_.size > 1:
-        keep = np.concatenate(([True], np.diff(mp_) > 1e-9))
-        mp_, mf = mp_[keep], mf[keep]
 
     with open(path, 'w') as f:
         f.write(f"# Best-fit model light curve -- {band.upper()} band, {WIND_MODELS[spec.wind_model]}\n")
@@ -1312,8 +1341,8 @@ def plot_geometry_diagnostics(spec: ParamSpec, stats: Dict, samples: np.ndarray,
 # Run / replot orchestration
 # =============================================================================
 
-def postprocess_fit(args, spec: ParamSpec, model, data: FitData, samples: np.ndarray,
-                    stats: Dict, band: str, chain: Optional[np.ndarray],
+def postprocess_fit(args, spec: ParamSpec, priors: Dict, model, data: FitData,
+                    samples: np.ndarray, stats: Dict, band: str, chain: Optional[np.ndarray],
                     log_prob_flat: Optional[np.ndarray], smoothed: Optional[pd.DataFrame],
                     sampler=None) -> Dict:
     """Everything after sampling that a fresh fit and a --replot share:
@@ -1346,11 +1375,11 @@ def postprocess_fit(args, spec: ParamSpec, model, data: FitData, samples: np.nda
             plot_geometry_diagnostics(spec, stats, samples, model, band, args.output_dir,
                                       suffix, verbose=not getattr(args, 'quiet', False))
 
-    if getattr(args, 'save_chi2', False):
+    if args.save_chi2:
         compute_chi2_for_samples(
             model, spec, samples, data,
             output_path=os.path.join(args.output_dir, f"{suffix}_chi2.csv.gz"),
-            n_samples=getattr(args, 'chi2_n_samples', None), verbose=True)
+            n_samples=args.chi2_n_samples, verbose=True, log_prob=log_prob_flat, priors=priors)
     stats['wind_model'] = spec.wind_model
     return stats
 
@@ -1381,12 +1410,14 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
         'n_walkers': int(args.n_walkers), 'n_steps': int(args.n_steps),
         'n_burn': int(args.n_burn), 'fit_elapsed_s': fit_elapsed,
         'fit_phase_shift': data.fit_phase_shift,
-        'phase_shift_grid_size': int(getattr(args, "phase_shift_grid_size", DEFAULT_PHASE_SHIFT_GRID_SIZE)),
-        'phase_shift_eval_points': int(getattr(args, "phase_shift_eval_points", DEFAULT_PHASE_SHIFT_EVAL_POINTS)),
+        'phase_shift_grid_size': (int(data.shift_search.shift_grid.size)
+                                  if data.shift_search is not None else None),
+        'phase_shift_resolution': (float(data.shift_search.resolution)
+                                   if data.shift_search is not None else None),
     }
 
     chain = sampler.get_chain(discard=args.n_burn)
-    stats = postprocess_fit(args, spec, model, data, samples, stats, band, chain,
+    stats = postprocess_fit(args, spec, priors, model, data, samples, stats, band, chain,
                             log_prob_flat, smoothed, sampler=sampler)
 
     if not getattr(args, "no_csv_output", False):
@@ -1423,12 +1454,14 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
 
 
 def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
-                         smoothed: Optional[pd.DataFrame]) -> Optional[Tuple[Dict, ParamSpec]]:
+                         smoothed: Optional[pd.DataFrame],
+                         priors_for) -> Optional[Tuple[Dict, ParamSpec]]:
     """Regenerate every output from a saved chain without re-sampling.
 
     The saved chain, not the command line, defines the parameterization: the
     mode, likelihood, period and frozen values are read from ``*_chain.npz``,
     and the sampled dimensions from the columns of ``*_samples.csv``.
+    *priors_for(spec)* returns the active priors of the rebuilt spec.
     """
     suffix = f"{band}_{spec.wind_model}"
     print(f"\n{'#' * 60}\n# Replotting {band.upper()} band - {WIND_MODELS[spec.wind_model]}\n{'#' * 60}")
@@ -1493,8 +1526,8 @@ def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
     print_results(stats, spec, band)
     if chain is not None and chain.shape[2] != spec.n_dim:
         chain = None  # column mismatch: skip ArviZ rather than mislabel
-    return postprocess_fit(args, spec, model, data, samples, stats, band, chain,
-                           log_prob_flat, smoothed, sampler=None), spec
+    return postprocess_fit(args, spec, priors_for(spec), model, data, samples, stats, band,
+                           chain, log_prob_flat, smoothed, sampler=None), spec
 
 
 def write_summary(path: str, band: str, spec: ParamSpec, stats: Dict) -> None:
@@ -1513,7 +1546,7 @@ def write_summary(path: str, band: str, spec: ParamSpec, stats: Dict) -> None:
                     f"burn={meta.get('n_burn')}\n")
             f.write(f"  fit_phase_shift={meta.get('fit_phase_shift')}, "
                     f"phase_shift_grid={meta.get('phase_shift_grid_size')}, "
-                    f"phase_eval_points={meta.get('phase_shift_eval_points')}\n")
+                    f"phase_shift_resolution={meta.get('phase_shift_resolution')}\n")
             if np.isfinite(meta.get('fit_elapsed_s', np.nan)):
                 f.write(f"  wall_time_s={meta['fit_elapsed_s']:.2f}\n")
 
@@ -1684,10 +1717,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-fit-phase-shift", action="store_true",
                         help="Disable the per-sample phase-shift alignment (by default every "
                              "likelihood call minimises chi2 over a phase shift).")
-    parser.add_argument("--phase-shift-grid-size", type=int, default=DEFAULT_PHASE_SHIFT_GRID_SIZE,
-                        help="Coarse trial shifts per likelihood call (a local refinement follows)")
-    parser.add_argument("--phase-shift-eval-points", type=int, default=DEFAULT_PHASE_SHIFT_EVAL_POINTS,
-                        help="Model phase points evaluated before the shift search")
+    parser.add_argument("--phase-shift-grid-size", type=int, default=None,
+                        help="Coarse trial shifts per likelihood call before the dense refinement. "
+                             "Default: max(number of data points, model phases), at most 400.")
     parser.add_argument("--n-threads", type=int, default=1,
                         help="Worker processes for parallel likelihood evaluation (1 = serial)")
     parser.add_argument("--numba-threads-per-worker", type=int, default=None, metavar="N",
@@ -1695,8 +1727,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "(default: cpu_count // n_threads)")
     parser.add_argument("--compute-bic", action="store_true",
                         help="Report the Bayesian information criterion at the MAP sample")
-    parser.add_argument("--dth", type=float, default=5.0,
-                        help="Model phase resolution in degrees (larger = faster)")
+    parser.add_argument("--dth", type=float, default=2.0,
+                        help="Model phase resolution in degrees (360/dth phases, half of them by "
+                             "reflection; larger = faster, coarser eclipse edges)")
 
     # Output
     parser.add_argument("--output-dir", type=str, default="mcmc_results", help="Output directory")
@@ -1706,9 +1739,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smooth", action="store_true",
                         help="Overlay a Gaussian-smoothed observed curve with an MC band")
     parser.add_argument("--smooth-sigma", type=float, default=0.01, help="Smoothing kernel width in phase")
-    parser.add_argument("--smooth-n-mc", type=int, default=2000,
-                        help="Monte Carlo perturbations for the smoothed band (0 disables)")
-    parser.add_argument("--smooth-seed", type=int, default=None, help="RNG seed for the smoothing MC")
     parser.add_argument("--quiet", action="store_true", help="Suppress the progress bar")
     parser.add_argument("--compact-output", action="store_true", help="Also save samples as NPZ")
     parser.add_argument("--no-csv-output", action="store_true", help="Skip the *_samples.csv table")
@@ -1719,7 +1749,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-chi2", action="store_true",
                         help="Write per-sample chi2 to {band}_{wind_model}_chi2.csv.gz")
     parser.add_argument("--chi2-n-samples", type=int, default=None,
-                        help="Random subset size for --save-chi2 (default: all samples)")
+                        help="Random subset size for --save-chi2. Default: every sample with "
+                             "--likelihood chi2 (read from the chain, no model calls), "
+                             f"{CHI2_TABLE_DEFAULT_SAMPLES} with jitter (one model call each).")
 
     sim = parser.add_argument_group('Simulation Parameters', 'Passed to simulate_lightcurve')
     sim.add_argument("--gma0", type=float, default=-90.0, help="Starting phase angle in degrees")
@@ -1785,14 +1817,13 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
         warnings.warn(f"Replaced {invalid.sum()} invalid errors with max(10% flux, median valid error)")
 
     data = FitData.build(phase, flux, err, fit_phase_shift=not args.no_fit_phase_shift,
-                         grid_size=args.phase_shift_grid_size,
-                         eval_points=args.phase_shift_eval_points,
+                         shift_grid_size=args.phase_shift_grid_size,
+                         n_model=int(round(360.0 / float(args.dth))),
                          is_binned=is_binned, phase_width=width)
 
     smoothed = None
     if args.smooth:
         smoothed = smooth_lightcurve(phase, flux, err, sigma=float(args.smooth_sigma),
-                                     n_mc=int(args.smooth_n_mc), random_state=args.smooth_seed,
                                      verbose=not args.quiet)
 
     scatter_prior = None
@@ -1831,8 +1862,6 @@ def main():
         parser.error("--counts-per-bin must be > 0.")
     if args.smooth_sigma <= 0:
         parser.error("--smooth-sigma must be > 0.")
-    if args.smooth_n_mc < 0:
-        parser.error("--smooth-n-mc must be >= 0.")
     lo, hi = map(float, args.scatter_eclipse_phase)
     if not (0.0 <= lo <= hi <= 1.0):
         parser.error("--scatter-eclipse-phase must satisfy 0 <= PHASE_MIN <= PHASE_MAX <= 1.")
@@ -1867,12 +1896,16 @@ def main():
         data, smoothed, scatter_prior = load_fit_data(args, band)
         model = DirectLightCurveModel(band=band, flux_csv_path=args.flux_csv,
                                       wind_model=args.wind_model, dth=args.dth, sim_params=sim_params)
+
+        def priors_for(s: ParamSpec) -> Dict[str, Dict[str, float]]:
+            return get_active_priors(s, geometry_priors, shape_prior_overrides, scatter_prior)
+
         if args.replot:
             # Self-healing: results predating run-config saving get one written,
             # so the next --replot needs no arguments.
             if restored_config is None and not os.path.exists(run_config_path(args.output_dir, band, args.wind_model)):
                 save_run_config(args.output_dir, band, args.wind_model, args)
-            result = replot_from_existing(band, args, spec, model, data, smoothed)
+            result = replot_from_existing(band, args, spec, model, data, smoothed, priors_for)
             if result is None:
                 print(f"Could not load existing results for {band}_{args.wind_model}")
                 return
@@ -1880,8 +1913,7 @@ def main():
         else:
             # Written before sampling so the configuration survives a crash.
             save_run_config(args.output_dir, band, args.wind_model, args)
-            priors = get_active_priors(spec, geometry_priors, shape_prior_overrides, scatter_prior)
-            stats = run_single_fit(band, args, spec, priors, model, data, smoothed)
+            stats = run_single_fit(band, args, spec, priors_for(spec), model, data, smoothed)
     except Exception as e:
         print(f"ERROR {'replotting' if args.replot else 'fitting'} {band} band ({args.wind_model}): {e}")
         import traceback

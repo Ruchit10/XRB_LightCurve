@@ -126,16 +126,16 @@ def _g_profile(r, model_id, p1, p2, p3, p4):
 
     if model_id == 0:
         # smooth_pl: Rb=p1, p=p2, Delta=p3
-        Rb = p1
-        p_slope = p2
-        Delta = p3
-        x = r / Rb
-        if Delta <= 0.0:
-            return x ** (-2.0)
-        base = x ** (-2.0)
-        bracket = 1.0 + (1.0 / x) ** Delta
-        exponent = (p_slope - 2.0) / Delta
-        return base * (bracket ** exponent)
+        #   g = x^-2 (1 + x^-Delta)^((p-2)/Delta),   x = r / Rb
+        # x^-2 as a division and a single pow for x^-Delta: pow dominates the
+        # per-node cost of the kernel, and 3 -> 2 calls is x0.75 on the whole
+        # light curve.
+        x = r / p1
+        inv_x2 = 1.0 / (x * x)
+        if p3 <= 0.0:
+            return inv_x2
+        bracket = 1.0 + x ** (-p3)
+        return inv_x2 * bracket ** ((p2 - 2.0) / p3)
 
     if model_id == 1:
         # confinement: R_star=p1, fconf=p2, ell=p3
@@ -649,6 +649,41 @@ def inclination_to_internal_rad(i0_deg: float) -> float:
 # Simulation
 # =============================================================================
 
+def _mirror_indices(gma0_deg: float, dth_deg: float, n_phases: int):
+    """Phase indices to compute, and every index's reflection partner.
+
+    The kernel sees the orbital phase only through ``sin(gma)`` and
+    ``|cos(gma)|`` (``l``, ``z_start`` and the occultation test), so ``gma`` and
+    ``pi - gma`` give identical columns and an ``L`` of opposite sign. On the
+    uniform grid ``gma_k = gma0 + k dth`` that reflection maps index ``k`` to
+    ``(m - k) mod n`` with ``m = (180 - 2 gma0) / dth``. When ``m`` is an
+    integer -- the default ``gma0 = -90`` with any ``dth`` dividing 360 -- only
+    one member of each pair is run through the kernel and the other is copied,
+    which halves the kernel and flux-conversion work. The two halves of a full
+    computation already agree only to trig round-off (~1e-15), so the copy is
+    exact.
+
+    Returns ``(run, partner)``: the indices to compute and, for every index,
+    its partner; ``partner`` is None when the grid has no such symmetry.
+    """
+    m = (180.0 - 2.0 * float(gma0_deg)) / float(dth_deg)
+    if abs(m - round(m)) > 1e-9:
+        return np.arange(n_phases), None
+    idx = np.arange(n_phases)
+    partner = (int(round(m)) - idx) % n_phases
+    return idx[idx <= partner], partner
+
+
+def _unmirror(values: np.ndarray, run: np.ndarray, partner, negate: bool = False) -> np.ndarray:
+    """Scatter per-phase results of the computed indices onto the full grid."""
+    if partner is None:
+        return values
+    full = np.empty(partner.shape[0], dtype=values.dtype)
+    full[partner[run]] = -values if negate else values
+    full[run] = values
+    return full
+
+
 def _simulate_core(
     r: float,
     R: float,
@@ -694,9 +729,13 @@ def _simulate_core(
     n_phases = int(360 / dth)
     gma_values = gma0_rad + np.arange(n_phases) * (dth * np.pi / 180.0)
 
+    # Phases gma and pi - gma are geometrically identical (see
+    # _mirror_indices): only one of each pair goes through the kernel.
+    run, partner = _mirror_indices(gma0, dth, n_phases)
+
     (flx, A2, l_arr, L_arr, h_arr, eclipsed,
      cell_col, cell_area, cell_count) = _simulate_phases_numba(
-        gma_values.astype(np.float64),
+        np.ascontiguousarray(gma_values[run], dtype=np.float64),
         float(r), float(R), float(d1), float(d2), float(incl), float(d2h),
         int(model_id), float(p1), float(p2), float(p3), float(p4),
         _GL16_X, _GL16_W,
@@ -724,6 +763,11 @@ def _simulate_core(
         A_coef, B_coef = info["exp_fit"]
         nfl = _cell_flux_exp(cell_col, cell_area, cell_count, col_scale, A_coef, B_coef)
 
+    # Copy the computed phases onto their reflection partners (L flips sign).
+    flx, A2, l_arr, h_arr, eclipsed, nfl = (
+        _unmirror(x, run, partner) for x in (flx, A2, l_arr, h_arr, eclipsed, nfl))
+    L_arr = _unmirror(L_arr, run, partner, negate=True)
+
     # Eclipsed phases have no visible cells, so nfl is already 0 there; the
     # scattered-light floor is a constant, phase-independent addition.
     if float(scattered_flux) != 0.0:
@@ -731,6 +775,7 @@ def _simulate_core(
 
     return {
         "band": band,
+        "n_computed": int(run.size),
         "deg": gma_values * (180.0 / np.pi),
         "phase": (gma_values - gma0_rad) / (2.0 * np.pi),
         "A2": A2,
@@ -826,8 +871,9 @@ def simulate_lightcurve(
         band,
     )
     if verbose:
-        print(f"Computed {res['deg'].size} phases via the GL kernel "
-              f"(parallel over phases); band '{res['band']}'")
+        print(f"Computed {res['n_computed']} of {res['deg'].size} phases via the GL "
+              f"kernel (parallel over phases; the rest by phase reflection); "
+              f"band '{res['band']}'")
     frame = pd.DataFrame({
         "deg": res["deg"],
         "phase": res["phase"],

@@ -13,11 +13,12 @@ import from this module, so there is a single implementation of:
   constant-counts (:func:`phase_bin_data_snr`)
 * Gaussian phase smoothing (:func:`smooth_lightcurve`) and the eclipse-floor
   estimate (:func:`estimate_scattered_flux`)
-* periodic model interpolation (:func:`prepare_model_interpolator`,
-  :func:`model_from_wrap`, :func:`interp_periodic_phases`)
-* the tabulated-model χ² fit (:func:`fit_simulation`) and the periodic
-  phase-shift search it shares with the MCMC likelihood
-  (:func:`build_phase_shift_terms`, :func:`apply_best_phase_shift`)
+* the single periodic model interpolator (:func:`periodic_model`,
+  :func:`eval_periodic`, :func:`prepare_model_interpolator`,
+  :func:`interp_periodic_phases`)
+* the periodic phase-shift search (:class:`PhaseShiftSearch`,
+  :func:`build_phase_shift_search`, :func:`best_phase_shift`), shared by the
+  tabulated-model χ² fit (:func:`fit_simulation`) and the MCMC likelihood
 * band-directory observation loading (:func:`resolve_band_directory`,
   :func:`load_observed_lightcurves`) and :func:`save_samples_csv_chunked`
 * CLI run-config persistence (:func:`save_run_config`,
@@ -25,10 +26,10 @@ import from this module, so there is a single implementation of:
   options without retyping them
 
 This module deliberately depends only on the standard library plus numpy /
-pandas / scipy: it must stay importable from either analysis script without
-creating an import cycle.
+pandas: it must stay importable from either analysis script (and from the
+XSPEC environment) without creating an import cycle.
 
-Dependencies: numpy, pandas, scipy (in requirements.txt).
+Dependencies: numpy, pandas (in requirements.txt).
 """
 from __future__ import annotations
 
@@ -41,11 +42,11 @@ import shlex
 import sys
 import time
 import warnings
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize_scalar
 
 # -----------------------------------------------------------------------------
 # Constants adopted from the R script (seconds)
@@ -54,10 +55,14 @@ REF_EPOCH: float = 278801348  # Reference time (t0) used for phase zero
 # REF_EPOCH: float = 278800407.267 # corrected reference epoch from find_reference_epoch.py
 ORBITAL_PERIOD: float = 125431  # Orbital period of the system
 
-# Two-stage periodic phase-shift search: coarse grid, then local refinement.
-DEFAULT_PHASE_SHIFT_GRID_SIZE = 25
-DEFAULT_PHASE_SHIFT_EVAL_POINTS = 240
-DEFAULT_PHASE_SHIFT_REFINE_POINTS = 9
+# Periodic phase-shift search (build_phase_shift_search / best_phase_shift):
+# a coarse scan over the full period whose step is tied to the data and model
+# spacing, then PHASE_SHIFT_LEVELS dense passes of PHASE_SHIFT_FINE_POINTS
+# points, each spanning +-1 previous step around the best shift.
+PHASE_SHIFT_MIN_GRID = 25
+PHASE_SHIFT_MAX_GRID = 400
+PHASE_SHIFT_FINE_POINTS = 33
+PHASE_SHIFT_LEVELS = 2
 
 # Phase grid for the drawn model overlay, shared by plot_utils.plot_phase and
 # write_model_lightcurve so the dumped curve is exactly the plotted one.
@@ -719,11 +724,15 @@ def smooth_lightcurve(
     sigma: float = 0.01,
     eval_phase: Optional[np.ndarray] = None,
     n_eval: int = 300,
-    n_mc: int = 2000,
-    random_state: Optional[int] = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
-    """Periodic Gaussian-kernel smoothing with optional MC uncertainty band."""
+    """Periodic Gaussian-kernel smoothing with its propagated 1σ band.
+
+    The smoother is linear in the data, so the uncertainty of the smoothed
+    value is exact: ``Var[Σ w_i f_i / Σ w_i] = Σ w_i² σ_i² / (Σ w_i)²``. Points
+    without a valid error contribute to the smoothed curve but not to its
+    band.
+    """
     phase = np.asarray(phase, dtype=float)
     flux = np.asarray(flux, dtype=float)
     if phase.shape != flux.shape:
@@ -732,16 +741,13 @@ def smooth_lightcurve(
         raise ValueError("sigma must be > 0.")
     if n_eval <= 0:
         raise ValueError("n_eval must be > 0.")
-    if n_mc < 0:
-        raise ValueError("n_mc must be >= 0.")
 
     valid = np.isfinite(phase) & np.isfinite(flux)
     if flux_err is not None:
         flux_err = np.asarray(flux_err, dtype=float)
         if flux_err.shape != flux.shape:
             raise ValueError("flux_err must match phase/flux shape.")
-        valid &= np.isfinite(flux_err)
-        flux_err = np.where(flux_err > 0.0, flux_err, np.nan)
+        flux_err = np.where(np.isfinite(flux_err) & (flux_err > 0.0), flux_err, np.nan)
 
     phase = np.mod(phase[valid], 1.0)
     flux = flux[valid]
@@ -767,26 +773,19 @@ def smooth_lightcurve(
         flux_smooth[good] = (w[good] @ flux) / wsum[good]
 
     flux_smooth_err = np.full(eval_phase.shape, np.nan, dtype=float)
-    if flux_err is not None and n_mc > 0:
-        mc_valid = np.isfinite(flux_err)
-        if np.any(mc_valid):
-            rng = np.random.default_rng(random_state)
-            perturbed = (
-                flux[mc_valid][None, :]
-                + flux_err[mc_valid][None, :] * rng.standard_normal((int(n_mc), int(np.sum(mc_valid))))
-            )
-            w_mc = w[:, mc_valid]
-            wsum_mc = w_mc.sum(axis=1)
-            good_mc = wsum_mc > 0.0
-            if np.any(good_mc):
-                smoothed_mc = (perturbed @ w_mc[good_mc].T) / wsum_mc[good_mc][None, :]
-                flux_smooth_err[good_mc] = smoothed_mc.std(axis=0)
+    if flux_err is not None:
+        ok = np.isfinite(flux_err)
+        if np.any(ok):
+            w_ok = w[:, ok]
+            wsum_ok = w_ok.sum(axis=1)
+            good_ok = wsum_ok > 0.0
+            if np.any(good_ok):
+                flux_smooth_err[good_ok] = (
+                    np.sqrt((w_ok[good_ok] ** 2) @ (flux_err[ok] ** 2)) / wsum_ok[good_ok]
+                )
 
     if verbose:
-        print(
-            f"Smoothing: {phase.size} points, sigma={sigma:.4f}, "
-            f"eval={eval_phase.size}, n_mc={int(n_mc)}"
-        )
+        print(f"Smoothing: {phase.size} points, sigma={sigma:.4f}, eval={eval_phase.size}")
 
     return pd.DataFrame(
         {
@@ -825,55 +824,57 @@ def estimate_scattered_flux(
 # Periodic model interpolation
 # -----------------------------------------------------------------------------
 
-def prepare_model_interpolator(
-    sim_df: pd.DataFrame, sim_column: str
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build wrap-around interpolation arrays for a simulation light curve.
+def periodic_model(phase, flux) -> Tuple[np.ndarray, np.ndarray]:
+    """Prepare a periodic ``(phase, flux)`` curve for ``np.interp``.
 
-    Returns ``(phase_wrap, flux_wrap)`` covering [0, 2) in phase with strictly
-    increasing x, so ``np.interp`` handles the periodic boundary correctly.
+    Returns ``(phase_ext, flux_ext)``: the curve folded into [0, 1), sorted,
+    duplicate abscissae removed, with the last point repeated at ``phase - 1``
+    and the first at ``phase + 1`` so that every query in [0, 1) is bracketed.
+    This is the single periodic interpolator of the codebase: the tabulated χ²
+    fit, the plot overlays, the model dumps and the MCMC likelihood all
+    evaluate a model through it, so they cannot disagree.
     """
-    if "phase" in sim_df.columns:
-        sim_phase = np.mod(sim_df["phase"].to_numpy(dtype=float), 1.0)
-    elif "deg" in sim_df.columns:
-        sim_phase = np.mod(sim_df["deg"].to_numpy(dtype=float) % 360.0, 360.0) / 360.0
-    else:
-        raise ValueError("Simulation file must contain 'phase' or 'deg' column.")
-
-    if sim_column not in sim_df.columns:
-        raise KeyError(f"Column '{sim_column}' not found in simulation DataFrame.")
-    sim_flux = sim_df[sim_column].to_numpy(dtype=float)
-
-    order = np.argsort(sim_phase)
-    p = sim_phase[order]
-    f = sim_flux[order]
-    phase_wrap = np.concatenate([p, p + 1.0])
-    flux_wrap = np.concatenate([f, f])
-
-    # Strictly increasing x only, to avoid np.interp ambiguity at duplicates.
-    keep = np.concatenate(([True], np.diff(phase_wrap) > 0))
-    return phase_wrap[keep], flux_wrap[keep]
+    p = np.mod(np.asarray(phase, dtype=float), 1.0)
+    f = np.asarray(flux, dtype=float)
+    if p.size == 0:
+        raise ValueError("periodic_model needs at least one point.")
+    order = np.argsort(p, kind="stable")
+    p, f = p[order], f[order]
+    keep = np.concatenate(([True], np.diff(p) > 0))
+    p, f = p[keep], f[keep]
+    return (np.concatenate(([p[-1] - 1.0], p, [p[0] + 1.0])),
+            np.concatenate(([f[-1]], f, [f[0]])))
 
 
-def model_from_wrap(
-    phase_wrap: np.ndarray,
-    flux_wrap: np.ndarray,
+def eval_periodic(
+    phase_ext: np.ndarray,
+    flux_ext: np.ndarray,
     phases,
     shift=0.0,
-    scatter: float = 0.0,
+    offset: float = 0.0,
 ) -> np.ndarray:
-    """Evaluate a prepared model at *phases* for a given shift and scatter.
+    """Model from :func:`periodic_model` at ``phases - shift``, plus *offset*.
 
-    This is the single definition of the tabulated model used everywhere: the χ²
-    in :func:`fit_simulation`, the overlay curve and the residual panel all route
-    through it, so they cannot silently disagree. *shift* may be an array
-    (broadcast against *phases*) to evaluate many trial shifts at once.
+    *shift* may be an array broadcast against *phases* to evaluate many trial
+    shifts at once; *offset* is the additive scattered-flux floor.
     """
-    ph = np.mod(
-        np.asarray(phases, dtype=float) - np.asarray(shift, dtype=float), 1.0
-    )
-    out = np.interp(ph.ravel(), phase_wrap, flux_wrap).reshape(ph.shape)
-    return out + float(scatter)
+    ph = np.mod(np.asarray(phases, dtype=float) - np.asarray(shift, dtype=float), 1.0)
+    return np.interp(ph.ravel(), phase_ext, flux_ext).reshape(ph.shape) + float(offset)
+
+
+def prepare_model_interpolator(
+    sim_df: pd.DataFrame, sim_column: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    """:func:`periodic_model` of a simulation CSV column (``phase`` or ``deg`` x-axis)."""
+    if "phase" in sim_df.columns:
+        sim_phase = sim_df["phase"].to_numpy(dtype=float)
+    elif "deg" in sim_df.columns:
+        sim_phase = sim_df["deg"].to_numpy(dtype=float) / 360.0
+    else:
+        raise ValueError("Simulation file must contain 'phase' or 'deg' column.")
+    if sim_column not in sim_df.columns:
+        raise KeyError(f"Column '{sim_column}' not found in simulation DataFrame.")
+    return periodic_model(sim_phase, sim_df[sim_column].to_numpy(dtype=float))
 
 
 def interp_periodic_phases(
@@ -881,27 +882,8 @@ def interp_periodic_phases(
     model_phase: np.ndarray,
     model_flux: np.ndarray,
 ) -> np.ndarray:
-    """Interpolate a periodic model given as (phase, flux) arrays onto *obs_phases*.
-
-    The array-in/array-out counterpart of :func:`model_from_wrap`, for callers
-    that hold a freshly evaluated model curve rather than a prepared
-    interpolator (the MCMC likelihood, which rebuilds the curve every sample).
-    Uses a monotonic fast path and falls back to sorting when needed.
-    """
-    if model_phase.size == 0:
-        return np.full_like(obs_phases, np.nan, dtype=float)
-
-    if np.all(np.diff(model_phase) >= 0):
-        phase_sorted = model_phase
-        flux_sorted = model_flux
-    else:
-        sort_idx = np.argsort(model_phase)
-        phase_sorted = model_phase[sort_idx]
-        flux_sorted = model_flux[sort_idx]
-
-    phase_ext = np.concatenate([phase_sorted - 1.0, phase_sorted, phase_sorted + 1.0])
-    flux_ext = np.concatenate([flux_sorted, flux_sorted, flux_sorted])
-    return np.interp(obs_phases, phase_ext, flux_ext)
+    """A periodic ``(phase, flux)`` curve interpolated onto *obs_phases*."""
+    return eval_periodic(*periodic_model(model_phase, model_flux), obs_phases)
 
 
 def obs_errors(
@@ -934,115 +916,72 @@ def fit_simulation(
     sim_column: str = "fl",
     fit_phase_shift: bool = False,
     scatter: float = 0.0,
-    n_shift_grid: int = 1000,
+    n_shift_grid: Optional[int] = None,
     verbose: bool = True,
-) -> tuple[float, float]:
-    """Fit simulation light-curve to observations via chi-square minimization.
+) -> Tuple[float, float]:
+    """Fit a tabulated simulation light curve to observations by χ².
 
     Only the **phase shift** (x-direction) is fitted. There is deliberately no
     multiplicative flux scale: the model's absolute normalization is already
     fixed by the wind mass-loss rate (via the physical column-density
     normalization) together with the XSPEC ``flux vs nH`` table, so a free
     y-scale would silently absorb an error in that normalization instead of
-    exposing it. The only y-direction
-    freedom is the *additive* ``scatter`` floor, which is supplied by the caller
-    (measured at mid-eclipse) rather than fitted here. This matches
-    ``mcmc_lightcurve_fit.py``, which likewise fits a per-sample phase shift and
-    an additive ``f_scatter`` but no multiplicative scale.
+    exposing it. The only y-direction freedom is the *additive* ``scatter``
+    floor, which is supplied by the caller (measured at mid-eclipse) rather
+    than fitted here. The MCMC likelihood uses the same
+    :func:`best_phase_shift` search and the same additive ``f_scatter``.
 
     Parameters
     ----------
     obs_df : DataFrame
-        Observational data with columns ``phase``, ``rate`` and (optionally) ``error``.
+        Observational data with columns ``phase``, ``rate`` and ``error``.
     sim_df : DataFrame
-        Simulation results. Must contain columns ``phase`` (or ``deg``) and *sim_column*.
+        Simulation results with ``phase`` (or ``deg``) and *sim_column*.
     sim_column : str, default ``"fl"``
         Column in *sim_df* to use as the model flux.
     fit_phase_shift : bool, default False
-        If True, scan the phase shift that minimizes chi-square.
-        If False, evaluate chi-square at shift = 0.
+        If True, search the phase shift that minimizes χ²; otherwise evaluate
+        χ² at shift = 0.
     scatter : float, default 0.0
-        Constant additive scattered-flux floor added to the model. Added *after*
-        interpolation and never scaled.
-    n_shift_grid : int, default 1000
-        Number of trial shifts in the coarse scan over [0, 1). The scan is
-        followed by a bounded local refinement, so this only needs to be fine
-        enough to land in the correct basin.
+        Constant additive scattered-flux floor added to the model, never scaled.
+    n_shift_grid : int, optional
+        Coarse trial shifts over [0, 1); see :func:`build_phase_shift_search`
+        for the default.
     verbose : bool, default True
-        Print the fitted shift, scatter and reduced chi-square.
+        Print the fitted shift, scatter and reduced χ².
 
     Returns
     -------
     (phase_shift, reduced_chi2)
-        Best-fit phase shift (0–1) and reduced chi-squared value.
-        If *fit_phase_shift* is False, returns ``(0.0, reduced_chi2)``.
+        Best-fit phase shift in [0, 1) (0.0 when not fitted) and χ²/dof.
     """
-    # Prepare observation arrays
-    phase_obs = obs_df["phase"].to_numpy()
+    phase_obs = np.mod(obs_df["phase"].to_numpy(dtype=float), 1.0)
     rate_obs = obs_df["rate"].to_numpy(dtype=float)
     err_obs = obs_errors(obs_df)
 
-    # Prepared once; every model evaluation below goes through model_from_wrap
-    # so the χ² here and the curve drawn by plot_phase are the same function.
-    phase_wrap, flux_wrap = prepare_model_interpolator(sim_df, sim_column)
-    scatter = float(scatter)
-
-    def chi2(shift) -> float:
-        model = model_from_wrap(phase_wrap, flux_wrap, phase_obs, shift, scatter)
-        return float(np.sum(((rate_obs - model) / err_obs) ** 2))
+    # Prepared once; the χ² here, the overlay drawn by plot_phase and the model
+    # dump all evaluate this same periodic model.
+    phase_ext, flux_ext = prepare_model_interpolator(sim_df, sim_column)
+    flux_ext = flux_ext + float(scatter)
 
     if fit_phase_shift:
-        # The phase shift is periodic and the eclipse profile makes chi2(shift)
-        # strongly multi-modal, so a local optimizer started at shift=0 would
-        # routinely settle in the wrong basin. Scan a coarse grid over the full
-        # period first, then refine locally around the best node. This mirrors
-        # the two-stage search in mcmc_lightcurve_fit._apply_best_phase_shift.
-        n_grid = max(3, int(n_shift_grid))
-        shift_grid = np.linspace(0.0, 1.0, n_grid, endpoint=False)
+        search = build_phase_shift_search(phase_obs, n_grid=n_shift_grid, n_model=len(sim_df))
+        _, best_shift, chi2 = best_phase_shift(phase_ext, flux_ext, rate_obs, err_obs ** 2, search)
+    else:
+        best_shift = 0.0
+        model = eval_periodic(phase_ext, flux_ext, phase_obs)
+        chi2 = float(np.sum(((rate_obs - model) / err_obs) ** 2))
 
-        # Vectorized coarse scan: one interp over all (shift, obs_phase) pairs.
-        models = model_from_wrap(
-            phase_wrap, flux_wrap, phase_obs[None, :], shift_grid[:, None], scatter
-        )
-        chi2_grid = np.sum(
-            ((rate_obs[None, :] - models) / err_obs[None, :]) ** 2, axis=1
-        )
-        best_idx = int(np.argmin(chi2_grid))
-        best_shift = float(shift_grid[best_idx])
-        best_chi2 = float(chi2_grid[best_idx])
-
-        # Bounded local refinement within one coarse step of the best node.
-        step = 1.0 / n_grid
-        refined = minimize_scalar(
-            chi2,
-            bounds=(best_shift - step, best_shift + step),
-            method="bounded",
-        )
-        if refined.success and float(refined.fun) < best_chi2:
-            best_shift = float(refined.x) % 1.0
-            best_chi2 = float(refined.fun)
-
-        n_free = 1
-        reduced_chi2 = best_chi2 / max(len(rate_obs) - n_free, 1)
-        if verbose:
-            print(
-                f"Best-fit parameters (phase shift only, no flux rescaling):\n"
-                f"  Phase shift = {best_shift:.5f}\n"
-                f"  Scattered flux = {scatter:.6g} (fixed, additive)\n"
-                f"  Reduced χ² = {reduced_chi2:.3f}  (dof = {max(len(rate_obs) - n_free, 1)})"
-            )
-        return float(best_shift), float(reduced_chi2)
-
-    # No optimization: evaluate chi-square at zero shift.
-    best_shift = 0.0
-    n_free = 0
-    reduced_chi2 = chi2(best_shift) / max(len(rate_obs) - n_free, 1)
+    n_free = int(fit_phase_shift)
+    dof = max(len(rate_obs) - n_free, 1)
+    reduced_chi2 = chi2 / dof
     if verbose:
         print(
-            f"Chi-square (no phase-shift fit, no flux rescaling):\n"
-            f"  Phase shift = {best_shift:.5f} (fixed)\n"
-            f"  Scattered flux = {scatter:.6g} (fixed, additive)\n"
-            f"  Reduced χ² = {reduced_chi2:.3f}  (dof = {max(len(rate_obs) - n_free, 1)})"
+            f"{'Best-fit phase shift' if fit_phase_shift else 'Chi-square at zero shift'} "
+            f"(no flux rescaling):\n"
+            f"  Phase shift = {best_shift:.5f}{'' if fit_phase_shift else ' (fixed)'}\n"
+            f"  Scattered flux = {float(scatter):.6g} (fixed, additive)\n"
+            f"  Reduced χ² = {reduced_chi2:.3f}  (dof = {dof})"
         )
     return float(best_shift), float(reduced_chi2)
 
@@ -1076,12 +1015,12 @@ def write_model_lightcurve(
     whitespace-delimited tables under ``#`` comments, so
     ``np.genfromtxt(..., names=True)`` reads either after selecting its rows.
 
-    Every model value routes through :func:`model_from_wrap`, the same evaluator
+    Every model value routes through :func:`eval_periodic`, the same evaluator
     used by the χ² and the plot overlay, so the three cannot disagree.
 
     Returns the path written.
     """
-    phase_wrap, flux_wrap = prepare_model_interpolator(sim_df, sim_column)
+    phase_ext, flux_ext = prepare_model_interpolator(sim_df, sim_column)
     shift = float(shift)
     scatter = float(scatter)
 
@@ -1090,8 +1029,8 @@ def write_model_lightcurve(
     obs_err = obs_errors(obs_df)
 
     model_phase = np.linspace(0.0, 1.0, int(n_model_points))
-    model_flux = model_from_wrap(phase_wrap, flux_wrap, model_phase, shift, scatter)
-    obs_model = model_from_wrap(phase_wrap, flux_wrap, obs_phase, shift, scatter)
+    model_flux = eval_periodic(phase_ext, flux_ext, model_phase, shift, scatter)
+    obs_model = eval_periodic(phase_ext, flux_ext, obs_phase, shift, scatter)
 
     n_free = 1 if shift_fitted else 0
     dof = max(len(obs_flux) - n_free, 1)
@@ -1149,85 +1088,101 @@ def write_model_lightcurve(
 
 
 # -----------------------------------------------------------------------------
-# Periodic phase-shift alignment
+# Periodic phase-shift search
 # -----------------------------------------------------------------------------
 # The model's phase zero is not tied to the ephemeris, so every comparison with
 # data allows a free shift. chi2(shift) is periodic and strongly multi-modal
 # (the eclipse), so a local optimizer started at 0 settles in the wrong basin:
-# both searches here scan a coarse grid over the full period first, then refine.
-# :func:`fit_simulation` does the same for a tabulated model.
+# the search scans the full period on a grid fine enough to resolve every basin
+# first, then refines densely around the best node. One implementation serves
+# fit_simulation (tabulated model) and the MCMC likelihood (kernel model).
 
-def build_phase_shift_terms(
-    enabled: bool,
+@dataclass(frozen=True)
+class PhaseShiftSearch:
+    """Trial shifts precomputed once for an observed phase array."""
+    obs_phase: np.ndarray           # observed phases folded into [0, 1)
+    shift_grid: np.ndarray          # coarse trial shifts in [0, 1)
+    shifted_obs_phase: np.ndarray   # (n_grid, n_obs): mod(obs_phase - shift, 1)
+    n_fine: int = PHASE_SHIFT_FINE_POINTS
+    n_levels: int = PHASE_SHIFT_LEVELS
+
+    @property
+    def resolution(self) -> float:
+        """Shift spacing of the final dense pass."""
+        step = 1.0 / self.shift_grid.size
+        for _ in range(self.n_levels):
+            step = 2.0 * step / (self.n_fine - 1)
+        return step
+
+
+def build_phase_shift_search(
     obs_phase: np.ndarray,
-    *,
-    grid_size: int = DEFAULT_PHASE_SHIFT_GRID_SIZE,
-    eval_points: int = DEFAULT_PHASE_SHIFT_EVAL_POINTS,
-    refine_points: int = DEFAULT_PHASE_SHIFT_REFINE_POINTS,
-) -> Dict[str, object]:
-    """Precompute the reusable arrays for a per-sample phase-shift search."""
-    if not enabled:
-        return {"enabled": False}
-    n_grid = max(3, int(grid_size))
+    n_grid: Optional[int] = None,
+    n_model: int = 0,
+    n_fine: int = PHASE_SHIFT_FINE_POINTS,
+    n_levels: int = PHASE_SHIFT_LEVELS,
+) -> PhaseShiftSearch:
+    """Precompute the coarse trial shifts for :func:`best_phase_shift`.
+
+    The coarse step must not exceed the narrowest feature of χ²(shift), which
+    is set by the data spacing (a bin crossing the eclipse edge) and by the
+    model spacing (one ``dth``), so by default ``n_grid = max(n_obs, n_model)``
+    clipped to ``[PHASE_SHIFT_MIN_GRID, PHASE_SHIFT_MAX_GRID]``. The cap keeps
+    the scan affordable for unbinned data, whose χ²(shift) is smooth anyway.
+    """
+    obs_phase = np.mod(np.asarray(obs_phase, dtype=float), 1.0)
+    if n_grid is None:
+        n_grid = min(max(PHASE_SHIFT_MIN_GRID, obs_phase.size, int(n_model)), PHASE_SHIFT_MAX_GRID)
+    n_grid = max(3, int(n_grid))
     shift_grid = np.linspace(0.0, 1.0, n_grid, endpoint=False)
-    return {
-        "enabled": True,
-        "shift_grid": shift_grid,
-        "phase_eval_grid": np.linspace(0.0, 1.0, max(16, int(eval_points)), endpoint=False),
-        "shifted_obs_phase": np.mod(obs_phase[None, :] - shift_grid[:, None], 1.0),
-        "refine_points": max(0, int(refine_points)),
-    }
+    return PhaseShiftSearch(
+        obs_phase=obs_phase,
+        shift_grid=shift_grid,
+        shifted_obs_phase=np.mod(obs_phase[None, :] - shift_grid[:, None], 1.0),
+        n_fine=max(3, int(n_fine)),
+        n_levels=max(0, int(n_levels)),
+    )
 
 
-def apply_best_phase_shift(
-    model_phase: np.ndarray,
-    model_flux: np.ndarray,
-    obs_phase: np.ndarray,
+def best_phase_shift(
+    phase_ext: np.ndarray,
+    flux_ext: np.ndarray,
     obs_flux: np.ndarray,
     obs_err2: np.ndarray,
-    phase_shift_terms: Optional[Dict[str, object]],
-) -> Tuple[Optional[np.ndarray], float]:
-    """Align a model curve to observations by minimizing weighted chi-square.
+    search: PhaseShiftSearch,
+) -> Tuple[np.ndarray, float, float]:
+    """Shift of a periodic model that minimizes χ² against the observations.
 
-    Returns ``(model_at_obs_phases, best_shift)``, or ``(None, 0.0)`` if no
-    trial shift produced a finite model. With the search disabled, returns
-    *model_flux* unchanged and a shift of 0.
+    One ``np.interp`` over the precomputed ``(n_grid, n_obs)`` trial-phase
+    matrix gives χ² at every coarse shift; ``search.n_levels`` dense passes of
+    ``search.n_fine`` points, each spanning ±1 previous step around the best
+    shift, then bring the resolution to ``search.resolution``. The model is
+    ``(phase_ext, flux_ext)`` from :func:`periodic_model`, with any additive
+    floor already included in ``flux_ext``.
+
+    Returns ``(model_at_obs_phases, shift, chi2)``.
     """
-    if not phase_shift_terms or not bool(phase_shift_terms.get("enabled", False)):
-        return model_flux, 0.0
+    obs_flux = np.asarray(obs_flux, dtype=float)
+    obs_err2 = np.asarray(obs_err2, dtype=float)
 
-    shift_grid = np.asarray(phase_shift_terms.get("shift_grid", []), dtype=float)
-    if shift_grid.size == 0:
-        return model_flux, 0.0
-    shifted_obs_phase = phase_shift_terms.get("shifted_obs_phase")
-    if shifted_obs_phase is None or np.shape(shifted_obs_phase) != (shift_grid.size, obs_phase.size):
-        shifted_obs_phase = np.mod(obs_phase[None, :] - shift_grid[:, None], 1.0)
+    def scan(shifted):
+        model = np.interp(shifted.ravel(), phase_ext, flux_ext).reshape(shifted.shape)
+        chi2 = np.sum((obs_flux - model) ** 2 / obs_err2, axis=1)
+        j = int(np.argmin(chi2))
+        return float(chi2[j]), j, model[j]
 
-    best_model, best_idx, best_shift, best_chi2 = None, -1, 0.0, np.inf
-
-    def _try(shifted_phase, shift, idx=-1):
-        nonlocal best_model, best_idx, best_shift, best_chi2
-        flux = interp_periodic_phases(shifted_phase, model_phase, model_flux)
-        if np.any(~np.isfinite(flux)):
-            return
-        chi2 = float(np.sum((obs_flux - flux) ** 2 / obs_err2))
+    best_chi2, j, best_model = scan(search.shifted_obs_phase)
+    if not np.isfinite(best_chi2):
+        raise ValueError("best_phase_shift: the model or the data contain non-finite values.")
+    best_shift = float(search.shift_grid[j])
+    step = 1.0 / search.shift_grid.size
+    for _ in range(search.n_levels):
+        cand = best_shift + np.linspace(-step, step, search.n_fine)
+        chi2, j, model = scan(np.mod(search.obs_phase[None, :] - cand[:, None], 1.0))
         if chi2 < best_chi2:
-            best_model, best_idx, best_shift, best_chi2 = flux, idx, float(shift), chi2
-
-    for i, shift in enumerate(shift_grid):
-        _try(shifted_obs_phase[i], shift, i)
-    if best_model is None:
-        return None, 0.0
-
-    # Local refinement within one coarse step, so a dense global grid is not
-    # needed for sub-grid accuracy.
-    n_refine = int(phase_shift_terms.get("refine_points", 0) or 0)
-    if n_refine > 1 and shift_grid.size >= 3 and best_idx >= 0:
-        step = 1.0 / float(shift_grid.size)
-        for shift in np.mod(np.linspace(best_shift - step, best_shift + step, n_refine), 1.0):
-            _try(np.mod(obs_phase - shift, 1.0), shift)
-
-    return best_model, best_shift
+            best_chi2, best_shift, best_model = chi2, float(cand[j] % 1.0), model
+        step = 2.0 * step / (search.n_fine - 1)
+    return best_model, best_shift, best_chi2
 
 
 # -----------------------------------------------------------------------------

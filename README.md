@@ -8,7 +8,7 @@ wind.
 
 Originally ported from R; the numerical core is a Numba-parallel
 Gauss-Legendre quadrature over the line of sight. One full light curve
-(360 phases, 60 angular sectors × 10 radial cells) takes ≈ 30 ms on a laptop,
+(360 phases, 60 angular sectors × 10 radial cells) takes ≈ 12 ms on a laptop,
 which is what makes direct-evaluation MCMC practical. The model is run **one
 energy band at a time**: each flux-vs-nH table holds a single band and each
 simulation produces a single `nfl_{band}` column.
@@ -22,7 +22,8 @@ For each orbital phase the code
 1. builds a polar grid across the projected emitter disk,
 2. integrates the wind density along the line of sight from every visible
    grid cell (sectors mirrored about the star–star line share their geometry,
-   so only half of them are integrated),
+   so only half of them are integrated; likewise phases γ and 180° − γ are
+   geometrically identical, so only half the orbit is computed),
 3. converts each cell's column density `N_H` to a band flux using an XSPEC
    `flux vs nH` table, and
 4. area-averages the result.
@@ -146,7 +147,10 @@ Only the **phase shift** is fitted in the x-direction and only an *additive*
 scattered-flux floor in the y-direction. There is deliberately no
 multiplicative flux scale: the absolute normalization is already set by Ṁ and
 the XSPEC table, so a free y-scale would silently absorb an error in that
-normalization instead of exposing it.
+normalization instead of exposing it. Both fitters find the shift with the
+same search: a scan over the full period with a step no larger than the data
+or model spacing, then two dense passes to a resolution of ~2e-5 in phase.
+The MCMC evaluates the model at `--dth 2` (180 phases) by default.
 
 ---
 

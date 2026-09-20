@@ -35,8 +35,8 @@ from utils.utils import (
     MODEL_OVERLAY_N_POINTS,
     band_label_from_column,
     detect_energy_bands,
+    eval_periodic,
     get_band_display_name,
-    model_from_wrap,
     obs_errors,
     prepare_model_interpolator,
 )
@@ -405,10 +405,10 @@ def plot_phase(
         # Overlay and residuals both come from the same evaluator used by
         # fit_simulation's χ², so the drawn curve, the residual panel and the
         # displayed χ² are guaranteed to describe the same model.
-        model_wrap = prepare_model_interpolator(sim_df, sim_column)
+        model_ext = prepare_model_interpolator(sim_df, sim_column)
         model_phase = np.linspace(0.0, 1.0, MODEL_OVERLAY_N_POINTS)
-        model_flux = model_from_wrap(*model_wrap, model_phase, shift, scatter)
-        obs_model = model_from_wrap(*model_wrap, obs_phase, shift, scatter)
+        model_flux = eval_periodic(*model_ext, model_phase, shift, scatter)
+        obs_model = eval_periodic(*model_ext, obs_phase, shift, scatter)
 
         # Self-check: the χ² we display must be the χ² of the model we drew.
         # This catches a `scatter` or `shift` that disagrees with the

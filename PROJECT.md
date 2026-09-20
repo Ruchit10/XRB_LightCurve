@@ -93,14 +93,14 @@ Neither analysis script imports the other. Everything they share lives in
   `resolve_band_directory`, `load_observed_lightcurves`), both binners
   (`phase_bin_data`, `phase_bin_data_snr` — their value columns keep the
   caller's names, so `flux`/`flux_err` needs no rename wrapper),
-  `smooth_lightcurve`, `estimate_scattered_flux`, periodic model interpolation
-  (`prepare_model_interpolator`, `model_from_wrap`,
+  `smooth_lightcurve`, `estimate_scattered_flux`, the single periodic model
+  interpolator (`periodic_model`, `eval_periodic`, `prepare_model_interpolator`,
   `interp_periodic_phases`), `obs_errors`, the tabulated-model χ² fit
   `fit_simulation`, the periodic phase-shift search it shares with the MCMC
-  likelihood (`build_phase_shift_terms`, `apply_best_phase_shift`),
-  `save_samples_csv_chunked`, and CLI run-config persistence
-  (`save_run_config`, `apply_saved_run_config`). Standard library plus
-  numpy / pandas / scipy only.
+  likelihood (`PhaseShiftSearch`, `build_phase_shift_search`,
+  `best_phase_shift`), `save_samples_csv_chunked`, and CLI run-config
+  persistence (`save_run_config`, `apply_saved_run_config`). Standard library
+  plus numpy / pandas only.
 * **`utils/plot_utils.py`** — `plot_lightcurve_fit` is the **single** light-curve
   drawing routine (the one that used to be inlined in
   `mcmc_lightcurve_fit.plot_best_fit`). Callers evaluate their own model and hand
@@ -182,6 +182,17 @@ over phases. Per phase it:
 4. Reduces to `flx = Σ(los·A)/ΣA` and `A2 = ΣA`, and returns the **per-cell**
    column and area arrays that the nonlinear `nH → flux` conversion needs.
 
+**Phase reflection (`_mirror_indices`).** The kernel sees the phase only
+through `sin(gma)` and `|cos(gma)|` (`l`, `z_start`, the occultation test), so
+`gma` and `π − gma` give identical columns and an `L` of opposite sign. On the
+uniform grid `gma_k = gma0 + k·dth` the reflection maps index `k` to
+`(m − k) mod n` with `m = (180 − 2·gma0)/dth`; whenever `m` is an integer (the
+default `gma0 = −90` with any `dth` dividing 360) `_simulate_core` runs the
+kernel and the flux conversion on one member of each pair only (181 of 360
+phases at `dth = 1`) and copies the rest. The two halves of a full computation
+already agreed only to trig round-off (≤ 2e-15, 6e-13 for rays grazing a
+`beta_law` photosphere), so the copy changes nothing measurable.
+
 The pre-Phase-33 kernel used `360/d2h + 1` rings, so the θ = 360° ring
 duplicated θ = 0° (sector 0 carried double weight, `ΣA = 61/60` of the area),
 and tested visibility at the sector's leading edge while integrating at its
@@ -214,11 +225,14 @@ interpolation in log–log space with end-segment extrapolation, the column
 clipped to `[1e-6, 1e6] × 1e22`) and `_cell_flux_exp` (`A·e^{-B·N}`) each take
 the kernel's per-cell columns and areas and return the area-averaged flux per
 phase in one `prange` pass; the former reproduces the previous
-`scipy.interp1d` path to 5e-15 in 1.6 ms instead of ~20 ms.
+`scipy.interp1d` path to 5e-15.
 
-Performance: one full light curve (`dth=1`, `d2h=6`) is **≈ 30 ms** on a
-laptop (8 threads), down from ≈ 70 ms before Phase 33, which is what makes
-direct-evaluation MCMC feasible.
+Performance: one full light curve (`smooth_pl`, `dth=1`, `d2h=6`) is
+**≈ 12 ms** on a laptop (8 threads): ≈ 70 ms before Phase 33, 30 ms after it,
+and 12 ms after Phase 34 halved the phases by reflection and cut the
+`smooth_pl` profile from three `pow` calls per quadrature node to two (`x⁻²`
+as a division, `x^−Δ` as the only pow besides the bracket). At the MCMC
+default `dth = 2` a curve costs ≈ 7 ms, at `dth = 5` ≈ 4 ms.
 
 ### `simulate_lightcurve(...)` and `simulate_band_flux(...)`
 
@@ -399,14 +413,15 @@ invalid errors patched with the median valid error):
 
 Shared by both the single-model and MCMC plot paths:
 
-- **`smooth_lightcurve(phase, flux, flux_err, sigma=0.01, n_eval=300, n_mc=2000, random_state=None)`**
+- **`smooth_lightcurve(phase, flux, flux_err, sigma=0.01, n_eval=300)`**
   — periodic Gaussian-kernel phase smoother. Periodic distance
   `d = |((φ_i - φ_eval + 0.5) mod 1) - 0.5|`, weights `exp(-½(d/σ)²)`, so it is
   continuous across `phase = 0/1`. The kernel is phase-distance only (no
   inverse-variance weighting), matching the MATLAB reference in `temp/LC_MC/`.
-  The 1σ band is a *vectorized* Monte Carlo: perturb all points at once and take
-  one matmul, `std` over `n_mc` realizations. Works equally on fixed-width bins,
-  constant-SNR bins, and raw unbinned data. `σ = 0.01` sits well below the
+  The smoother is linear in the data, so its 1σ band is the exact
+  `√(Σ w_i² σ_i²) / Σ w_i` (this replaced a 2000-draw Monte Carlo that was 25×
+  slower and itself noisy at the 1–6 % level). Works equally on fixed-width
+  bins, constant-SNR bins, and raw unbinned data. `σ = 0.01` sits well below the
   ~0.1–0.25 phase scale of real features and above the ~0.0002 raw sampling.
 - **`estimate_scattered_flux(phase, flux, window=(0.4, 0.6))`** — mean observed
   flux inside the mid-eclipse window (fallback `0.1 × median`, clamped ≥ 0).
@@ -426,21 +441,23 @@ Shared by both the single-model and MCMC plot paths:
   *additive* `scatter` floor, supplied by the caller (measured at mid-eclipse)
   rather than fitted. This matches `mcmc_lightcurve_fit.py`, which likewise
   fits a per-sample phase shift and an additive `f_scatter` but no scale.
-  With `--fit-phase-shift` the shift is found by a coarse scan over the full
-  period followed by bounded local refinement (χ²(shift) is periodic and
-  strongly multi-modal, so a local optimizer started at 0 would settle in the
-  wrong basin); otherwise the shift is held at 0. `dof = N - 1` when the shift
-  is fitted, `N` otherwise. Returns `(shift, reduced_χ²)`.
-- **`model_from_wrap(phase_wrap, flux_wrap, phases, shift, scatter)`** — the
-  single definition of "model flux at these phases", built on
-  `prepare_model_interpolator` (wrap-around `np.interp` arrays, accepts a
-  `phase` or `deg` column); it accepts an array-valued `shift` so batched
-  trial-shift scans use the identical expression. `fit_simulation`'s χ², the
-  `plot_phase` overlay, the residual panel and `write_model_lightcurve` all
-  route through it, so they cannot silently disagree.
-  `interp_periodic_phases(obs_phases, model_phase, model_flux)` is the
-  array-in/array-out counterpart, used by the MCMC likelihood which rebuilds the
-  curve every sample. `obs_errors(obs_df)` likewise centralizes uncertainty
+  With `--fit-phase-shift` the shift comes from the shared `best_phase_shift`
+  search (see *Per-sample phase-shift alignment* below); otherwise it is held
+  at 0. `dof = N - 1` when the shift is fitted, `N` otherwise. Returns
+  `(shift, reduced_χ²)`.
+- **`periodic_model(phase, flux)` / `eval_periodic(phase_ext, flux_ext, phases, shift, offset)`**
+  — the single periodic interpolator: the curve folded into `[0, 1)`, sorted,
+  duplicate abscissae removed, with one wrap point on each side so every query
+  in `[0, 1)` is bracketed; `eval_periodic` accepts an array-valued `shift` so
+  batched trial-shift scans use the identical expression.
+  `prepare_model_interpolator(sim_df, column)` is the CSV front end (accepts a
+  `phase` or `deg` column) and `interp_periodic_phases(obs_phases, phase, flux)`
+  the array-in/array-out convenience. `fit_simulation`'s χ², the `plot_phase`
+  overlay, the residual panel, `write_model_lightcurve` and the MCMC likelihood
+  all route through it, so they cannot silently disagree. (Before Phase 34 the
+  MCMC and the tabulated path had separate interpolators whose wrap ranges
+  differed: the `[0, 2)` tiling clamped queries below the first model phase.)
+  `obs_errors(obs_df)` likewise centralizes uncertainty
   extraction (given errors else `sqrt(|rate|)`, with zero/negative/non-finite
   floored) so the fit and the residuals weight points identically.
 - **`plot_lightcurve_fit(...)`** (`utils/plot_utils.py`) — **the one light-curve
@@ -478,14 +495,16 @@ Phase 33 consolidation).
 ### Forward model: direct only
 
 `DirectLightCurveModel` holds the run's band, flux table, wind model, `dth`
-and simulation constants; `evaluate(d1, d2, r, R, i0, phases, wind_params,
-f_opacity)` calls `simulate_band_flux` and interpolates onto the requested
-phases (`interp_periodic_phases`: monotonic fast path, `[-1, 0, +1]`
-triple-tiling so wrap-around is exact). At ~30 ms/LC this is fast enough for
-MCMC and is the only path that supports per-sample wind-shape parameters.
+(default 2°) and simulation constants; `curve(d1, d2, r, R, i0, wind_params,
+f_opacity)` calls `simulate_band_flux` and returns the kernel's native
+`(phase, flux)` arrays. Nothing is resampled: the likelihood interpolates that
+curve once, directly onto the (shifted) observed phases. At ≈ 7 ms per curve
+this is fast enough for MCMC and is the only path that supports per-sample
+wind-shape parameters.
 
 `FitData` bundles the observed arrays the likelihood needs (`phase`, `flux`,
-`err`, `err2`, the precomputed phase-shift search terms, bin widths).
+`err`, `err2`, bin widths) and the precomputed `PhaseShiftSearch` (`None` when
+the shift is held at 0).
 
 ### Parameterization: `ParamSpec`
 
@@ -513,8 +532,8 @@ Every consumer — `log_prior`, `log_likelihood`, `compute_statistics`,
 `compute_chi2_for_samples`, `compute_bic_metrics`, `plot_best_fit`,
 `plot_geometry_diagnostics`, `write_summary`, `replot_from_existing` — takes the
 `ParamSpec` and nothing else; there is no parallel `reparam/kepler/active_names`
-argument path. `evaluate_model(theta, spec, model, phases)` is the one place the
-physical model (including the additive `f_scatter`) is evaluated, and
+argument path. `model_curve(theta, spec, model)` is the one place the physical
+model (including the additive `f_scatter`) is evaluated, and
 `aligned_model_flux` / `chi2_terms` sit on top of it for the phase-shift search
 and the χ² reports.
 
@@ -598,20 +617,32 @@ frozen entries.
 ### Per-sample phase-shift alignment
 
 On by default. Rather than trusting the ephemeris to align model and data,
-*every* likelihood call searches for the phase shift that minimizes weighted χ²:
+*every* likelihood call searches for the phase shift that minimizes weighted χ²
+with `utils.best_phase_shift`, the same routine `fit_simulation` uses:
 
-1. Coarse uniform grid of `--phase-shift-grid-size` (default 25) shifts over
-   `[0,1)`, with the model evaluated once on a dense
-   `--phase-shift-eval-points` grid (default 240) and re-interpolated per shift.
-2. Local refinement over 9 points spanning ±1 coarse step around the best shift.
+1. One `np.interp` over the precomputed `(n_grid, n_obs)` matrix of shifted
+   observed phases gives χ² at every coarse shift. The coarse step must not
+   exceed the narrowest feature of χ²(shift), which is set by the data spacing
+   (a bin crossing the eclipse edge) and the model spacing (one `dth`), so
+   `n_grid = max(n_obs, 360/dth)` clipped to `[25, 400]`
+   (`--phase-shift-grid-size` overrides).
+2. Two dense passes of 33 points, each spanning ±1 previous step around the
+   best shift, bring the resolution to `step/256` (2e-5 for 180 coarse shifts).
 
-`build_phase_shift_terms` precomputes the shift grid, the evaluation grid, and
-the shifted observation-phase matrix once per run (stored in `FitData`).
-Because the shift is a per-sample nuisance minimization (not a sampled
-parameter), every consumer goes through `aligned_model_flux`, so the
-likelihood, `compute_chi2_for_samples`, `compute_bic_metrics` and
-`plot_best_fit` apply it identically. Disable with `--no-fit-phase-shift`.
-`f_scatter` is phase-invariant and so is unaffected by the shift search.
+Measured against a brute-force minimum on the real 150-bin light curve, the
+profiled χ² is within 0.006 of the true minimum for every sample. The
+pre-Phase-34 search (25-point grid, 9-point refinement) quantised the shift to
+0.01, coarser than the bin width, and sat a median 1.9 and up to 24 χ² units
+above the minimum; its intermediate 240-point resample of the model added a
+further ±7 units. The search costs 0.6 ms per call.
+
+`build_phase_shift_search` precomputes the trial shifts once per run (a frozen
+`PhaseShiftSearch` stored in `FitData`). Because the shift is a per-sample
+nuisance minimization (not a sampled parameter), every consumer goes through
+`aligned_model_flux`, so the likelihood, `compute_chi2_for_samples`,
+`compute_bic_metrics` and `plot_best_fit` apply it identically. Disable with
+`--no-fit-phase-shift`. `f_scatter` is phase-invariant and so is unaffected by
+the shift search.
 
 ### Samplers and parallelism
 
@@ -619,11 +650,15 @@ likelihood, `compute_chi2_for_samples`, `compute_bic_metrics` and
   better for correlated posteriors).
 - Walkers initialized at `prior['mean'] ± 0.1·prior['std']`, clipped just inside
   each box; `r ≥ R` walkers are repaired when both are free.
-- `--n-threads N > 1` opens a `spawn` multiprocessing pool. Because
-  `simulate_lightcurve` is itself Numba-`parallel=True`, each worker calls
-  `numba.set_num_threads(...)` via `_init_numba_worker` to avoid
-  oversubscription; the default is `max(1, cpu_count // n_threads)`, overridable
-  with `--numba-threads-per-worker`.
+- `--n-threads N > 1` opens a `spawn` multiprocessing pool. The fit context
+  (`ParamSpec`, priors, model, `FitData`) is sent to each worker once through
+  the pool initializer `_init_worker`, and the sampler calls
+  `_log_probability_worker(theta)`, so only `theta` crosses the pipe per task
+  (emcee and zeus would otherwise pickle every argument into every task, ~900 KB
+  per sample for unbinned data). Because the kernel is itself
+  Numba-`parallel=True`, the initializer also calls `numba.set_num_threads(...)`
+  to avoid oversubscription; the default is `max(1, cpu_count // n_threads)`,
+  overridable with `--numba-threads-per-worker`.
 
 ### Data path
 
@@ -668,10 +703,13 @@ non-finite / non-positive errors are patched to
   map_log_prob`, or `median_fallback`). BIC is the model-comparison metric;
   `ΔBIC` is reported relative to the best model in the run. Enable with
   `--compute-bic`.
-- `compute_chi2_for_samples` (`--save-chi2`) — per-sample χ² and reduced χ² for
-  the whole chain, gzip CSV. For jitter runs it emits *both* the classical
-  measurement-error χ² (comparable across likelihood choices) and the
-  effective-variance `chi2_eff`.
+- `compute_chi2_for_samples` (`--save-chi2`) — per-sample χ² and reduced χ²,
+  gzip CSV. With the `chi2` likelihood the table is read from the chain
+  (`χ² = −2·(log_prob − log_prior)` exactly; no model calls, every sample). For
+  jitter runs it emits *both* the classical measurement-error χ² (comparable
+  across likelihood choices) and the effective-variance `chi2_eff`, which needs
+  a model call per row, so it defaults to a 2000-sample subset
+  (`--chi2-n-samples`).
 - `postprocess_fit` — the block shared by a fresh fit and `--replot`: ArviZ,
   BIC, corner/trace/best-fit/geometry figures, the chi2 table.
   `write_summary` writes `mcmc_summary.txt`.

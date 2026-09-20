@@ -538,15 +538,81 @@ jitter) the new prior, likelihood and statistics agree with the previous file to
 ### Left as is
 
 - `fit_simulation` (single-model CLI) and `apply_best_phase_shift` (MCMC)
-  both do a coarse scan then refine, but with different refinement targets
-  (bounded scalar minimization vs a 9-point grid) for different model
-  representations; kept separate.
+  both did a coarse scan then refine, but with different refinement targets
+  (bounded scalar minimization vs a 9-point grid); kept separate here and
+  unified in Phase 34.
 - `compute_flux_vs_nH.py` keeps its own small exponential fit for the plot
   annotation so it does not depend on numba in the XSPEC environment.
 - `chandra_analysis_combined_flux.py` (untracked) is an unmigrated fork with
   its own multi-column helpers and a multiplicative flux scale; retiring it is
   recommended. The `utils/` data-prep scripts and the notebooks are unchanged
   (the notebooks were already stale).
+
+---
+
+## Phase 34 — Release Review: Performance, Correctness, Trimming (2026-09-19)
+
+A second review round before release (ten review angles plus benchmarks on the
+real 150-bin CIAO broad light curve), delivered as four commits in the order
+below. All numbers: `henv`, 8 threads unless stated.
+
+### Commit 1 — Halve the kernel by phase reflection, trim pow(), one exact shift search
+
+**Phase reflection.** The kernel depends on the phase only through `sin γ` and
+`|cos γ|`, so `γ` and `π − γ` give identical columns (`L` flips sign). With
+`gma0 = −90` and any `dth` dividing 360 the uniform grid maps onto itself
+(`_mirror_indices`), so `_simulate_core` runs the kernel and the flux
+conversion on one member of each pair (181 of 360 phases at `dth = 1`) and
+copies the rest. A full computation's two halves already agreed only to trig
+round-off (≤ 2e-15; 6e-13 for rays grazing a `beta_law` photosphere).
+
+**`smooth_pl` profile.** `x⁻²` as a division and `x^−Δ` as the only pow besides
+the bracket: 3 → 2 `pow` per quadrature node, kernel ×0.75, agreement 5e-16.
+
+**Phase-shift search** (`utils.best_phase_shift`, one implementation for the
+MCMC likelihood and `fit_simulation`): a single `np.interp` over the
+precomputed `(n_grid, n_obs)` matrix instead of 34 Python calls; the coarse
+step tied to the data and model spacing (`n_grid = max(n_obs, 360/dth)`,
+clipped to `[25, 400]`); two 33-point dense passes (resolution `step/256`); and
+the kernel's native curve interpolated once onto the shifted observed phases,
+dropping the intermediate 240-point resample (`--phase-shift-eval-points`
+removed). On 25 prior draws the profiled χ² is now within 0.006 of a
+brute-force minimum; the old search sat a median 1.9 (max 24) χ² above it and
+the resample added ±7 more. `periodic_model` / `eval_periodic` replace the two
+periodic interpolators (`interp_periodic_phases` with `[−1, 0, +1]` tiling and
+`prepare_model_interpolator` / `model_from_wrap` with `[0, 2)` tiling, which
+clamped queries below the first model phase). `FitData` holds a frozen
+`PhaseShiftSearch` instead of a dict of terms.
+
+**Also.** `--dth` default 5 → 2: the `dth = 5` discretisation was the largest
+likelihood error (−479…+178 χ² across prior draws against a `dth = 0.25`
+reference, ≤ 1.6 near the prior means) and `dth = 2` now costs what `dth = 5`
+did. `--save-chi2` with the `chi2` likelihood reads χ² from the chain
+(`−2(log_prob − log_prior)`, agrees with direct evaluation to 1e-14, no model
+calls); jitter runs default to a 2000-sample subset. The smoothing band is the
+exact `√(Σw²σ²)/Σw` of a linear smoother instead of a 2000-draw Monte Carlo
+(`--smooth-n-mc`, `--smooth-seed` removed; agrees with a 40 000-draw MC within
+its noise). Pooled runs send the fit context once through the pool
+initializer, so only `theta` is pickled per task. `chandra_phase_analysis`
+computes the smoothed overlay once instead of in both branches.
+
+| | HEAD | Commit 1 |
+| --- | --- | --- |
+| kernel, `smooth_pl`, `dth = 1` | 28.7 ms | 15.1 ms (reflection) → 11.3 ms (+ pow) |
+| one light curve, `dth = 1` | 30 ms | 12 ms |
+| `log_probability`, 150 bins, `dth = 5` | 8.2 ms | 4.1 ms |
+| `log_probability`, `dth = 2` (new default) | 20.8 ms | 7.9 ms |
+| shift search | 1.0 ms | 0.6 ms |
+
+Verification: forward model vs HEAD ≤ 6e-13 relative over 6 geometries × 3
+profiles × 4 `dth` (including a grid without the symmetry, which takes the
+full path); likelihood with the shift held at 0 identical to 5e-13; the
+tabulated fit on the CIAO broad data gives the same shift (0.98351) and χ²/dof
+(93.410) as HEAD's Brent refinement; tests 6/6; emcee serial with `--save-chi2`
+and `--compute-bic`, emcee with a 2-process pool, zeus with `--smooth`, and
+`--replot` all run. The MCMC path constructs no pandas DataFrame (checked by
+counting constructions over 20 likelihood calls: 0), so the Phase 33 item
+"return arrays, not a DataFrame, on the likelihood path" is closed.
 
 ---
 

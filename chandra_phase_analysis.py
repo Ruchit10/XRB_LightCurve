@@ -95,11 +95,11 @@ from utils.utils import (
     band_label_from_column,
     detect_flux_columns,
     estimate_scattered_flux,
+    eval_periodic,
     fit_simulation,
     frac,
     interp_periodic_phases,
     load_data,
-    model_from_wrap,
     obs_errors,
     phase_bin_data,
     phase_bin_data_snr,
@@ -121,12 +121,12 @@ __all__ = [
     "band_label_from_column",
     "detect_flux_columns",
     "estimate_scattered_flux",
+    "eval_periodic",
     "fit_simulation",
     "frac",
     "interp_periodic_phases",
     "load_data",
     "main",
-    "model_from_wrap",
     "obs_errors",
     "phase_bin_data",
     "phase_bin_data_snr",
@@ -272,18 +272,6 @@ def main() -> None:
         help="Gaussian kernel width in phase units for smoothing.",
     )
     parser.add_argument(
-        "--smooth-n-mc",
-        type=int,
-        default=2000,
-        help="Number of Monte Carlo perturbations for smoothing uncertainty (0 disables band).",
-    )
-    parser.add_argument(
-        "--smooth-seed",
-        type=int,
-        default=None,
-        help="RNG seed for smoothing Monte Carlo perturbations.",
-    )
-    parser.add_argument(
         "--scatter",
         type=float,
         default=None,
@@ -394,10 +382,20 @@ def main() -> None:
             )
         is_binned = True
 
+    smooth_df = None
+    if args.smooth:
+        smooth_df = smooth_lightcurve(
+            df["phase"].to_numpy(dtype=float),
+            df["rate"].to_numpy(dtype=float),
+            df["error"].to_numpy(dtype=float) if "error" in df.columns else None,
+            sigma=float(args.smooth_sigma),
+            verbose=True,
+        )
+
     if args.fit:
         if not args.sim_file:
             parser.error("--fit requires --sim-file to be specified.")
-        
+
         if args.scatter is not None:
             scatter_value = float(args.scatter)
             print(f"Using fixed scattered flux: {scatter_value:.6g}")
@@ -408,18 +406,6 @@ def main() -> None:
                 window=(float(args.scatter_eclipse_phase[0]), float(args.scatter_eclipse_phase[1])),
             )
             print(f"Estimated scattered flux from eclipse window: {scatter_value:.6g}")
-
-        smooth_df = None
-        if args.smooth:
-            smooth_df = smooth_lightcurve(
-                df["phase"].to_numpy(dtype=float),
-                df["rate"].to_numpy(dtype=float),
-                df["error"].to_numpy(dtype=float) if "error" in df.columns else None,
-                sigma=float(args.smooth_sigma),
-                n_mc=int(args.smooth_n_mc),
-                random_state=args.smooth_seed,
-                verbose=True,
-            )
 
         print(f"Loading simulation file: {args.sim_file}")
         sim_df = pd.read_csv(args.sim_file)
@@ -464,17 +450,6 @@ def main() -> None:
             is_binned=is_binned, smooth_df=smooth_df, scatter=scatter_value,
         )
     else:
-        smooth_df = None
-        if args.smooth:
-            smooth_df = smooth_lightcurve(
-                df["phase"].to_numpy(dtype=float),
-                df["rate"].to_numpy(dtype=float),
-                df["error"].to_numpy(dtype=float) if "error" in df.columns else None,
-                sigma=float(args.smooth_sigma),
-                n_mc=int(args.smooth_n_mc),
-                random_state=args.smooth_seed,
-                verbose=True,
-            )
         plot_phase(
             df,
             args.output,
