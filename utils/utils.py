@@ -143,6 +143,23 @@ def detect_flux_columns(df: pd.DataFrame) -> List[str]:
     return [f"nfl_{band}" for band in detect_energy_bands(df)]
 
 
+def fit_exponential(nh: np.ndarray, flux: np.ndarray) -> Tuple[float, float]:
+    """Least-squares fit of ``flux = A exp(-B nh)`` in log space, as ``(A, B)``.
+
+    Fitting ``log flux = log A - B nh`` gives every point equal weight
+    regardless of magnitude, appropriate for data spanning many decades. Shared
+    by the simulator's ``refit`` flux method and by ``compute_flux_vs_nH.py``'s
+    figure annotation, so the law drawn on the table is the law the model uses.
+    """
+    nh = np.asarray(nh, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+    valid = np.isfinite(nh) & np.isfinite(flux) & (flux > 0) & (nh > 0)
+    if np.count_nonzero(valid) < 2:
+        raise ValueError("Exponential fit needs at least two valid (nH, flux) points")
+    slope, intercept = np.polyfit(nh[valid], np.log(flux[valid]), 1)
+    return float(np.exp(intercept)), float(-slope)
+
+
 # -----------------------------------------------------------------------------
 # Observation reading
 # -----------------------------------------------------------------------------
@@ -202,12 +219,11 @@ def _detect_error_column(df: pd.DataFrame, obs_col: str,
     """Error column belonging to *obs_col*, or None.
 
     An explicitly requested name wins (with a warning if it is absent).
-    Otherwise candidates are matched case-insensitively and a candidate equal
-    to the observable itself is always skipped -- a lower-case ``flux_t`` once
-    matched its own column and set error := flux. ``rate_err`` measures the
-    rate, so it is only offered when the observable *is* the rate; for a
-    proportional column such as ``flux_t`` it has the wrong scale and the
-    caller derives the error from it instead (:func:`_derive_err_from_rate_err`).
+    Otherwise ``{OBS}_ERR`` and ``ERR_{OBS}`` are matched case-insensitively.
+    ``rate_err`` measures the rate, so it is only offered when the observable
+    *is* the rate; for a proportional column such as ``flux_t`` it has the
+    wrong scale and the caller derives the error from it instead
+    (:func:`_derive_err_from_rate_err`).
     """
     if requested:
         col = find_column(df, requested)
@@ -217,17 +233,10 @@ def _detect_error_column(df: pd.DataFrame, obs_col: str,
                       f"auto-detecting. Available columns: {list(df.columns)}")
 
     obs_upper = str(obs_col).upper()
-    candidates = [
-        f"{obs_upper}_ERR",
-        f"ERR_{obs_upper}",
-        obs_upper.replace("RATE", "ERR_RATE"),
-        obs_upper.replace("FLUX", "FLUX_ERR"),
-    ]
+    candidates = [f"{obs_upper}_ERR", f"ERR_{obs_upper}"]
     if obs_upper in {"RATE", "COUNT_RATE", "NET_RATE"}:
         candidates += ["RATE_ERR", "ERR_RATE", "COUNT_RATE_ERR"]
-    for name in dict.fromkeys(candidates):
-        if name == obs_upper:
-            continue
+    for name in candidates:
         col = find_column(df, name)
         if col is not None:
             return col
@@ -1039,6 +1048,39 @@ def fit_simulation(
     return float(best_shift), float(reduced_chi2)
 
 
+def write_model_blocks(f, model_phase, model_flux, obs_phase, obs_flux, obs_err, obs_model) -> None:
+    """Write the two data blocks of a model dump to an open text file.
+
+    BLOCK 1 is the dense model curve (phase already shifted to the observed
+    frame, any additive floor included), BLOCK 2 the observed points with the
+    model at their phases and the normalized residual. Both are plain
+    whitespace-delimited tables under ``#`` comments, so
+    ``np.genfromtxt(..., names=True)`` reads either after selecting its rows.
+    Shared by :func:`write_model_lightcurve` (tabulated fit) and
+    ``mcmc_lightcurve_fit._write_bestfit_model_txt``.
+    """
+    model_phase = np.asarray(model_phase, dtype=float)
+    model_flux = np.asarray(model_flux, dtype=float)
+    obs_phase = np.asarray(obs_phase, dtype=float)
+    obs_flux = np.asarray(obs_flux, dtype=float)
+    obs_err = np.asarray(obs_err, dtype=float)
+    obs_model = np.asarray(obs_model, dtype=float)
+
+    f.write("#\n# --- BLOCK 1: dense model curve (phase already shifted to the "
+            "observed frame, scatter added) ---\n")
+    f.write("phase model_flux\n")
+    for p_val, flux_val in zip(model_phase, model_flux):
+        f.write(f"{p_val:.8f} {flux_val:.8e}\n")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        resid = (obs_flux - obs_model) / obs_err
+    f.write("#\n# --- BLOCK 2: observed bins vs model ---\n")
+    f.write("phase obs_flux obs_err model_flux resid_sigma\n")
+    for idx in np.argsort(obs_phase):
+        f.write(f"{obs_phase[idx]:.8f} {obs_flux[idx]:.8e} {obs_err[idx]:.8e} "
+                f"{obs_model[idx]:.8e} {resid[idx]:.6f}\n")
+
+
 def write_model_lightcurve(
     path: str,
     obs_df: pd.DataFrame,
@@ -1047,7 +1089,6 @@ def write_model_lightcurve(
     shift: float,
     scatter: float = 0.0,
     *,
-    red_chi2: Optional[float] = None,
     shift_fitted: bool = False,
     obs_column: str = "rate",
     sim_file: Optional[str] = None,
@@ -1060,16 +1101,9 @@ def write_model_lightcurve(
     contents: :func:`fit_simulation` slides the model in phase and adds the
     ``scatter`` floor, so reproducing the drawn curve from the simulation CSV
     alone means re-applying both by hand. Here they are already applied, and the
-    header records them so the transformation stays auditable.
-
-    Two blocks, matching ``mcmc_lightcurve_fit._write_bestfit_model_txt``: the
-    dense model curve on the plotting grid, then the observed bins with the
-    model at their phases and the normalized residual. Both are plain
-    whitespace-delimited tables under ``#`` comments, so
-    ``np.genfromtxt(..., names=True)`` reads either after selecting its rows.
-
-    Every model value routes through :func:`eval_periodic`, the same evaluator
-    used by the χ² and the plot overlay, so the three cannot disagree.
+    header records them so the transformation stays auditable. Every model
+    value routes through :func:`eval_periodic`, the same evaluator used by the
+    χ² and the plot overlay; the blocks come from :func:`write_model_blocks`.
 
     Returns the path written.
     """
@@ -1106,34 +1140,7 @@ def write_model_lightcurve(
                 "native normalization.\n")
         f.write(f"# chi2/dof: {chi2_total / dof:.6g}  (chi2 = {chi2_total:.6g}, "
                 f"dof = {dof} = {len(obs_flux)} bins - {n_free} free)\n")
-        if red_chi2 is not None and np.isfinite(red_chi2):
-            # Guards against a shift/scatter here that disagrees with the
-            # fit_simulation call, exactly as plot_phase's self-check does.
-            if abs(chi2_total / dof - float(red_chi2)) > 0.01 * max(
-                abs(float(red_chi2)), 1e-300
-            ):
-                warnings.warn(
-                    f"write_model_lightcurve: recomputed reduced chi2 "
-                    f"({chi2_total / dof:.4g}) does not match the value reported by "
-                    f"the fit ({float(red_chi2):.4g}); the shift/scatter passed here "
-                    f"probably differ from the fit_simulation call.",
-                    stacklevel=2,
-                )
-        f.write("#\n")
-        f.write("# --- BLOCK 1: dense model curve (phase already shifted to the "
-                "observed frame, scatter added) ---\n")
-        f.write("phase model_flux\n")
-        for p_val, flux_val in zip(model_phase, model_flux):
-            f.write(f"{p_val:.8f} {flux_val:.8e}\n")
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            resid = (obs_flux - obs_model) / obs_err
-        order = np.argsort(obs_phase)
-        f.write("#\n# --- BLOCK 2: observed bins vs model ---\n")
-        f.write("phase obs_flux obs_err model_flux resid_sigma\n")
-        for idx in order:
-            f.write(f"{obs_phase[idx]:.8f} {obs_flux[idx]:.8e} {obs_err[idx]:.8e} "
-                    f"{obs_model[idx]:.8e} {resid[idx]:.6f}\n")
+        write_model_blocks(f, model_phase, model_flux, obs_phase, obs_flux, obs_err, obs_model)
 
     if verbose:
         print(f"Model light curve written to: {path}")
@@ -1357,12 +1364,8 @@ def find_run_configs(
     band: Optional[str] = None,
     wind_model: Optional[str] = None,
 ) -> List[str]:
-    """Saved run-config paths in *output_dir*, optionally filtered.
-
-    ``band='all'`` counts as unspecified: it is a fit-many-bands request, not
-    the name of a saved fit.
-    """
-    b = band if (band and band != 'all') else "*"
+    """Saved run-config paths in *output_dir*, optionally filtered."""
+    b = band if band else "*"
     w = wind_model if wind_model else "*"
     return sorted(glob.glob(os.path.join(output_dir, f"{b}_{w}{RUN_CONFIG_SUFFIX}")))
 

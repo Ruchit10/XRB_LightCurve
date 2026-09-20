@@ -717,6 +717,55 @@ headerless files, no-error data, empty binning, duplicate `nH` rows and
 directory exits 1; the tabulated fit runs on both data layouts and the tests
 pass 6/6.
 
+### Commit 4 — Trimming: one source for the defaults, the XSPEC script, shared helpers
+
+No numerical change: the forward model, the likelihood and every observation
+file read identically to the Commit 3 tree (max difference 0.0).
+
+- **Simulator defaults defined once.** `_simulate_core` is keyword-only with
+  the defaults in its signature; `SIM_DEFAULTS` exports them and the
+  `xrb_lightcurve.py` CLI, `DirectLightCurveModel.sim_kwargs` and the MCMC
+  argparse defaults read from it, while the wind-shape CLI defaults come from
+  `default_wind_params`. `simulate_lightcurve(verbose=False, **kwargs)` and
+  `simulate_band_flux(**kwargs)` forward their keywords, so a misspelled one
+  raises `TypeError` (`simulate_band_flux` used to pull every argument with
+  `kwargs.get(name, default)`; `f_opa=0.02` ran silently at `f_opacity = 1`).
+  The unused fourth profile slot `p4` is gone from `pack_wind_params`,
+  `_g_profile`, the quadrature and the kernel signature. `_simulate_core`
+  returns the columns in output order, so the DataFrame is one comprehension.
+- **`compute_flux_vs_nH.py` 930 → 384 lines.** PyXspec parameters by index
+  (`.values = x`, `.values[0]`, `.sigma` instead of the never-populated
+  `.error`); the unreachable index-vs-name fallbacks removed; spectrum files
+  matched on file names with the background identified first; background and
+  RMF/ARF attached explicitly and loudly; the energy grid and plot device set
+  once; `np.trapezoid`; the figure's exponential law is `utils.fit_exponential`
+  (moved to `utils/utils.py`, which is numpy/pandas only and therefore
+  importable in the XSPEC environment; `xrb_lightcurve` imports it from
+  there). Exercised end to end against a PyXspec stand-in; the resulting table
+  is consumed by `simulate_band_flux`.
+- **Shared helpers.** `write_model_blocks` writes the two data blocks of both
+  model dumps (`write_model_lightcurve`, `_write_bestfit_model_txt`); the two
+  χ² self-checks in `plot_phase` and `write_model_lightcurve`, which guarded a
+  shift/scatter mismatch that the single caller cannot produce, are gone, as is
+  the `red_chi2` argument they needed.
+- **Small items.** `plot_corner`/`plot_trace` draw on their own figure and plot
+  all walkers in one call; `getattr(args, …, default)` restating argparse
+  defaults replaced by `args.x`; the unused `stats` argument of the model dump
+  removed; `_detect_error_column` drops the `.replace` candidates that never
+  matched a file; `find_run_configs` drops the `band='all'` case; the `--rescale`
+  alias and the duplicated smoothing block in `chandra_phase_analysis` are gone
+  and `--obs-column` defaults to `rate` in argparse; the test uses
+  `np.isfinite`; f-strings without placeholders and an unused import fixed.
+- **Data-prep scripts.** `utils/convert_fits_to_txt.py` looked for the data
+  under `utils/data/` since the move into `utils/`; it now resolves the
+  repository root. `utils/add_flux_to_lightcurves.py` failed with `KeyError`
+  on the converted layout and duplicated `add_flux_simple.py`; removed.
+  `get_average_count_rates.py` no longer swallows every exception or points at
+  a script that does not exist. `scipy` is no longer imported anywhere and
+  leaves `requirements.txt` (emcee and arviz pull it in).
+
+Tracked Python: 7712 → 6945 lines across the four commits.
+
 ---
 
 ## Side Investigation — Reference Epoch
@@ -735,19 +784,19 @@ interpretability of plotted phases; the study script is not in the tree.
 ### Core simulation / inference
 | File | Lines | Description |
 | ---- | ----- | ----------- |
-| `xrb_lightcurve.py` | ~1030 | Forward model: profiles, Numba GL kernel with mirror-symmetric sectors, compiled per-cell flux conversion, `simulate_lightcurve` / `simulate_band_flux`, physical normalization. |
-| `mcmc_lightcurve_fit.py` | ~1900 | emcee/zeus MCMC: `MODES`, `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
-| `chandra_phase_analysis.py` | ~490 | CLI for the single-model χ² fit; re-exports the shared `utils/` API for the notebooks. |
-| `utils/utils.py` | ~1570 | Ephemeris, loading, both binners, smoothing, periodic model interpolation + phase-shift search, `fit_simulation`, run-config persistence. |
-| `utils/plot_utils.py` | ~940 | All plotting on the single `plot_lightcurve_fit`; geometry and wind-profile figures. |
-| `compute_flux_vs_nH.py` | ~930 | XSPEC flux-vs-nH table generator, one band per table. |
+| `xrb_lightcurve.py` | ~1050 | Forward model: profiles, Numba GL kernel (mirror-symmetric sectors, half the orbit by phase reflection), compiled per-cell flux conversion, `simulate_lightcurve` / `simulate_band_flux`, `SIM_DEFAULTS`, physical normalization. |
+| `mcmc_lightcurve_fit.py` | ~1950 | emcee/zeus MCMC: `MODES`, `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
+| `chandra_phase_analysis.py` | ~450 | CLI for the single-model χ² fit; re-exports the shared `utils/` API. |
+| `utils/utils.py` | ~1500 | Ephemeris, loading, `sanitize_errors`, both binners, smoothing, the periodic interpolator + phase-shift search, `fit_simulation`, model-dump blocks, run-config persistence. |
+| `utils/plot_utils.py` | ~900 | All plotting on the single `plot_lightcurve_fit`; geometry and wind-profile figures. |
+| `compute_flux_vs_nH.py` | ~380 | XSPEC flux-vs-nH table generator, one band per table. |
 | `plot_results.py` | 104 | Thin CLI over `utils/plot_utils.py` (`--geometric`, `--orbit`). |
 
 ### Utilities, scripts, references
 `utils/` is a package (`utils.py`, `plot_utils.py`); `test_flux_methods.py` is
 the regression test; `convert_fits_to_txt.py`, `add_flux_simple.py`,
-`add_flux_to_lightcurves.py`, `get_average_count_rates.py` are standalone
-data-prep scripts. `rkp_run_w_mcmc_cmds.sh` is the worked command sequence.
+`get_average_count_rates.py` are standalone data-prep scripts
+(`add_flux_to_lightcurves.py` was removed in Phase 34). `rkp_run_w_mcmc_cmds.sh` is the worked command sequence.
 Reference PDFs: `Wind_Density.pdf` (profile equations), `stu2151.pdf`
 (Laycock et al. 2015), `manuscript_1.pdf` (2017 MS thesis). `paper/` holds the
 MDPI *Algorithms* manuscript skeleton and bibliography. Legacy R code in

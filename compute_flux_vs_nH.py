@@ -1,78 +1,58 @@
 #!/usr/bin/env python3
 """
-Compute photon flux as a function of hydrogen column density (nH) for X-ray energy bands
-using XSPEC via its Python API.
-
-Simplified version supporting three absorption models:
-- phabs*powerlaw (photoelectric absorption, Morrison & McCammon 1983)
-- tbabs*powerlaw (Tuebingen-Boulder ISM absorption, Wilms et al. 2000)
-- wabs*powerlaw (Wisconsin absorption, Morrison & McCammon 1983)
+Tabulate the model flux of an absorbed power law against the hydrogen column
+density nH, using XSPEC through PyXspec.
 
 Workflow:
-1. Load spectrum data (PHA + responses) from directory
-2. Fit specified absorption*powerlaw model to data
-3. Log best-fit parameters
-4. Freeze powerlaw parameters (PhoIndex, norm)
-5. Vary nH over a grid and compute photon flux in each energy band
-6. Save CSV and comparison plot
+1. Load the spectrum (PHA/PI, plus background and responses when present) from
+   --specdir.
+2. Fit {phabs,tbabs,wabs}*powerlaw over --fit_emin/--fit_emax.
+3. Freeze the power-law parameters (PhoIndex, norm).
+4. Step nH over a log grid and integrate the model spectrum over the requested
+   band: photon flux (photons/cm^2/s) and energy flux (erg/cm^2/s).
+5. Save one CSV per band (the light-curve model is run one band at a time) and
+   a diagnostic figure with the exponential law F = A exp(-B nH) that the
+   simulator's `refit` flux method uses.
 
-Supported Instruments and Energy Bands:
-  Chandra (default):
-    - broad: 0.5–7.0 keV
-    - soft: 0.5–2.0 keV
-    - medium: 1.2–2.0 keV
-    - hard: 2.0–7.0 keV
+Chandra bands: broad 0.5-7.0, soft 0.5-2.0, medium 1.2-2.0, hard 2.0-7.0 keV.
 
-Run this under a conda environment with XSPEC Python (e.g., `henv`).
+Requires PyXspec (HEASoft): initialise HEASoft first, e.g. under the `henv`
+conda environment. Everything else needs only numpy, pandas and matplotlib
+(`utils.utils` is numpy/pandas only, so this script never imports numba).
 
 Example:
-  python compute_flux_vs_nH.py \\
-      --specdir ./data/IC10X1_spec \\
-      --model tbabs \\
-      --statistic chi \\
-      --fit_emin 0.5 --fit_emax 7.0 \\
-      --band broad \\
-      --out_csv flux_vs_nH.csv \\
-      --out_png flux_vs_nH.png \\
+  python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec --model tbabs \\
+      --band broad --out_csv flux_vs_nH_broad.csv --out_png flux_vs_nH_broad.png \\
       --nH_min 1e20 --nH_max 1e24 --nH_points 60
 
 Notes:
-- XSPEC absorption nH parameter is in 1e22 cm^-2
-- This script accepts nH in cm^-2 and converts accordingly
-- Photon flux is computed by integrating the unfolded model spectrum (photons/cm^2/s/keV)
-- Fitting range (--fit_emin, --fit_emax) determines which channels are used for parameter fitting
-- Flux computation uses band-specific ranges (e.g., soft: 0.5-2.0, hard: 2.0-7.0)
-- These can differ: you might fit over 0.5-7.0 keV but compute flux in separate soft/hard bands
+- XSPEC's absorption nH is in 1e22 cm^-2; the grid here is given in cm^-2 and
+  the CSV carries both (`nH_cm2`, `nH_1e22`).
+- The model is sampled directly (AllModels.setEnergies + Plot("model")), i.e.
+  the intrinsic model flux, not a data-derived quantity.
+- The fitting range and the flux band may differ (fit 0.5-7 keV, tabulate soft).
 """
 
 import argparse
 import glob
 import os
 import sys
-from typing import Tuple, Optional, Dict
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import curve_fit
 
-# XSPEC must be available in the active Python environment
+from utils.utils import fit_exponential
+
 try:
-    from xspec import (  # type: ignore
-        AllData,
-        AllModels,
-        Model,
-        Fit,
-        Xset,
-        Plot,
-    )
+    from xspec import AllData, AllModels, Fit, Model, Plot, Xset  # type: ignore
 except Exception as exc:
     print("Error: XSPEC Python module not available in this environment.")
-    print("Ensure you run this under your conda env (e.g., 'henv') with XSPEC installed.")
+    print("Initialise HEASoft (PyXspec) first, e.g. under the 'henv' conda env.")
     print(f"Details: {exc}")
     sys.exit(1)
 
 
-# ========== INSTRUMENT-SPECIFIC ENERGY BANDS ==========
 INSTRUMENT_BANDS = {
     "chandra": {
         "broad": (0.5, 7.0),
@@ -81,89 +61,86 @@ INSTRUMENT_BANDS = {
         "hard": (2.0, 7.0),
     },
 }
+ABSORPTION_MODELS = ("phabs", "tbabs", "wabs")
 
-# Supported absorption models
-ABSORPTION_MODELS = ["phabs", "tbabs", "wabs"]
+_KEV_TO_ERG = 1.60218e-9                                   # 1 keV in erg
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz    # numpy 2 renamed trapz
+
+
+# ----------------------------------------------------------------------------
+# Spectrum files
+# ----------------------------------------------------------------------------
+
+def _pick(paths, keywords) -> Optional[str]:
+    """First path whose *file name* contains one of *keywords* (case-insensitive)."""
+    for path in paths:
+        name = os.path.basename(path).lower()
+        if any(key in name for key in keywords):
+            return path
+    return None
 
 
 def find_spectrum_files(specdir: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
-    """
-    Locate source PHA/PI, optional background, and responses in specdir.
-    Returns (src_pha_or_pi, bkg_pha_or_pi, rmf, arf)
-    """
-    pha_patterns = ["*.pha", "*.pha.gz", "*.pi", "*.pi.gz"]
-    all_spec = []
-    for pat in pha_patterns:
-        all_spec.extend(sorted(glob.glob(os.path.join(specdir, pat))))
+    """Locate the source PHA/PI, the background and the responses in *specdir*.
 
-    if not all_spec:
+    Keywords are matched against file names only: matching the full path
+    picked the background as the source whenever a directory was called
+    ``src``. The background is identified first so a file such as
+    ``acisf_src_bkg.pi`` cannot be taken for the source.
+
+    Returns ``(src, bkg, rmf, arf)``; the last three may be None.
+    """
+    spectra = []
+    for pattern in ("*.pha", "*.pha.gz", "*.pi", "*.pi.gz"):
+        spectra.extend(glob.glob(os.path.join(specdir, pattern)))
+    spectra = sorted(spectra)
+    if not spectra:
         raise FileNotFoundError(f"No PHA/PI files found in {specdir}")
 
-    # Prefer files with 'src' or 'source' in name
-    src = None
-    for spec in all_spec:
-        if any(keyword in spec.lower() for keyword in ["_src", "source", "src"]):
-            src = spec
-            break
-    if src is None:
-        src = all_spec[0]
+    bkg = _pick(spectra, ("bkg", "background"))
+    candidates = [p for p in spectra if p != bkg]
+    if not candidates:
+        raise FileNotFoundError(f"Only a background spectrum found in {specdir}")
+    src = _pick(candidates, ("src", "source")) or candidates[0]
 
-    # Find background
-    remaining = [p for p in all_spec if p != src]
-    bkg = None
-    for spec in remaining:
-        if any(keyword in spec.lower() for keyword in ["_bkg", "background", "bkg"]):
-            bkg = spec
-            break
-
-    # Find responses
-    rmf_list = sorted(glob.glob(os.path.join(specdir, "*.rmf")))
-    arf_list = sorted(glob.glob(os.path.join(specdir, "*.arf")))
-
-    rmf = None
-    for r in rmf_list:
-        if any(keyword in r.lower() for keyword in ["_src", "source", "src"]):
-            rmf = r
-            break
-    if rmf is None and rmf_list:
-        rmf = rmf_list[0]
-
-    arf = None
-    for a in arf_list:
-        if any(keyword in a.lower() for keyword in ["_src", "source", "src"]):
-            arf = a
-            break
-    if arf is None and arf_list:
-        arf = arf_list[0]
-
+    rmfs = sorted(glob.glob(os.path.join(specdir, "*.rmf")))
+    arfs = sorted(glob.glob(os.path.join(specdir, "*.arf")))
+    rmf = _pick(rmfs, ("src", "source")) or (rmfs[0] if rmfs else None)
+    arf = _pick(arfs, ("src", "source")) or (arfs[0] if arfs else None)
     return src, bkg, rmf, arf
 
 
-def load_xspec_spectrum(pha_or_pi: str, bkg: Optional[str], rmf: Optional[str], arf: Optional[str]) -> None:
-    """Load spectrum into XSPEC and attach background."""
+def load_xspec_spectrum(src: str, bkg: Optional[str], rmf: Optional[str], arf: Optional[str]) -> None:
+    """Load the spectrum into XSPEC and attach the background and responses found.
+
+    XSPEC resolves file names relative to the working directory, hence the
+    temporary chdir. Attaching is not guarded: a background or response that
+    cannot be attached used to be swallowed, and the fit proceeded silently
+    without it.
+    """
     AllData.clear()
     AllModels.clear()
-
-    specdir = os.path.dirname(os.path.abspath(pha_or_pi))
-    src_base = os.path.basename(pha_or_pi)
-    bkg_base = os.path.basename(bkg) if bkg else None
-
     cwd = os.getcwd()
     try:
-        os.chdir(specdir)
-        AllData(src_base)
-        try:
-            sp = AllData(1)
-            if bkg_base:
-                sp.background = bkg_base
-        except Exception:
-            pass
+        os.chdir(os.path.dirname(os.path.abspath(src)))
+        AllData(os.path.basename(src))
+        spectrum = AllData(1)
+        if bkg:
+            spectrum.background = os.path.basename(bkg)
+        if rmf:
+            spectrum.response = os.path.basename(rmf)
+        if arf:
+            spectrum.response.arf = os.path.basename(arf)
     finally:
         os.chdir(cwd)
 
 
+# ----------------------------------------------------------------------------
+# Spectral fit
+# ----------------------------------------------------------------------------
+
 def fit_model(
-    model_name: str, 
+    model_name: str,
     statistic: str = "chi",
     init_nH: float = 0.55,
     init_PhoIndex: float = 1.89,
@@ -171,759 +148,236 @@ def fit_model(
     fit_emin: float = 0.5,
     fit_emax: float = 7.0,
 ) -> Dict[str, float]:
-    """
-    Fit absorption*powerlaw model to loaded spectrum.
-    
-    Args:
-        model_name: Absorption model name (phabs, tbabs, or wabs)
-        statistic: Fit statistic ('chi' or 'cstat')
-        init_nH: Initial nH value in 1e22 cm^-2 (default: 0.55)
-        init_PhoIndex: Initial powerlaw photon index (default: 1.89)
-        init_norm: Initial powerlaw normalization (default: 1e-4)
-        fit_emin: Minimum energy for fitting in keV (default: 0.5)
-        fit_emax: Maximum energy for fitting in keV (default: 7.0)
-        
-    Returns:
-        Dictionary of best-fit parameters
+    """Fit ``model_name*powerlaw`` to the loaded spectrum; return the best fit.
+
+    PyXspec parameters are addressed by index (1: nH, 2: PhoIndex, 3: norm).
+    ``Parameter.values`` is a six-float list and assigning a float sets the
+    value alone. The reported uncertainty is ``Parameter.sigma``, the fit
+    sigma; ``Parameter.error`` holds the result of a ``Fit.error`` run, which
+    this script never performs.
     """
     if model_name not in ABSORPTION_MODELS:
         raise ValueError(f"Model must be one of {ABSORPTION_MODELS}, got: {model_name}")
-
-    # Set abundance and cross-section tables
-    Xset.abund = "wilm"
-    Xset.xsect = "vern"
-    
-    # Set fit statistic
-    if statistic.lower() == "chi":
-        Fit.statMethod = "chi"
-    elif statistic.lower() == "cstat":
-        Fit.statMethod = "cstat"
-    else:
+    statistic = statistic.lower()
+    if statistic not in ("chi", "cstat"):
         raise ValueError(f"Statistic must be 'chi' or 'cstat', got: {statistic}")
 
-    # Create model
-    model_expr = f"{model_name}*powerlaw"
-    Model(model_expr)
+    Xset.abund = "wilm"
+    Xset.xsect = "vern"
+    Fit.statMethod = statistic
+    AllData.ignore("**-**")
+    AllData.notice(f"{fit_emin}-{fit_emax}")
+    print(f"Fitting energy range: {fit_emin}-{fit_emax} keV")
 
-    # Set energy range for fitting
-    try:
-        # First ignore all channels
-        AllData.ignore("**-**")
-        # Then notice only the specified energy range
-        AllData.notice(f"{fit_emin}-{fit_emax}")
-        print(f"Fitting energy range: {fit_emin}-{fit_emax} keV")
-    except Exception as e:
-        print(f"Warning: Could not set energy range: {e}")
-        # Fallback to notice all
-        try:
-            AllData.notice("all")
-        except:
-            pass
+    model = Model(f"{model_name}*powerlaw")
+    for index, value in enumerate((init_nH, init_PhoIndex, init_norm), start=1):
+        model(index).values = value
+    print(f"Initial parameters: nH={init_nH:.4f} x 10^22 cm^-2, "
+          f"PhoIndex={init_PhoIndex:.4f}, norm={init_norm:.4e}")
 
-    model = AllModels(1)
-
-    # Set initial parameter values
-    # Access components by parameter index (more robust than component names)
-    # absorption*powerlaw typically has parameters:
-    # 1: absorption.nH
-    # 2: powerlaw.PhoIndex
-    # 3: powerlaw.norm
-    
-    try:
-        # Try to set parameters by index (most reliable method)
-        # XSPEC parameters store values as tuples/lists, so we need to preserve that
-        par1 = model(1)
-        if isinstance(par1.values, (tuple, list)):
-            vals = list(par1.values)
-            vals[0] = init_nH
-            par1.values = vals if isinstance(par1.values, list) else tuple(vals)
-        else:
-            par1.values = init_nH
-        
-        par2 = model(2)
-        if isinstance(par2.values, (tuple, list)):
-            vals = list(par2.values)
-            vals[0] = init_PhoIndex
-            par2.values = vals if isinstance(par2.values, list) else tuple(vals)
-        else:
-            par2.values = init_PhoIndex
-        
-        par3 = model(3)
-        if isinstance(par3.values, (tuple, list)):
-            vals = list(par3.values)
-            vals[0] = init_norm
-            par3.values = vals if isinstance(par3.values, list) else tuple(vals)
-        else:
-            par3.values = init_norm
-        
-        print(f"Initial parameters: nH={init_nH:.4f} × 10²² cm⁻², PhoIndex={init_PhoIndex:.4f}, norm={init_norm:.4e}")
-        
-    except Exception as e:
-        # Fallback: try component name access
-        print(f"Warning: Could not set parameters by index, trying component names: {e}")
-        
-        # Try various capitalizations for absorption component
-        abs_comp = None
-        for name_variant in [model_name, model_name.upper(), model_name.capitalize(), 
-                             model_name.lower(), f"TBabs" if "tb" in model_name.lower() else None]:
-            if name_variant and hasattr(model, name_variant):
-                abs_comp = getattr(model, name_variant)
-                break
-        
-        if abs_comp is None:
-            raise AttributeError(f"Cannot access {model_name} component. Available: {dir(model)}")
-        
-        # Set starting nH
-        if hasattr(abs_comp, "nH"):
-            abs_comp.nH = init_nH
-        elif hasattr(abs_comp, "NH"):
-            abs_comp.NH = init_nH
-        else:
-            raise AttributeError(f"Cannot find nH parameter in {model_name} component")
-
-        # Access powerlaw component
-        po_comp = None
-        for name_variant in ["powerlaw", "Powerlaw", "POWERLAW", "po"]:
-            if hasattr(model, name_variant):
-                po_comp = getattr(model, name_variant)
-                break
-        
-        if po_comp is None:
-            raise AttributeError("Cannot access powerlaw component")
-
-        # Set starting powerlaw parameters
-        po_comp.PhoIndex = init_PhoIndex
-        po_comp.norm = init_norm
-        
-        print(f"Initial parameters: nH={init_nH:.4f} × 10²² cm⁻², PhoIndex={init_PhoIndex:.4f}, norm={init_norm:.4e}")
-
-    # Perform fit
-    print(f"\nFitting {model_expr} with {statistic} statistic...")
+    print(f"\nFitting {model_name}*powerlaw with {statistic} statistic...")
     Fit.method = "leven"
     Fit.query = "yes"
-    
-    try:
-        Fit.perform()
-    except Exception as e:
-        print(f"Warning: Fit may not have converged: {e}")
+    Fit.perform()
 
-    # Extract best-fit parameters using parameter indices (most reliable)
-    params = {}
-    
-    try:
-        # Parameter 1: nH
-        nh_par = model(1)
-        params["nH"] = float(nh_par.values[0] if isinstance(nh_par.values, (tuple, list)) else nh_par.values)
-        try:
-            err = nh_par.error
-            params["nH_error"] = float(err[0] if isinstance(err, (tuple, list)) else err)
-        except (AttributeError, IndexError, TypeError):
-            params["nH_error"] = 0.0
-        
-        # Parameter 2: PhoIndex
-        phoindex_par = model(2)
-        params["PhoIndex"] = float(phoindex_par.values[0] if isinstance(phoindex_par.values, (tuple, list)) else phoindex_par.values)
-        try:
-            err = phoindex_par.error
-            params["PhoIndex_error"] = float(err[0] if isinstance(err, (tuple, list)) else err)
-        except (AttributeError, IndexError, TypeError):
-            params["PhoIndex_error"] = 0.0
-        
-        # Parameter 3: norm
-        norm_par = model(3)
-        params["norm"] = float(norm_par.values[0] if isinstance(norm_par.values, (tuple, list)) else norm_par.values)
-        try:
-            err = norm_par.error
-            params["norm_error"] = float(err[0] if isinstance(err, (tuple, list)) else err)
-        except (AttributeError, IndexError, TypeError):
-            params["norm_error"] = 0.0
-        
-    except Exception as e:
-        print(f"Warning: Could not extract parameters by index, trying component names: {e}")
-        
-        # Fallback: try component access
-        # Find absorption component
-        abs_comp = None
-        for name_variant in [model_name, model_name.upper(), model_name.capitalize(), 
-                             model_name.lower(), f"TBabs" if "tb" in model_name.lower() else None]:
-            if name_variant and hasattr(model, name_variant):
-                abs_comp = getattr(model, name_variant)
-                break
-        
-        if abs_comp is None:
-            raise AttributeError(f"Cannot access {model_name} component for parameter extraction")
-        
-        # Get nH
-        if hasattr(abs_comp, "nH"):
-            nh_par = abs_comp.nH
-        else:
-            nh_par = abs_comp.NH
-        params["nH"] = float(nh_par.values[0] if isinstance(nh_par.values, (tuple, list)) else nh_par.values)
-        try:
-            err = nh_par.error
-            params["nH_error"] = float(err[0] if isinstance(err, (tuple, list)) else err)
-        except (AttributeError, IndexError, TypeError):
-            params["nH_error"] = 0.0
-        
-        # Find powerlaw component
-        po_comp = None
-        for name_variant in ["powerlaw", "Powerlaw", "POWERLAW", "po"]:
-            if hasattr(model, name_variant):
-                po_comp = getattr(model, name_variant)
-                break
-        
-        if po_comp is None:
-            raise AttributeError("Cannot access powerlaw component for parameter extraction")
-        
-        # Get powerlaw parameters
-        params["PhoIndex"] = float(po_comp.PhoIndex.values[0] if isinstance(po_comp.PhoIndex.values, (tuple, list)) else po_comp.PhoIndex.values)
-        try:
-            err = po_comp.PhoIndex.error
-            params["PhoIndex_error"] = float(err[0] if isinstance(err, (tuple, list)) else err)
-        except (AttributeError, IndexError, TypeError):
-            params["PhoIndex_error"] = 0.0
-            
-        params["norm"] = float(po_comp.norm.values[0] if isinstance(po_comp.norm.values, (tuple, list)) else po_comp.norm.values)
-        try:
-            err = po_comp.norm.error
-            params["norm_error"] = float(err[0] if isinstance(err, (tuple, list)) else err)
-        except (AttributeError, IndexError, TypeError):
-            params["norm_error"] = 0.0
-    
-    # Get fit statistics
-    params["statistic"] = Fit.statistic
-    params["dof"] = Fit.dof
-    params["chi2_red"] = Fit.statistic / Fit.dof if Fit.dof > 0 else 0.0
-    
-    # Log results
-    print(f"\nBest-fit parameters:")
-    print(f"  {model_name}.nH = {params['nH']:.6f} ± {params['nH_error']:.6f} × 10²² cm⁻²")
-    print(f"  powerlaw.PhoIndex = {params['PhoIndex']:.6f} ± {params['PhoIndex_error']:.6f}")
-    print(f"  powerlaw.norm = {params['norm']:.6e} ± {params['norm_error']:.6e}")
-    print(f"  Fit statistic = {params['statistic']:.2f} for {params['dof']} dof")
-    if statistic.lower() == "chi":
-        print(f"  Reduced χ² = {params['chi2_red']:.4f}")
-    
+    params: Dict[str, float] = {}
+    for index, name in enumerate(("nH", "PhoIndex", "norm"), start=1):
+        params[name] = float(model(index).values[0])
+        params[f"{name}_error"] = float(model(index).sigma)
+    params["statistic"] = float(Fit.statistic)
+    params["dof"] = float(Fit.dof)
+    params["chi2_red"] = params["statistic"] / params["dof"] if params["dof"] > 0 else 0.0
+
+    print("\nBest-fit parameters:")
+    print(f"  {model_name}.nH = {params['nH']:.6f} +/- {params['nH_error']:.6f} x 10^22 cm^-2")
+    print(f"  powerlaw.PhoIndex = {params['PhoIndex']:.6f} +/- {params['PhoIndex_error']:.6f}")
+    print(f"  powerlaw.norm = {params['norm']:.6e} +/- {params['norm_error']:.6e}")
+    print(f"  Fit statistic = {params['statistic']:.2f} for {params['dof']:.0f} dof")
+    if statistic == "chi":
+        print(f"  Reduced chi^2 = {params['chi2_red']:.4f}")
     return params
 
 
-def freeze_powerlaw_params() -> object:
-    """
-    Freeze powerlaw parameters (PhoIndex, norm) and return the nH parameter object.
-    
-    Uses parameter indices for robustness:
-    - Parameter 1: absorption.nH (keep free)
-    - Parameter 2: powerlaw.PhoIndex (freeze)
-    - Parameter 3: powerlaw.norm (freeze)
-    
-    Returns:
-        The nH parameter object that will be varied
-    """
+def freeze_powerlaw_params():
+    """Freeze PhoIndex and norm (parameters 2 and 3); return the nH parameter."""
     model = AllModels(1)
-    
-    try:
-        # Freeze by parameter index (most reliable)
-        model(2).frozen = True  # PhoIndex
-        model(3).frozen = True  # norm
-        
-        print("\nFroze powerlaw parameters (PhoIndex, norm) using parameter indices")
-        
-        # Return nH parameter
-        return model(1)
-        
-    except Exception as e:
-        print(f"Warning: Could not freeze by index, trying component names: {e}")
-        
-        # Fallback: try component name access
-        po_comp = None
-        for name_variant in ["powerlaw", "Powerlaw", "POWERLAW", "po"]:
-            if hasattr(model, name_variant):
-                po_comp = getattr(model, name_variant)
-                break
-        
-        if po_comp is None:
-            raise AttributeError("Cannot access powerlaw component")
-        
-        po_comp.PhoIndex.frozen = True
-        po_comp.norm.frozen = True
-        
-        print("\nFroze powerlaw parameters (PhoIndex, norm)")
-        
-        # Find and return nH parameter
-        model_expr = str(model.expression).lower()
-        for abs_name in ABSORPTION_MODELS:
-            if abs_name in model_expr:
-                abs_comp = None
-                for name_variant in [abs_name, abs_name.upper(), abs_name.capitalize(), 
-                                   abs_name.lower(), f"TBabs" if "tb" in abs_name.lower() else None]:
-                    if name_variant and hasattr(model, name_variant):
-                        abs_comp = getattr(model, name_variant)
-                        break
-                
-                if abs_comp:
-                    if hasattr(abs_comp, "nH"):
-                        return abs_comp.nH
-                    elif hasattr(abs_comp, "NH"):
-                        return abs_comp.NH
-        
-        raise RuntimeError("Could not find nH parameter in model")
+    model(2).frozen = True
+    model(3).frozen = True
+    print("\nFroze powerlaw parameters (PhoIndex, norm)")
+    return model(1)
 
 
-_KEV_TO_ERG = 1.60218e-9  # 1 keV in erg
+# ----------------------------------------------------------------------------
+# Flux vs nH
+# ----------------------------------------------------------------------------
 
+def integrate_fluxes(E: np.ndarray, y: np.ndarray, band: Tuple[float, float]) -> Tuple[float, float]:
+    """Photon and energy flux of ``y(E)`` [photons/cm^2/s/keV] over *band* [keV].
 
-def integrate_fluxes(
-    E: np.ndarray, y: np.ndarray, band: Tuple[float, float]
-) -> Tuple[float, float]:
-    """
-    Integrate model spectrum y(E) [photons/cm^2/s/keV] over band [E1, E2] keV.
-
-    Returns:
-        photon_flux : photons/cm^2/s  = trapz(y, E)
-        energy_flux : erg/cm^2/s     = trapz(E * y, E) * keV_to_erg
+    Returns ``(photons/cm^2/s, erg/cm^2/s)``; NaN when fewer than two grid
+    points fall inside the band.
     """
     e1, e2 = band
     mask = (E >= e1) & (E <= e2)
     if np.count_nonzero(mask) < 2:
-        # Pull in nearest bins when band edges fall between grid points
-        idx = np.argsort(np.abs(E - np.clip((e1 + e2) / 2.0, E.min(), E.max())))[:3]
-        mask[idx] = True
-    if np.count_nonzero(mask) < 2:
         return float("nan"), float("nan")
     E_b, y_b = E[mask], y[mask]
-    ph = float(np.trapz(y_b, E_b))
-    erg = float(np.trapz(E_b * y_b, E_b)) * _KEV_TO_ERG
-    return ph, erg
+    return float(_trapezoid(y_b, E_b)), float(_trapezoid(E_b * y_b, E_b)) * _KEV_TO_ERG
 
 
-def compute_fluxes_for_band(band: Tuple[float, float]) -> Tuple[float, float]:
-    """
-    Evaluate the current XSPEC model on a fine log-spaced energy grid and
-    integrate over the requested band to get photon and energy flux.
+def vary_nh_and_compute(nH_values_cm2: np.ndarray, band_name: str,
+                        band: Tuple[float, float]) -> pd.DataFrame:
+    """Step nH over the grid and integrate the model spectrum over *band*.
 
-    The model is sampled directly (no unfolding / instrument response needed)
-    because we want the intrinsic model flux, not a data-derived quantity.
-
-    Args:
-        band: (E_min, E_max) in keV
-
-    Returns:
-        photon_flux : photons/cm^2/s
-        energy_flux : erg/cm^2/s
+    Assumes the model has been fitted. The energy grid and the plot device
+    are set once; only the nH value changes between points, so the model is
+    re-evaluated on the same 2000-point log grid every time.
     """
     e1, e2 = band
     if e1 >= e2:
-        print(f"Error: Invalid band {e1}-{e2} keV (min >= max)")
-        return float("nan"), float("nan")
+        raise ValueError(f"Invalid band {e1}-{e2} keV (min >= max)")
 
+    nh_par = freeze_powerlaw_params()
     Plot.xAxis = "keV"
     Plot.device = "/null"
+    AllModels.setEnergies("0.1 20.0 2000 log")
 
-    try:
-        AllModels.setEnergies("0.1 20.0 2000 log")
-        Plot("model")
-        E = np.array(Plot.x(1), dtype=float)
-        y = np.array(Plot.model(1), dtype=float)
-    except Exception as e:
-        import traceback
-        print(f"[compute_fluxes_for_band] ERROR for band {band}: {e}")
-        traceback.print_exc()
-        return float("nan"), float("nan")
-
-    if E.size < 2 or y.size < 2:
-        return float("nan"), float("nan")
-
-    return integrate_fluxes(E, y, band)
-
-
-def vary_nh_and_compute(
-    nH_values_cm2: np.ndarray,
-    bands: dict,
-) -> pd.DataFrame:
-    """
-    For each nH (cm^-2), set absorption.nH and compute photon and energy flux
-    in each requested band.
-
-    Assumes model has already been fit and powerlaw parameters frozen.
-
-    Args:
-        nH_values_cm2: Array of nH values in cm^-2
-        bands: Dictionary mapping band names to (E_min, E_max) tuples in keV
-
-    Returns:
-        DataFrame with columns:
-            nH_cm2, nH_1e22,
-            flux_{band}_ph  [photons/cm^2/s],
-            flux_{band}_erg [erg/cm^2/s]
-        for each band.
-    """
-    nh_par = freeze_powerlaw_params()
-
-    results = []
+    rows = []
+    report_every = max(1, len(nH_values_cm2) // 10)
     print(f"\nComputing flux for {len(nH_values_cm2)} nH values...")
-
     for i, nH_cm2 in enumerate(nH_values_cm2):
-        nH_1e22 = float(nH_cm2 / 1.0e22)
-        result_row = {
+        nH_1e22 = float(nH_cm2) / 1.0e22
+        nh_par.values = nH_1e22
+        Plot("model")
+        E = np.asarray(Plot.x(1), dtype=float)
+        y = np.asarray(Plot.model(1), dtype=float)
+        flux_ph, flux_erg = integrate_fluxes(E, y, band)
+        rows.append({
             "nH_cm2": float(nH_cm2),
             "nH_1e22": nH_1e22,
-        }
-
-        try:
-            # Update nH parameter
-            if isinstance(nh_par.values, (tuple, list)):
-                vals = list(nh_par.values)
-                vals[0] = nH_1e22
-                nh_par.values = vals if isinstance(nh_par.values, list) else tuple(vals)
-            else:
-                nh_par.values = nH_1e22
-
-            # Compute photon and energy flux for each band
-            for band_name, band_range in bands.items():
-                flux_ph, flux_erg = compute_fluxes_for_band(band_range)
-                result_row[f"flux_{band_name}_ph"] = flux_ph
-                result_row[f"flux_{band_name}_erg"] = flux_erg
-
-        except Exception as e:
-            import traceback
-            print(f"[vary_nh_and_compute] ERROR at nH={nH_cm2:.3e} cm⁻² (nH_1e22={nH_1e22:.4f}): {e}")
-            traceback.print_exc()
-            for band_name in bands.keys():
-                result_row[f"flux_{band_name}_ph"] = float("nan")
-                result_row[f"flux_{band_name}_erg"] = float("nan")
-
-        # Progress indicator
-        if (i + 1) % max(1, len(nH_values_cm2) // 10) == 0:
-            print(f"  Progress: {i+1}/{len(nH_values_cm2)}")
-
-        results.append(result_row)
-
-    return pd.DataFrame(results)
+            f"flux_{band_name}_ph": flux_ph,
+            f"flux_{band_name}_erg": flux_erg,
+        })
+        if (i + 1) % report_every == 0:
+            print(f"  Progress: {i + 1}/{len(nH_values_cm2)}")
+    return pd.DataFrame(rows)
 
 
-def fit_exponential_decay(nH_cm2: np.ndarray, flux: np.ndarray) -> Tuple[float, float, np.ndarray]:
-    """
-    Fit exponential decay function to flux vs nH data in LOG SPACE.
-    
-    Formula: flux = A * exp(-B * nH_1e22)
-    where nH_1e22 = nH_cm2 / 1e22
-    
-    Taking log: log(flux) = log(A) - B * nH_1e22
-    
-    Args:
-        nH_cm2: Array of nH values in cm^-2
-        flux: Array of flux values (photons/cm^2/s)
-    
-    Returns:
-        A: Fitted coefficient A
-        B: Fitted coefficient B (in units of 1e22 cm^-2)
-        flux_fit: Fitted flux values for the input nH_cm2 array
-    """
-    # Filter out invalid data points
-    mask = (nH_cm2 > 0) & (flux > 0) & np.isfinite(nH_cm2) & np.isfinite(flux)
-    
-    if np.sum(mask) < 3:
-        return float('nan'), float('nan'), np.full_like(nH_cm2, np.nan)
-    
-    nH_valid = nH_cm2[mask]
-    flux_valid = flux[mask]
-    
-    # Convert nH to 1e22 units
-    nH_1e22 = nH_valid / 1e22
-    
-    # Take logarithm for fitting in log space
-    log_flux = np.log(flux_valid)
-    
-    # Define linear function for log-space fitting
-    def linear_func(x, log_A, B):
-        return log_A - B * x
-    
-    try:
-        # Fit in log space
-        popt, _ = curve_fit(
-            linear_func,
-            nH_1e22,
-            log_flux,
-            p0=[np.log(flux_valid[0]), 0.1],
-            maxfev=10000
-        )
-        log_A, B = popt
-        A = np.exp(log_A)
-        
-        # Compute fitted flux for all input nH values
-        nH_all_1e22 = nH_cm2 / 1e22
-        flux_fit = A * np.exp(-B * nH_all_1e22)
-        
-        return float(A), float(B), flux_fit
-        
-    except Exception as e:
-        return float('nan'), float('nan'), np.full_like(nH_cm2, np.nan)
+# ----------------------------------------------------------------------------
+# Figure
+# ----------------------------------------------------------------------------
 
+def plot_table(df: pd.DataFrame, band_name: str, band: Tuple[float, float],
+               best_fit: Dict[str, float], model_name: str, statistic: str,
+               instrument: str, out_png: str) -> None:
+    """Photon- and energy-flux panels with the exponential law of the table."""
+    import matplotlib.pyplot as plt
+
+    fig, (ax_ph, ax_erg) = plt.subplots(2, 1, figsize=(10, 12), sharex=True)
+    stat_text = (f"$\\chi^2_r$ = {best_fit['chi2_red']:.2f}" if statistic == "chi"
+                 else f"C-stat = {best_fit['statistic']:.2f}")
+    fig.suptitle(f"Flux vs $n_H$ ({instrument.capitalize()})  -  Model: {model_name}*powerlaw, "
+                 f"Stat: {statistic}, {stat_text}", fontsize=12, fontweight="bold")
+
+    nh = df["nH_1e22"].to_numpy(dtype=float)
+    label = f"{band_name.capitalize()} {band[0]}-{band[1]} keV"
+    panels = (
+        (ax_ph, "ph", "Photon flux (photons cm$^{-2}$ s$^{-1}$)"),
+        (ax_erg, "erg", "Energy flux (erg cm$^{-2}$ s$^{-1}$)"),
+    )
+    for ax, kind, ylabel in panels:
+        flux = df[f"flux_{band_name}_{kind}"].to_numpy(dtype=float)
+        ok = np.isfinite(flux) & (flux > 0) & (nh > 0)
+        ax.plot(nh[ok] * 1e22, flux[ok], "o", ms=4, alpha=0.7, label=label)
+        if np.count_nonzero(ok) >= 2:
+            A, B = fit_exponential(nh[ok], flux[ok])
+            ax.plot(nh[ok] * 1e22, A * np.exp(-B * nh[ok]), "--", lw=2, alpha=0.9,
+                    label=f"$F = {A:.3e}\\,e^{{-{B:.4f}\\,n_H}}$  ($n_H$ in $10^{{22}}$ cm$^{{-2}}$)")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+    ax_erg.set_xlabel("$n_H$ (cm$^{-2}$)", fontsize=12)
+    ax_ph.text(0.02, 0.98,
+               "Best-fit parameters:\n"
+               f"$n_H$ = {best_fit['nH']:.4f} $\\times 10^{{22}}$ cm$^{{-2}}$\n"
+               f"$\\Gamma$ = {best_fit['PhoIndex']:.4f}\n"
+               f"norm = {best_fit['norm']:.3e}",
+               transform=ax_ph.transAxes, fontsize=9, verticalalignment="top",
+               bbox=dict(boxstyle="round", facecolor="lightblue", alpha=0.8, edgecolor="black"))
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+    print(f"Saved: {out_png}")
+
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute photon flux vs nH using XSPEC (simplified: phabs/tbabs/wabs * powerlaw)",
+        description="Tabulate the model flux vs nH with XSPEC ({phabs,tbabs,wabs}*powerlaw)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--specdir",
-        type=str,
-        default=os.path.join(os.getcwd(), "data", "IC10X1_spec"),
-        help="Directory containing PHA/PI (+RMF/ARF) spectrum files",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        choices=ABSORPTION_MODELS,
-        default="tbabs",
-        help="Absorption model: phabs, tbabs, or wabs (will be multiplied by powerlaw)",
-    )
-    parser.add_argument(
-        "--statistic",
-        type=str,
-        choices=["chi", "cstat"],
-        default="chi",
-        help="Fit statistic: chi (chi-squared) or cstat (C-statistic for Poisson data)",
-    )
-    parser.add_argument(
-        "--init_nH",
-        type=float,
-        default=0.55,
-        help="Initial nH value for fitting in 10^22 cm^-2 (helps convergence)",
-    )
-    parser.add_argument(
-        "--init_PhoIndex",
-        type=float,
-        default=1.89,
-        help="Initial powerlaw photon index for fitting (helps convergence)",
-    )
-    parser.add_argument(
-        "--init_norm",
-        type=float,
-        default=1e-4,
-        help="Initial powerlaw normalization for fitting (helps convergence)",
-    )
-    parser.add_argument(
-        "--fit_emin",
-        type=float,
-        default=0.5,
-        help="Minimum energy for fitting in keV (default: 0.5)",
-    )
-    parser.add_argument(
-        "--fit_emax",
-        type=float,
-        default=7.0,
-        help="Maximum energy for fitting in keV (default: 7.0)",
-    )
-    parser.add_argument(
-        "--instrument",
-        type=str,
-        default="chandra",
-        choices=list(INSTRUMENT_BANDS.keys()),
-        help="X-ray instrument (determines available energy bands)",
-    )
-    parser.add_argument(
-        "--band",
-        type=str,
-        default=None,
-        help="Energy band to tabulate. The light-curve model is run one band at "
-             "a time, so each output CSV holds a single band. Default: the "
-             "instrument's broad band.",
-    )
-    parser.add_argument("--nH_min", type=float, default=1e20, help="Min nH (cm^-2) for flux grid")
-    parser.add_argument("--nH_max", type=float, default=1e24, help="Max nH (cm^-2) for flux grid")
-    parser.add_argument("--nH_points", type=int, default=60, help="Number of nH grid points (log-spaced)")
-    parser.add_argument("--out_csv", type=str, default="flux_vs_nH.csv", help="Output CSV filename")
-    parser.add_argument("--out_png", type=str, default="flux_vs_nH.png", help="Output PNG filename")
-
+    parser.add_argument("--specdir", type=str, default=os.path.join(os.getcwd(), "data", "IC10X1_spec"),
+                        help="Directory containing the PHA/PI (+ background, RMF, ARF) spectrum files")
+    parser.add_argument("--model", type=str, choices=ABSORPTION_MODELS, default="tbabs",
+                        help="Absorption model, multiplied by a power law")
+    parser.add_argument("--statistic", type=str, choices=["chi", "cstat"], default="chi",
+                        help="Fit statistic: chi-squared, or the C statistic for Poisson data")
+    parser.add_argument("--init_nH", type=float, default=0.55, help="Initial nH (10^22 cm^-2)")
+    parser.add_argument("--init_PhoIndex", type=float, default=1.89, help="Initial power-law photon index")
+    parser.add_argument("--init_norm", type=float, default=1e-4, help="Initial power-law normalization")
+    parser.add_argument("--fit_emin", type=float, default=0.5, help="Lower energy of the fit range (keV)")
+    parser.add_argument("--fit_emax", type=float, default=7.0, help="Upper energy of the fit range (keV)")
+    parser.add_argument("--instrument", type=str, default="chandra", choices=list(INSTRUMENT_BANDS),
+                        help="Instrument (determines the available energy bands)")
+    parser.add_argument("--band", type=str, default=None,
+                        help="Energy band to tabulate. The light-curve model is run one band at "
+                             "a time, so each output CSV holds a single band. Default: the "
+                             "instrument's broad band.")
+    parser.add_argument("--nH_min", type=float, default=1e20, help="Min nH (cm^-2) of the grid")
+    parser.add_argument("--nH_max", type=float, default=1e24, help="Max nH (cm^-2) of the grid")
+    parser.add_argument("--nH_points", type=int, default=60, help="Number of log-spaced nH grid points")
+    parser.add_argument("--out_csv", type=str, default="flux_vs_nH.csv", help="Output CSV")
+    parser.add_argument("--out_png", type=str, default="flux_vs_nH.png", help="Output figure")
     args = parser.parse_args()
 
     if not os.path.isdir(args.specdir):
-        print(f"Error: specdir not found: {args.specdir}")
-        sys.exit(1)
+        parser.error(f"specdir not found: {args.specdir}")
+    bands = INSTRUMENT_BANDS[args.instrument]
+    band_name = args.band or ("broad" if "broad" in bands else next(iter(bands)))
+    if band_name not in bands:
+        parser.error(f"Invalid band for {args.instrument}: {band_name}. Available: {list(bands)}")
+    band = bands[band_name]
 
-    # Get instrument-specific bands
-    instrument_bands = INSTRUMENT_BANDS[args.instrument]
-    
-    # One band per table: the light-curve model is run one band at a time.
-    if args.band is None:
-        band_name = "broad" if "broad" in instrument_bands else next(iter(instrument_bands))
-    elif args.band not in instrument_bands:
-        print(f"Error: Invalid band for {args.instrument}: {args.band}")
-        print(f"Available bands: {list(instrument_bands.keys())}")
-        sys.exit(1)
-    else:
-        band_name = args.band
+    print(f"Computing flux vs nH for {args.instrument}: {args.model}*powerlaw, "
+          f"{args.statistic} statistic, fit range {args.fit_emin}-{args.fit_emax} keV")
+    print(f"Band: {band_name} ({band[0]}-{band[1]} keV)")
+    if band[0] < args.fit_emin or band[1] > args.fit_emax:
+        print("Note: the band extends beyond the fit range; the flux is computed over the "
+              "full band from the extrapolated model.")
 
-    bands = {band_name: instrument_bands[band_name]}
-    
-    print(f"Computing flux vs nH for {args.instrument} instrument")
-    print(f"Model: {args.model}*powerlaw")
-    print(f"Statistic: {args.statistic}")
-    print(f"Fitting energy range: {args.fit_emin}-{args.fit_emax} keV")
-    print(f"\nEnergy bands for flux computation:")
-    for name, (emin, emax) in bands.items():
-        print(f"  {name}: {emin}-{emax} keV")
-    
-    # Verify that bands are within reasonable range
-    for name, (emin, emax) in bands.items():
-        if emin < args.fit_emin or emax > args.fit_emax:
-            print(f"\nNote: Band '{name}' ({emin}-{emax} keV) extends beyond fitting range ({args.fit_emin}-{args.fit_emax} keV)")
-            print(f"      Flux will still be computed over full band range using extrapolated model.")
-
-    # Find and load spectrum files
     print(f"\nLoading spectrum from {args.specdir}...")
     src, bkg, rmf, arf = find_spectrum_files(args.specdir)
-    print(f"  Source: {os.path.basename(src)}")
-    if bkg:
-        print(f"  Background: {os.path.basename(bkg)}")
-    if rmf:
-        print(f"  RMF: {os.path.basename(rmf)}")
-    if arf:
-        print(f"  ARF: {os.path.basename(arf)}")
-    
+    for role, path in (("Source", src), ("Background", bkg), ("RMF", rmf), ("ARF", arf)):
+        if path:
+            print(f"  {role}: {os.path.basename(path)}")
     load_xspec_spectrum(src, bkg, rmf, arf)
 
-    # Fit model
-    best_fit_params = fit_model(
-        args.model, 
-        args.statistic,
-        init_nH=args.init_nH,
-        init_PhoIndex=args.init_PhoIndex,
-        init_norm=args.init_norm,
-        fit_emin=args.fit_emin,
-        fit_emax=args.fit_emax,
-    )
+    best_fit = fit_model(args.model, args.statistic, init_nH=args.init_nH,
+                         init_PhoIndex=args.init_PhoIndex, init_norm=args.init_norm,
+                         fit_emin=args.fit_emin, fit_emax=args.fit_emax)
 
-    # Build nH grid (log-spaced)
     nH_values_cm2 = np.logspace(np.log10(args.nH_min), np.log10(args.nH_max), args.nH_points)
-
-    # Compute flux vs nH
-    df = vary_nh_and_compute(nH_values_cm2, bands)
-
-    # Save CSV
+    df = vary_nh_and_compute(nH_values_cm2, band_name, band)
     df.to_csv(args.out_csv, index=False)
     print(f"\nSaved: {args.out_csv} ({len(df)} rows)")
 
-    # Plot
-    try:
-        import matplotlib.pyplot as plt
-
-        dfp = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["nH_cm2"]).copy()
-
-        colors = ["tab:blue", "tab:red", "tab:green", "tab:orange", "tab:purple", "tab:brown"]
-        markers = ["o", "s", "^", "D", "v", "p"]
-
-        fig, axes = plt.subplots(2, 1, figsize=(10, 12), sharex=True)
-        ax_ph, ax_erg = axes
-
-        # Shared title
-        title = (
-            f"Flux vs $n_H$ ({args.instrument.capitalize()})  —  "
-            f"Model: {args.model}*powerlaw, Stat: {args.statistic}, "
-        )
-        title += (
-            f"$\\chi^2_r$ = {best_fit_params['chi2_red']:.2f}"
-            if args.statistic == "chi"
-            else f"C-stat = {best_fit_params['statistic']:.2f}"
-        )
-        fig.suptitle(title, fontsize=12, fontweight="bold")
-
-        fit_text_lines_ph = []
-        fit_text_lines_erg = []
-        any_ph = False
-        any_erg = False
-
-        for idx, (band_name, (emin, emax)) in enumerate(bands.items()):
-            col_ph  = f"flux_{band_name}_ph"
-            col_erg = f"flux_{band_name}_erg"
-            color   = colors[idx % len(colors)]
-            marker  = markers[idx % len(markers)]
-            label   = f"{band_name.capitalize()} {emin}–{emax} keV"
-
-            # --- photon flux panel ---
-            if col_ph in dfp.columns:
-                mask = (dfp["nH_cm2"] > 0) & (dfp[col_ph] > 0)
-                if mask.any():
-                    nH_d = dfp.loc[mask, "nH_cm2"].values
-                    fl_d = dfp.loc[mask, col_ph].values
-                    ax_ph.plot(nH_d, fl_d, color=color, marker=marker,
-                               markersize=4, linewidth=0, alpha=0.7, label=label)
-                    A, B, fl_fit = fit_exponential_decay(nH_d, fl_d)
-                    if np.isfinite(A) and np.isfinite(B):
-                        si = np.argsort(nH_d)
-                        ax_ph.plot(nH_d[si], fl_fit[si], color=color,
-                                   linestyle="--", linewidth=2, alpha=0.9,
-                                   label=f"{band_name.capitalize()} fit")
-                        fit_text_lines_ph.append(
-                            f"{band_name.capitalize()}: $F = {A:.3e}\\,e^{{-{B:.4f}\\,n_H}}$"
-                        )
-                    any_ph = True
-
-            # --- energy flux panel ---
-            if col_erg in dfp.columns:
-                mask = (dfp["nH_cm2"] > 0) & (dfp[col_erg] > 0)
-                if mask.any():
-                    nH_d = dfp.loc[mask, "nH_cm2"].values
-                    fl_d = dfp.loc[mask, col_erg].values
-                    ax_erg.plot(nH_d, fl_d, color=color, marker=marker,
-                                markersize=4, linewidth=0, alpha=0.7, label=label)
-                    A, B, fl_fit = fit_exponential_decay(nH_d, fl_d)
-                    if np.isfinite(A) and np.isfinite(B):
-                        si = np.argsort(nH_d)
-                        ax_erg.plot(nH_d[si], fl_fit[si], color=color,
-                                    linestyle="--", linewidth=2, alpha=0.9,
-                                    label=f"{band_name.capitalize()} fit")
-                        fit_text_lines_erg.append(
-                            f"{band_name.capitalize()}: $F = {A:.3e}\\,e^{{-{B:.4f}\\,n_H}}$"
-                        )
-                    any_erg = True
-
-        for ax in (ax_ph, ax_erg):
-            ax.set_xscale("log")
-            ax.set_yscale("log")
-            ax.grid(True, which="both", alpha=0.3)
-            if len(dfp) > 0:
-                ax.set_xlim(dfp["nH_cm2"].min() * 0.8, dfp["nH_cm2"].max() * 1.2)
-
-        ax_ph.set_ylabel("Photon flux (photons cm$^{-2}$ s$^{-1}$)", fontsize=12)
-        ax_erg.set_ylabel("Energy flux (erg cm$^{-2}$ s$^{-1}$)", fontsize=12)
-        ax_erg.set_xlabel("$n_H$ (cm$^{-2}$)", fontsize=12)
-
-        if any_ph:
-            ax_ph.legend(loc="upper right", fontsize=9, framealpha=0.9)
-        if any_erg:
-            ax_erg.legend(loc="upper right", fontsize=9, framealpha=0.9)
-
-        # Best-fit parameter box on top panel
-        param_text = (
-            "Best-fit parameters:\n"
-            f"$n_H$ = {best_fit_params['nH']:.4f} $\\times 10^{{22}}$ cm$^{{-2}}$\n"
-            f"$\\Gamma$ = {best_fit_params['PhoIndex']:.4f}\n"
-            f"norm = {best_fit_params['norm']:.3e}"
-        )
-        ax_ph.text(0.02, 0.98, param_text, transform=ax_ph.transAxes,
-                   fontsize=9, verticalalignment="top",
-                   bbox=dict(boxstyle="round", facecolor="lightblue",
-                             alpha=0.8, edgecolor="black", linewidth=1.5))
-
-        # Equation boxes
-        for ax, lines in ((ax_ph, fit_text_lines_ph), (ax_erg, fit_text_lines_erg)):
-            if lines:
-                eq_text = "Fitted exponentials:\n" + "\n".join(lines)
-                eq_text += "\n\n$n_H$ in units of $10^{22}$ cm$^{-2}$"
-                ax.text(0.02, 0.02, eq_text, transform=ax.transAxes,
-                        fontsize=8, verticalalignment="bottom",
-                        bbox=dict(boxstyle="round", facecolor="wheat",
-                                  alpha=0.8, edgecolor="black", linewidth=1.5))
-
-        fig.tight_layout()
-        fig.savefig(args.out_png, dpi=200)
-        print(f"Saved: {args.out_png}")
-    except Exception as exc:
-        print(f"Plotting failed: {exc}")
-        import traceback
-        traceback.print_exc()
+    plot_table(df, band_name, band, best_fit, args.model, args.statistic, args.instrument, args.out_png)
 
 
 if __name__ == "__main__":

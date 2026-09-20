@@ -89,16 +89,18 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
         # profile that diverges along a visible ray would surface here.
         visible = ~results["is_eclipsed"].to_numpy()
         vals = results.loc[visible, col].to_numpy()
-        if not (len(vals) and (vals >= 0).all() and (vals == vals).all()):
+        if not (len(vals) and np.isfinite(vals).all() and (vals >= 0).all()):
             print(f"✗ {col} has negative or non-finite values at visible phases")
             ok = False
     if not results.loc[~results["is_eclipsed"], "fl"].gt(0).all():
         print("✗ fl is not strictly positive at every visible phase")
         ok = False
     # The likelihood path must see exactly the curve the DataFrame reports.
+    # (`verbose` belongs to simulate_lightcurve only; unknown keywords raise.)
+    sim_params = {k: v for k, v in BASE_PARAMS.items() if k != "verbose"}
     phase, flux = simulate_band_flux(
         flux_method=flux_method, flux_csv_path=csv_path, wind_model=wind_model,
-        **BASE_PARAMS,
+        **sim_params,
     )
     col = flux_cols[0]
     if not (np.array_equal(phase, results["phase"].to_numpy())

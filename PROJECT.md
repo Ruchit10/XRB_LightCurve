@@ -237,18 +237,23 @@ default `dth = 2` a curve costs ≈ 7 ms, at `dth = 5` ≈ 4 ms.
 ### `simulate_lightcurve(...)` and `simulate_band_flux(...)`
 
 ```python
-simulate_lightcurve(
-    r=0.001, R=2.0, d1=11.0, d2=8.0, gma0=-90.0, i0=64.0,
-    dth=1.0, d2h=6.0,
-    flux_method="interpolate", flux_csv_path=None, flux_type="erg",
-    wind_model="smooth_pl", wind_params=None,
-    scattered_flux=0.0,
-    mdot=4.0e-6, v_inf=1750.0, mu_wind=1.4, f_opacity=1.0,
-    band=None, verbose=False,
-) -> pd.DataFrame
+simulate_lightcurve(verbose=False, **kwargs) -> pd.DataFrame
+simulate_band_flux(**kwargs)              -> (phase, flux)   # likelihood fast path
 
-simulate_band_flux(**same_keywords) -> (phase, flux)   # likelihood fast path
+# keywords and their defaults, defined once on _simulate_core (= SIM_DEFAULTS):
+#   r=0.001, R=2.0, d1=11.0, d2=8.0, gma0=-90.0, i0=64.0, dth=1.0, d2h=6.0,
+#   flux_method="interpolate", flux_csv_path=None, flux_type="erg",
+#   wind_model="smooth_pl", wind_params=None, scattered_flux=0.0,
+#   mdot=4.0e-6, v_inf=1750.0, mu_wind=1.4, f_opacity=1.0, band=None
 ```
+
+Both entry points forward their keywords to `_simulate_core`, whose keyword-only
+signature is the single definition of the defaults: the `xrb_lightcurve.py`
+CLI, the MCMC's `DirectLightCurveModel.sim_kwargs` and its argparse defaults
+all read `SIM_DEFAULTS` (and the wind-shape CLI defaults come from
+`default_wind_params`). A misspelled keyword raises `TypeError` — until Phase
+34 `simulate_band_flux` pulled every argument with `kwargs.get(name, default)`
+and silently ran the default for an unknown key.
 
 `band` may be omitted when the flux table holds a single band; with a
 multi-band table it is required. Both entry points share `_simulate_core`, so
@@ -807,7 +812,8 @@ All three live in `utils/plot_utils.py`.
 `*_samples.csv` for the posterior, rebuilds the `ParamSpec` with the saved
 column order as its active set (shape parameters, `f_scatter` and `log_fopa`
 are detected from the column names), then runs the same `postprocess_fit` as a
-fresh fit. Result directories written before Phase 33 replot unchanged.
+fresh fit. Result directories written before Phase 34 carry no
+`wind_normalization` stamp and are refused (see below).
 
 **Every option not given explicitly is restored from `*_run_config.json`**, so
 `python mcmc_lightcurve_fit.py --replot` on its own reproduces the original
@@ -861,6 +867,24 @@ consumes. Chandra bands: `broad` 0.5–7.0, `soft` 0.5–2.0, `medium` 1.2–2.0
 XSPEC helper scripts (`.xcm` files, model-comparison and conversion-factor
 tools) are no longer in the tree.
 
+Phase 34 cut the script from 930 to ~380 lines without changing the table it
+produces. PyXspec parameters are addressed by index (`model(i).values = x`
+sets the value, `.values[0]` reads it, `.sigma` is the fit sigma — the old
+`.error` field held the result of a `Fit.error` run that is never made, so
+every printed "±" was 0); the ~200 lines of index-vs-component-name fallbacks
+that could not execute are gone; spectrum files are matched on their **file
+names** (matching the full path picked the background as the source whenever a
+directory was called `src`), with the background identified before the source;
+the background and the RMF/ARF that are found are attached explicitly and a
+failure to attach propagates; the energy grid and plot device are set once
+rather than per `nH` point; `np.trapz` → `np.trapezoid`; and the exponential
+law drawn on the figure is `utils.fit_exponential`, the function the
+simulator's `refit` method uses. HEASoft is not importable from plain `henv`,
+so the script's control flow was exercised end to end against a PyXspec
+stand-in (a fake `xspec` module with the same attribute semantics) and its
+output table fed to `simulate_band_flux`; the calls it makes of PyXspec are the
+documented ones.
+
 ---
 
 ## Data layout
@@ -888,10 +912,11 @@ natural single-observation test case.
 
 Time-averaged count rates (cts/s): broad 0.1132, soft 0.0635, hard 0.0497.
 
-Conversion pipeline for the legacy `IC_10_X1_LC` layout:
-`utils/convert_fits_to_txt.py` → `utils/add_flux_simple.py` /
-`utils/add_flux_to_lightcurves.py`, with time-averaged rates from
-`utils/get_average_count_rates.py`. The CIAO layout needs none of this.
+Conversion pipeline for the legacy `IC_10_X1_LC` layout (run from the
+repository root): `utils/convert_fits_to_txt.py` → `utils/add_flux_simple.py`,
+with the time-averaged count rates from `utils/get_average_count_rates.py`
+turned into a flux conversion factor by `flux / rate` from the XSPEC fit. The
+CIAO layout needs none of this.
 
 ---
 
@@ -1016,12 +1041,12 @@ longer imported there).
 ### Core
 | File | Lines | Role |
 | ---- | ----- | ---- |
-| [xrb_lightcurve.py](xrb_lightcurve.py) | ~1030 | Forward model: profiles, Numba LOS kernel and per-cell flux conversion, `simulate_lightcurve` / `simulate_band_flux`, physical normalization. |
-| [mcmc_lightcurve_fit.py](mcmc_lightcurve_fit.py) | ~1900 | emcee/zeus MCMC: `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
-| [chandra_phase_analysis.py](chandra_phase_analysis.py) | ~490 | CLI front end for the single-model χ² fit; re-exports the shared `utils/` API. |
-| [utils/utils.py](utils/utils.py) | ~1570 | Shared layer: ephemeris, loading, both binners, smoothing, periodic model interpolation + phase-shift search, `fit_simulation`, run-config persistence. |
-| [utils/plot_utils.py](utils/plot_utils.py) | ~940 | All plotting, built on the single `plot_lightcurve_fit`. |
-| [compute_flux_vs_nH.py](compute_flux_vs_nH.py) | ~930 | XSPEC `flux vs nH` table generator (one band per table). |
+| [xrb_lightcurve.py](xrb_lightcurve.py) | ~1050 | Forward model: profiles, Numba LOS kernel (half the orbit by phase reflection) and per-cell flux conversion, `simulate_lightcurve` / `simulate_band_flux`, `SIM_DEFAULTS`, physical normalization. |
+| [mcmc_lightcurve_fit.py](mcmc_lightcurve_fit.py) | ~1950 | emcee/zeus MCMC: `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
+| [chandra_phase_analysis.py](chandra_phase_analysis.py) | ~450 | CLI front end for the single-model χ² fit; re-exports the shared `utils/` API. |
+| [utils/utils.py](utils/utils.py) | ~1500 | Shared layer: ephemeris, loading, `sanitize_errors`, both binners, smoothing, the periodic interpolator + phase-shift search, `fit_simulation`, model-dump blocks, run-config persistence. |
+| [utils/plot_utils.py](utils/plot_utils.py) | ~900 | All plotting, built on the single `plot_lightcurve_fit`. |
+| [compute_flux_vs_nH.py](compute_flux_vs_nH.py) | ~380 | XSPEC `flux vs nH` table generator (one band per table). |
 | [plot_results.py](plot_results.py) | 104 | Thin CLI over `utils/plot_utils.py` for simulation CSVs (`--geometric`, `--orbit`). |
 
 ### Utilities (`utils/`)
@@ -1030,7 +1055,9 @@ the analysis scripts — `utils.py` and `plot_utils.py` (see Core above).
 `test_flux_methods.py` is the regression test. The rest are standalone
 one-time data-prep scripts for the legacy `IC_10_X1_LC` layout, not part of
 the package API: `convert_fits_to_txt.py`, `add_flux_simple.py`,
-`add_flux_to_lightcurves.py`, `get_average_count_rates.py`.
+`get_average_count_rates.py` (`add_flux_to_lightcurves.py`, which failed on
+the converted layout and duplicated `add_flux_simple.py`, was removed in
+Phase 34).
 
 ### Scripts, references, untracked
 `rkp_run_w_mcmc_cmds.sh` — the worked command sequence. Reference PDFs:

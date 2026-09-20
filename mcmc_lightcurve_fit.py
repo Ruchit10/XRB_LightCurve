@@ -88,9 +88,9 @@ except ImportError:
 from xrb_lightcurve import (
     simulate_lightcurve,
     simulate_band_flux,
+    SIM_DEFAULTS,
     WIND_MODEL_IDS,
     WIND_MODEL_PARAM_KEYS,
-    MU_WIND_DEFAULT,
     default_wind_params,
     evaluate_g_profile,
     flux_table_bands,
@@ -115,6 +115,7 @@ from utils.utils import (
     save_run_config,
     save_samples_csv_chunked,
     smooth_lightcurve,
+    write_model_blocks,
 )
 from utils.plot_utils import (
     plot_corner,
@@ -579,23 +580,19 @@ class DirectLightCurveModel:
 
     def sim_kwargs(self, d1, d2, r, R, i0, wind_params=None, f_opacity=None,
                    scattered_flux: float = 0.0) -> Dict[str, object]:
-        """Keyword arguments for simulate_lightcurve / simulate_band_flux."""
+        """Keyword arguments for simulate_lightcurve / simulate_band_flux.
+
+        Constants not set in ``sim_params`` take the simulator's own defaults.
+        """
+        const = {k: self.sim_params.get(k, SIM_DEFAULTS[k])
+                 for k in ('gma0', 'd2h', 'mdot', 'v_inf', 'mu_wind', 'f_opacity')}
+        if f_opacity is not None:
+            const['f_opacity'] = float(f_opacity)
         return dict(
-            r=r, R=R, d1=d1, d2=d2, i0=i0,
-            gma0=self.sim_params.get('gma0', -90.0),
-            dth=self.dth,
-            d2h=self.sim_params.get('d2h', 6.0),
-            flux_method=self.flux_method,
-            flux_csv_path=self.flux_csv_path,
-            band=self.band,
-            wind_model=self.wind_model,
-            wind_params=wind_params,
-            scattered_flux=scattered_flux,
-            mdot=self.sim_params.get('mdot', 4.0e-6),
-            v_inf=self.sim_params.get('v_inf', 1750.0),
-            mu_wind=self.sim_params.get('mu_wind', MU_WIND_DEFAULT),
-            f_opacity=(self.sim_params.get('f_opacity', 1.0)
-                       if f_opacity is None else float(f_opacity)),
+            r=r, R=R, d1=d1, d2=d2, i0=i0, dth=self.dth,
+            flux_method=self.flux_method, flux_csv_path=self.flux_csv_path, band=self.band,
+            wind_model=self.wind_model, wind_params=wind_params, scattered_flux=scattered_flux,
+            **const,
         )
 
     def curve(self, d1, d2, r, R, i0,
@@ -1201,7 +1198,7 @@ def plot_best_fit(model, spec: ParamSpec, data: FitData, stats: Dict, band: str,
     model_txt = re.sub(r'\.png$', '', str(output_path)) + "_model.txt"
     try:
         _write_bestfit_model_txt(
-            model_txt, spec=spec, data=data, stats=stats, theta=theta, point_key=key,
+            model_txt, spec=spec, data=data, theta=theta, point_key=key,
             overlay_phase=overlay_phase, model_flux=dense, obs_model=obs_model,
             band=band, red_chi2=red_chi2, dof=dof, shift=shift, f_best=f_best,
             red_chi2_eff=red_chi2_eff)
@@ -1211,20 +1208,16 @@ def plot_best_fit(model, spec: ParamSpec, data: FitData, stats: Dict, band: str,
     return red_chi2
 
 
-def _write_bestfit_model_txt(path: str, *, spec: ParamSpec, data: FitData, stats: Dict,
+def _write_bestfit_model_txt(path: str, *, spec: ParamSpec, data: FitData,
                              theta: np.ndarray, point_key: str, overlay_phase, model_flux,
                              obs_model, band: str, red_chi2: float, dof: int, shift: float,
                              f_best: Optional[float], red_chi2_eff: float) -> None:
-    """Best-fit curve as text: a reproducible header, the dense curve, and the
-    observed bins with the model at their phases and normalized residuals."""
+    """Best-fit curve as text: a reproducible header, then the two blocks of
+    ``utils.write_model_blocks`` (dense curve; observed bins with residuals)."""
     d1, d2, r_val, R_val, i0_val = spec.geometry(theta)
     wind_params = spec.wind_params(theta, R_val)
     f_opacity = spec.f_opacity(theta)
     derived = {k: float(v[0]) for k, v in spec.derived(theta[None, :]).items()}
-
-    order = np.argsort(np.asarray(overlay_phase, dtype=float))
-    mp_ = np.asarray(overlay_phase, dtype=float)[order]
-    mf = np.asarray(model_flux, dtype=float)[order]
 
     with open(path, 'w') as f:
         f.write(f"# Best-fit model light curve -- {band.upper()} band, {WIND_MODELS[spec.wind_model]}\n")
@@ -1259,17 +1252,10 @@ def _write_bestfit_model_txt(path: str, *, spec: ParamSpec, data: FitData, stats
         if f_opacity is not None:
             f.write(f"#   f_opacity = {float(f_opacity):.8g}\n")
         f.write(f"#   f_scatter = {spec.f_scatter(theta):.8g}\n")
-        f.write("#\n# --- BLOCK 1: dense model curve (phase already shifted to the observed frame) ---\n")
-        f.write("phase model_flux\n")
-        for p_val, flux_val in zip(mp_, mf):
-            f.write(f"{p_val:.8f} {flux_val:.8e}\n")
-        with np.errstate(divide='ignore', invalid='ignore'):
-            resid = (data.flux - np.asarray(obs_model, dtype=float)) / data.err
-        f.write("#\n# --- BLOCK 2: observed bins vs model ---\n")
-        f.write("phase obs_flux obs_err model_flux resid_sigma\n")
-        for idx in np.argsort(data.phase):
-            f.write(f"{data.phase[idx]:.8f} {data.flux[idx]:.8e} {data.err[idx]:.8e} "
-                    f"{obs_model[idx]:.8e} {resid[idx]:.6f}\n")
+        order = np.argsort(np.asarray(overlay_phase, dtype=float))
+        write_model_blocks(f, np.asarray(overlay_phase, dtype=float)[order],
+                           np.asarray(model_flux, dtype=float)[order],
+                           data.phase, data.flux, data.err, obs_model)
 
 
 def plot_geometry_diagnostics(spec: ParamSpec, stats: Dict, samples: np.ndarray,
@@ -1381,7 +1367,7 @@ def postprocess_fit(args, spec: ParamSpec, priors: Dict, model, data: FitData,
     suffix = f"{band}_{spec.wind_model}"
     if chain is not None:
         run_arviz_diagnostics(chain, spec, args.output_dir, suffix)
-    if getattr(args, 'compute_bic', False):
+    if args.compute_bic:
         bic_info = compute_bic_metrics(samples, spec, model, data, log_prob=log_prob_flat)
         if bic_info:
             stats.update(bic_info)
@@ -1401,10 +1387,10 @@ def postprocess_fit(args, spec: ParamSpec, priors: Dict, model, data: FitData,
         stats['reduced_chi2'] = plot_best_fit(
             model, spec, data, stats, band,
             os.path.join(args.output_dir, f"{suffix}_bestfit.png"),
-            smooth=smoothed, smooth_sigma=float(getattr(args, "smooth_sigma", 0.01)))
-        if not getattr(args, 'no_geometry_plots', False):
+            smooth=smoothed, smooth_sigma=float(args.smooth_sigma))
+        if not args.no_geometry_plots:
             plot_geometry_diagnostics(spec, stats, samples, model, band, args.output_dir,
-                                      suffix, verbose=not getattr(args, 'quiet', False))
+                                      suffix, verbose=not args.quiet)
 
     if args.save_chi2:
         compute_chi2_for_samples(
@@ -1426,7 +1412,7 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
         spec, priors, model, data,
         n_walkers=args.n_walkers, n_steps=args.n_steps, n_burn=args.n_burn,
         sampler_type=args.sampler, progress=not args.quiet, n_threads=args.n_threads,
-        numba_threads_per_worker=getattr(args, "numba_threads_per_worker", None))
+        numba_threads_per_worker=args.numba_threads_per_worker)
     fit_elapsed = float(time.time() - fit_start)
     log_prob_flat = sampler.get_log_prob(discard=args.n_burn, flat=True)
     chain = sampler.get_chain(discard=args.n_burn)
@@ -1705,10 +1691,10 @@ def build_parser() -> argparse.ArgumentParser:
         'Wind Normalization',
         "The density is fixed from --mdot / --v-inf, so the column carries real units and the "
         "eclipse emerges from wind opacity rather than a geometric cutoff.")
-    norm.add_argument("--mdot", type=float, default=4.0e-6,
+    norm.add_argument("--mdot", type=float, default=SIM_DEFAULTS['mdot'],
                       help="Mass-loss rate in Msun/yr (default: Clark & Crowther 2004, clumping-corrected)")
-    norm.add_argument("--v-inf", type=float, default=1750.0, help="Wind terminal velocity in km/s")
-    norm.add_argument("--mu-wind", type=float, default=MU_WIND_DEFAULT,
+    norm.add_argument("--v-inf", type=float, default=SIM_DEFAULTS['v_inf'], help="Wind terminal velocity in km/s")
+    norm.add_argument("--mu-wind", type=float, default=SIM_DEFAULTS['mu_wind'],
                       help="Mean mass per hydrogen-equivalent nucleus for the TBabs column")
     norm.add_argument("--fit-fopacity", action="store_true",
                       help="Fit log10(f_opacity), the effective-opacity factor absorbing wind "
@@ -1788,8 +1774,9 @@ def build_parser() -> argparse.ArgumentParser:
                              f"{CHI2_TABLE_DEFAULT_SAMPLES} with jitter (one model call each).")
 
     sim = parser.add_argument_group('Simulation Parameters', 'Passed to simulate_lightcurve')
-    sim.add_argument("--gma0", type=float, default=-90.0, help="Starting phase angle in degrees")
-    sim.add_argument("--d2h", type=float, default=6.0, help="Angular cell size of the emitter grid (degrees)")
+    sim.add_argument("--gma0", type=float, default=SIM_DEFAULTS['gma0'], help="Starting phase angle in degrees")
+    sim.add_argument("--d2h", type=float, default=SIM_DEFAULTS['d2h'],
+                     help="Angular cell size of the emitter grid (degrees)")
 
     prior_group = parser.add_argument_group(
         'Prior Customization',

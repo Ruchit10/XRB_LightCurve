@@ -41,7 +41,7 @@ def add_flux_column(input_file, output_file, conversion_factor):
     # Process and write output
     with open(output_file, 'w') as f:
         # Write header with metadata
-        f.write(f"# Light curve with FLUX columns added\n")
+        f.write("# Light curve with FLUX columns added\n")
         f.write(f"# Conversion factor: {factor:.6e} (erg/cm²/s)/(count/s)\n")
         f.write(f"# Source file: {os.path.basename(input_file)}\n")
         f.write("#\n")
@@ -80,7 +80,7 @@ def add_flux_column(input_file, output_file, conversion_factor):
                     # Write line as-is if format unexpected
                     f.write(line)
                     
-            except (ValueError, IndexError) as e:
+            except (ValueError, IndexError):
                 # Write line as-is if parsing fails
                 f.write(line)
     

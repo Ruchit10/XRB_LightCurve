@@ -382,8 +382,8 @@ def plot_phase(
         Matplotlib axes to plot on. If None, creates a new figure (with a
         residual panel when a model and errors are available).
     shift_fitted : bool, default False
-        Whether the phase shift was optimized (True) or held at 0 (False). Only
-        affects the degrees of freedom used by the displayed-χ² self-check.
+        Whether the phase shift was optimized (True) or held at 0 (False);
+        recorded for callers, not used in the drawing.
     obs_column_name : str, default "rate"
         Name of the observable column being plotted (for the y-axis label).
     is_binned : bool, default False
@@ -409,28 +409,6 @@ def plot_phase(
         model_phase = np.linspace(0.0, 1.0, MODEL_OVERLAY_N_POINTS)
         model_flux = eval_periodic(*model_ext, model_phase, shift, scatter)
         obs_model = eval_periodic(*model_ext, obs_phase, shift, scatter)
-
-        # Self-check: the χ² we display must be the χ² of the model we drew.
-        # This catches a `scatter` or `shift` that disagrees with the
-        # fit_simulation call, which would otherwise show a correct-looking
-        # number over the wrong curve.
-        if chi2 is not None and np.isfinite(chi2):
-            check_err = obs_err if obs_err is not None else obs_errors(df)
-            n_free = 1 if shift_fitted else 0
-            recomputed = float(
-                np.sum(((obs_rate - obs_model) / check_err) ** 2)
-                / max(len(obs_rate) - n_free, 1)
-            )
-            if np.isfinite(recomputed) and abs(recomputed - chi2) > 0.01 * max(
-                abs(chi2), 1e-300
-            ):
-                warnings.warn(
-                    f"plot_phase: displayed reduced chi2 ({chi2:.4g}) does not match "
-                    f"the plotted model ({recomputed:.4g}). The `shift`/`scatter` "
-                    f"passed here probably differ from the fit_simulation call "
-                    f"(scatter={scatter!r}, shift={shift!r}).",
-                    stacklevel=2,
-                )
 
     ylabel = (
         obs_column_name.replace("_", " ").title()
@@ -470,61 +448,44 @@ def plot_phase(
 # -----------------------------------------------------------------------------
 
 def plot_corner(samples: np.ndarray, band: str, wind_model: str, output_path: str,
-                param_labels: List[str] = None):
-    """Generate corner plot of posterior distributions."""
+                param_labels: List[str]) -> None:
+    """Corner plot of the posterior samples."""
     if corner is None:
         warnings.warn("corner package not installed, skipping corner plot")
         return
-    if param_labels is None:
-        param_labels = [f"param {i}" for i in range(np.shape(samples)[1])]
-
     fig = corner.corner(
         samples,
         labels=param_labels,
         quantiles=[0.16, 0.5, 0.84],
         show_titles=True,
         title_kwargs={"fontsize": 12},
-        title_fmt=".4f"
+        title_fmt=".4f",
     )
-
     fig.suptitle(f"Posterior Distributions - {band.upper()} band ({wind_model.upper()})",
                  fontsize=14, y=1.02)
-
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
     print(f"Corner plot saved to: {output_path}")
 
 
 def plot_trace(sampler, band: str, wind_model: str, output_path: str,
-               param_labels: List[str] = None, n_burn: int = None):
-    """Generate trace plots for convergence diagnostics."""
+               param_labels: List[str], n_burn: int) -> None:
+    """Walker traces per parameter, with the burn-in cut marked."""
     chain = sampler.get_chain()
     n_steps, n_walkers, n_dim = chain.shape
-    if param_labels is None:
-        param_labels = [f"param {i}" for i in range(n_dim)]
-    if n_burn is None:
-        n_burn = n_steps // 5
-
-    fig, axes = plt.subplots(n_dim, 1, figsize=(10, 2*n_dim), sharex=True)
-    if n_dim == 1:
-        axes = [axes]
-
+    fig, axes = plt.subplots(n_dim, 1, figsize=(10, 2 * n_dim), sharex=True, squeeze=False)
+    axes = axes[:, 0]
     for i, ax in enumerate(axes):
-        for j in range(n_walkers):
-            ax.plot(chain[:, j, i], alpha=0.3, lw=0.5)
-        ax.set_ylabel(param_labels[i] if i < len(param_labels) else f"param {i}")
-        ax.axvline(x=n_burn, color='r', linestyle='--',
-                   alpha=0.5, label='Burn-in' if i == 0 else None)
-
+        ax.plot(chain[:, :, i], alpha=0.3, lw=0.5)   # one line per walker
+        ax.set_ylabel(param_labels[i])
+        ax.axvline(x=n_burn, color='r', linestyle='--', alpha=0.5,
+                   label='Burn-in' if i == 0 else None)
     axes[-1].set_xlabel("Step")
     axes[0].legend(loc='upper right')
     fig.suptitle(f"MCMC Trace Plots - {band.upper()} band ({wind_model.upper()})", fontsize=14)
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
     print(f"Trace plot saved to: {output_path}")
 
 

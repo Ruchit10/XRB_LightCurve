@@ -13,12 +13,15 @@ trigonometric functions.
 """
 
 import argparse
+import inspect
 import math
 import os
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+from utils.utils import fit_exponential
 
 try:
     from numba import njit, prange
@@ -86,13 +89,13 @@ _FLUX_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
 def pack_wind_params(
     wind_model: str,
     wind_params: Dict[str, float],
-) -> Tuple[int, float, float, float, float]:
+) -> Tuple[int, float, float, float]:
     """
     Convert a (wind_model, params dict) pair into a flat tuple
-    (model_id, p1, p2, p3, p4) suitable for passing to the numba kernel.
+    (model_id, p1, p2, p3) suitable for passing to the numba kernel.
 
-    Keys expected per model are listed in WIND_MODEL_PARAM_KEYS. Missing keys
-    raise ValueError. Unused slots are filled with 0.
+    Keys expected per model are listed in WIND_MODEL_PARAM_KEYS (every profile
+    takes exactly three). Missing keys raise ValueError.
     """
     if wind_model not in WIND_MODEL_IDS:
         raise ValueError(
@@ -107,18 +110,16 @@ def pack_wind_params(
             f"wind_model '{wind_model}' requires parameters {keys}; "
             f"missing: {missing}"
         )
-    p = [float(wind_params[k]) for k in keys]
-    while len(p) < 4:
-        p.append(0.0)
-    return model_id, p[0], p[1], p[2], p[3]
+    p1, p2, p3 = (float(wind_params[k]) for k in keys)
+    return model_id, p1, p2, p3
 
 
 @njit(cache=True, inline="always")
-def _g_profile(r, model_id, p1, p2, p3, p4):
+def _g_profile(r, model_id, p1, p2, p3):
     """
     Dimensionless density profile g(r) with r in solar radii.
 
-    model_id encodes the profile; p1..p4 are model-specific parameters
+    model_id encodes the profile; p1..p3 are model-specific parameters
     (see pack_wind_params and WIND_MODEL_PARAM_KEYS).
     """
     if r <= 0.0:
@@ -166,11 +167,11 @@ def _g_profile(r, model_id, p1, p2, p3, p4):
 
 
 @njit(cache=True)
-def _g_profile_array(r_flat, model_id, p1, p2, p3, p4):
+def _g_profile_array(r_flat, model_id, p1, p2, p3):
     """Elementwise ``_g_profile`` over a 1-D array (one implementation, no mirror)."""
     out = np.empty(r_flat.shape[0])
     for i in range(r_flat.shape[0]):
-        out[i] = _g_profile(r_flat[i], model_id, p1, p2, p3, p4)
+        out[i] = _g_profile(r_flat[i], model_id, p1, p2, p3)
     return out
 
 
@@ -181,10 +182,10 @@ def evaluate_g_profile(r, wind_model: str, wind_params: Dict[str, float]):
     Evaluates the same compiled ``_g_profile`` the kernel uses, so there is no
     second implementation to keep in step.
     """
-    model_id, p1, p2, p3, p4 = pack_wind_params(wind_model, wind_params)
+    model_id, p1, p2, p3 = pack_wind_params(wind_model, wind_params)
     r_arr = np.asarray(r, dtype=float)
     flat = np.ascontiguousarray(r_arr.reshape(-1))
-    out = _g_profile_array(flat, model_id, p1, p2, p3, p4).reshape(r_arr.shape)
+    out = _g_profile_array(flat, model_id, p1, p2, p3).reshape(r_arr.shape)
     return float(out) if r_arr.ndim == 0 else out
 
 
@@ -225,7 +226,7 @@ _GL16_W = np.array([
 
 
 @njit(cache=True, inline="always")
-def _los_gl_quadrature(b, z_start, model_id, p1, p2, p3, p4, gl_x, gl_w):
+def _los_gl_quadrature(b, z_start, model_id, p1, p2, p3, gl_x, gl_w):
     """
     LOS integral ∫_{-∞}^{z_start} g(r=sqrt(b²+z²)) dz via Gauss-Legendre
     quadrature in u = arctan(z/b).
@@ -252,7 +253,7 @@ def _los_gl_quadrature(b, z_start, model_id, p1, p2, p3, p4, gl_x, gl_w):
         if cos_uk <= 1e-15:
             continue
         r_at_u = b / cos_uk
-        g_val = _g_profile(r_at_u, model_id, p1, p2, p3, p4)
+        g_val = _g_profile(r_at_u, model_id, p1, p2, p3)
         # integrand = g(r) * sec²(u) * b ; jacobian for [-1,1] -> [u_lo, u_hi] is half_range
         sec2 = 1.0 / (cos_uk * cos_uk)
         integral += gl_w[k] * g_val * sec2
@@ -269,7 +270,7 @@ def _simulate_phases_numba(
     incl,
     d2h_deg,
     model_id,
-    p1, p2, p3, p4,
+    p1, p2, p3,
     gl_x, gl_w,
 ):
     """
@@ -395,7 +396,7 @@ def _simulate_phases_numba(
                     bv = math.sqrt(bv2) if bv2 > 0.0 else 0.0
                     A_seg = A_seg_tab[i_r]
                     los_val = _los_gl_quadrature(
-                        bv, z_start, model_id, p1, p2, p3, p4, gl_x, gl_w
+                        bv, z_start, model_id, p1, p2, p3, gl_x, gl_w
                     )
                     for _rep in range(reps):
                         sum_lw += los_val * A_seg
@@ -540,21 +541,6 @@ def load_flux_vs_nh_csv(
     return df, bands
 
 
-def fit_exponential(nh: np.ndarray, flux: np.ndarray) -> Tuple[float, float]:
-    """Least-squares fit of ``flux = A exp(-B nH)`` in log space.
-
-    Fitting ``log flux = log A - B nH`` gives every point equal weight
-    regardless of magnitude, appropriate for data spanning many decades.
-    """
-    nh = np.asarray(nh, dtype=float)
-    flux = np.asarray(flux, dtype=float)
-    valid = np.isfinite(nh) & np.isfinite(flux) & (flux > 0) & (nh > 0)
-    if np.count_nonzero(valid) < 2:
-        raise ValueError("Exponential fit needs at least two valid (nH, flux) points")
-    slope, intercept = np.polyfit(nh[valid], np.log(flux[valid]), 1)
-    return float(np.exp(intercept)), float(-slope)
-
-
 def _build_flux_context(csv_path: str, flux_type: str) -> Dict[str, object]:
     """Build (once) the per-band interpolation and refit data for a CSV."""
     key = (os.path.abspath(csv_path), str(flux_type))
@@ -696,27 +682,33 @@ def _unmirror(values: np.ndarray, run: np.ndarray, partner, negate: bool = False
 
 
 def _simulate_core(
-    r: float,
-    R: float,
-    d1: float,
-    d2: float,
-    gma0: float,
-    i0: float,
-    dth: float,
-    d2h: float,
-    flux_method: str,
-    flux_csv_path: Optional[str],
-    flux_type: str,
-    wind_model: str,
-    wind_params: Optional[Dict[str, float]],
-    scattered_flux: float,
-    mdot: float,
-    v_inf: float,
-    mu_wind: float,
-    f_opacity: float,
-    band: Optional[str],
+    *,
+    r: float = 0.001,
+    R: float = 2.0,
+    d1: float = 11.0,
+    d2: float = 8.0,
+    gma0: float = -90.0,
+    i0: float = 64.0,
+    dth: float = 1.0,
+    d2h: float = 6.0,
+    flux_method: str = "interpolate",
+    flux_csv_path: Optional[str] = None,
+    flux_type: str = "erg",
+    wind_model: str = "smooth_pl",
+    wind_params: Optional[Dict[str, float]] = None,
+    scattered_flux: float = 0.0,
+    mdot: float = 4.0e-6,
+    v_inf: float = 1750.0,
+    mu_wind: float = MU_WIND_DEFAULT,
+    f_opacity: float = 1.0,
+    band: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Shared implementation of simulate_lightcurve / simulate_band_flux."""
+    """Shared implementation of simulate_lightcurve / simulate_band_flux.
+
+    This signature is the single definition of the simulation defaults
+    (exported as ``SIM_DEFAULTS`` for the CLIs); keyword-only, so a misspelled
+    argument raises ``TypeError`` instead of silently running the default.
+    """
     if flux_csv_path is None:
         raise ValueError("flux_csv_path is required (table from compute_flux_vs_nH.py)")
     if flux_method not in ("interpolate", "refit"):
@@ -740,7 +732,7 @@ def _simulate_core(
     if wind_model in R_STAR_TIED_MODELS and "R_star" not in wind_params:
         wind_params = dict(wind_params)
         wind_params["R_star"] = float(R)
-    model_id, p1, p2, p3, p4 = pack_wind_params(wind_model, wind_params)
+    model_id, p1, p2, p3 = pack_wind_params(wind_model, wind_params)
 
     gma0_rad = gma0 * np.pi / 180.0
     n_phases = int(360 / dth)
@@ -754,7 +746,7 @@ def _simulate_core(
      cell_col, cell_area, cell_count) = _simulate_phases_numba(
         np.ascontiguousarray(gma_values[run], dtype=np.float64),
         float(r), float(R), float(d1), float(d2), float(incl), float(d2h),
-        int(model_id), float(p1), float(p2), float(p3), float(p4),
+        int(model_id), float(p1), float(p2), float(p3),
         _GL16_X, _GL16_W,
     )
 
@@ -790,48 +782,35 @@ def _simulate_core(
     if float(scattered_flux) != 0.0:
         nfl = nfl + float(scattered_flux)
 
+    # Column order of the DataFrame simulate_lightcurve builds from this.
     return {
-        "band": band,
-        "n_computed": int(run.size),
         "deg": gma_values * (180.0 / np.pi),
         "phase": (gma_values - gma0_rad) / (2.0 * np.pi),
-        "A2": A2,
-        "flx": flx,
         "l3": l_arr,
         "L3": L_arr,
         "h3": h_arr,
+        "A2": A2,
         "is_eclipsed": eclipsed.astype(bool),
+        "flx": flx,
         "fl": flx * col_scale,
-        "nfl": nfl,
+        f"nfl_{band}": nfl,
+        "band": band,
+        "n_computed": int(run.size),
     }
 
 
-def simulate_lightcurve(
-    r: float = 0.001,
-    R: float = 2.0,
-    d1: float = 11.0,
-    d2: float = 8.0,
-    gma0: float = -90.0,
-    i0: float = 64.0,
-    dth: float = 1.0,
-    d2h: float = 6.0,
-    verbose: bool = False,
-    flux_method: str = "interpolate",
-    flux_csv_path: Optional[str] = None,
-    flux_type: str = "erg",
-    wind_model: str = "smooth_pl",
-    wind_params: Optional[Dict[str, float]] = None,
-    scattered_flux: float = 0.0,
-    mdot: float = 4.0e-6,
-    v_inf: float = 1750.0,
-    mu_wind: float = MU_WIND_DEFAULT,
-    f_opacity: float = 1.0,
-    band: Optional[str] = None,
-) -> pd.DataFrame:
+# Simulation defaults, taken from the one place they are defined.
+SIM_DEFAULTS: Dict[str, object] = {
+    name: param.default for name, param in inspect.signature(_simulate_core).parameters.items()
+}
+
+
+def simulate_lightcurve(verbose: bool = False, **kwargs) -> pd.DataFrame:
     """
     Simulate one orbit and return a per-phase DataFrame.
 
-    Args:
+    All simulation arguments are keywords with the defaults of ``SIM_DEFAULTS``
+    (an unknown keyword raises ``TypeError``):
         r: Radius of smaller star B (compact object) in solar radii
         R: Radius of larger star A (companion) in solar radii
         d1: Distance of star B from COM in solar radii
@@ -842,7 +821,6 @@ def simulate_lightcurve(
             0 deg is face-on.
         dth: Orbital increment in degrees
         d2h: Angular cell size (degrees) of the polar emitter grid
-        verbose: If True, prints a one-line summary of the kernel call
         flux_method: nH -> flux conversion: "interpolate" (log-log
             interpolation of the CSV table, default) or "refit" (analytic
             A*exp(-B*nH) fitted to the same table)
@@ -863,6 +841,7 @@ def simulate_lightcurve(
             absorbing wind photoionization, clumping and abundance departures.
         band: Energy band to simulate. May be omitted when the CSV holds a
             single band (the model is run one band at a time).
+    ``verbose`` prints a one-line summary of the kernel call.
 
     Returns:
         DataFrame with one row per phase and columns
@@ -882,53 +861,22 @@ def simulate_lightcurve(
           area-averaged, because <F(N)> != F(<N>) when the column varies across
           the disk (ingress/egress, eclipse core).
     """
-    res = _simulate_core(
-        r, R, d1, d2, gma0, i0, dth, d2h, flux_method, flux_csv_path, flux_type,
-        wind_model, wind_params, scattered_flux, mdot, v_inf, mu_wind, f_opacity,
-        band,
-    )
+    res = _simulate_core(**kwargs)
     if verbose:
         print(f"Computed {res['n_computed']} of {res['deg'].size} phases via the GL "
               f"kernel (parallel over phases; the rest by phase reflection); "
               f"band '{res['band']}'")
-    frame = pd.DataFrame({
-        "deg": res["deg"],
-        "phase": res["phase"],
-        "l3": res["l3"],
-        "L3": res["L3"],
-        "h3": res["h3"],
-        "A2": res["A2"],
-        "is_eclipsed": res["is_eclipsed"],
-        "flx": res["flx"],
-        "fl": res["fl"],
-    })
-    frame[f"nfl_{res['band']}"] = res["nfl"]
-    return frame
+    return pd.DataFrame({k: v for k, v in res.items() if k not in ("band", "n_computed")})
 
 
 def simulate_band_flux(**kwargs) -> Tuple[np.ndarray, np.ndarray]:
-    """``(phase, band_flux)`` arrays for the same arguments as simulate_lightcurve.
+    """``(phase, band_flux)`` arrays for the same keywords as simulate_lightcurve.
 
     The lightweight entry point for likelihood evaluation: no DataFrame is
     built and only the two arrays the fit needs are returned.
     """
-    res = _simulate_core(
-        r=kwargs.get("r", 0.001), R=kwargs.get("R", 2.0),
-        d1=kwargs.get("d1", 11.0), d2=kwargs.get("d2", 8.0),
-        gma0=kwargs.get("gma0", -90.0), i0=kwargs.get("i0", 64.0),
-        dth=kwargs.get("dth", 1.0), d2h=kwargs.get("d2h", 6.0),
-        flux_method=kwargs.get("flux_method", "interpolate"),
-        flux_csv_path=kwargs.get("flux_csv_path"),
-        flux_type=kwargs.get("flux_type", "erg"),
-        wind_model=kwargs.get("wind_model", "smooth_pl"),
-        wind_params=kwargs.get("wind_params"),
-        scattered_flux=kwargs.get("scattered_flux", 0.0),
-        mdot=kwargs.get("mdot", 4.0e-6), v_inf=kwargs.get("v_inf", 1750.0),
-        mu_wind=kwargs.get("mu_wind", MU_WIND_DEFAULT),
-        f_opacity=kwargs.get("f_opacity", 1.0),
-        band=kwargs.get("band"),
-    )
-    return res["phase"], res["nfl"]
+    res = _simulate_core(**kwargs)
+    return res["phase"], res[f"nfl_{res['band']}"]
 
 
 # =============================================================================
@@ -998,62 +946,67 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--r", type=float, default=0.001,
+    # Every default comes from _simulate_core (SIM_DEFAULTS) or from
+    # default_wind_params, so the CLI, the Python API and the MCMC agree.
+    D = SIM_DEFAULTS
+    spl = default_wind_params("smooth_pl", D["R"])
+    conf = default_wind_params("confinement", D["R"])
+    beta = default_wind_params("beta_law", D["R"])
+    parser.add_argument("--r", type=float, default=D["r"],
                         help="Radius of star B (compact object / disk) in solar radii")
-    parser.add_argument("--R", type=float, default=2.0,
+    parser.add_argument("--R", type=float, default=D["R"],
                         help="Radius of star A (companion) in solar radii")
-    parser.add_argument("--d1", type=float, default=11.0,
+    parser.add_argument("--d1", type=float, default=D["d1"],
                         help="Distance of star B from COM in solar radii")
-    parser.add_argument("--d2", type=float, default=8.0,
+    parser.add_argument("--d2", type=float, default=D["d2"],
                         help="Distance of star A from COM in solar radii")
-    parser.add_argument("--gma0", type=float, default=-90.0,
+    parser.add_argument("--gma0", type=float, default=D["gma0"],
                         help="Starting phase angle in degrees")
-    parser.add_argument("--i0", type=float, default=64.0,
+    parser.add_argument("--i0", type=float, default=D["i0"],
                         help="Orbital inclination in degrees from the orbital-plane "
                              "normal (90 = edge-on, 0 = face-on)")
-    parser.add_argument("--dth", type=float, default=1.0,
+    parser.add_argument("--dth", type=float, default=D["dth"],
                         help="Orbital increment in degrees")
-    parser.add_argument("--d2h", type=float, default=6.0,
+    parser.add_argument("--d2h", type=float, default=D["d2h"],
                         help="Angular cell size (degrees) of the polar emitter grid")
     parser.add_argument("--verbose", action="store_true",
                         help="Print a one-line kernel summary")
     parser.add_argument("--flux_method", type=str, choices=["interpolate", "refit"],
-                        default="interpolate",
+                        default=D["flux_method"],
                         help="nH -> flux conversion: log-log interpolation of the CSV "
                              "table, or an exponential refit to it")
     parser.add_argument("--flux_csv", type=str, required=True,
                         help="Flux vs nH CSV from compute_flux_vs_nH.py")
-    parser.add_argument("--flux_type", type=str, choices=["erg", "ph"], default="erg",
+    parser.add_argument("--flux_type", type=str, choices=["erg", "ph"], default=D["flux_type"],
                         help="Flux column to use: erg (erg/cm^2/s) or ph (photons/cm^2/s)")
     parser.add_argument("--band", type=str, default=None,
                         help="Energy band to simulate; optional when the CSV holds one band")
-    parser.add_argument("--mdot", type=float, default=4.0e-6,
+    parser.add_argument("--mdot", type=float, default=D["mdot"],
                         help="Mass-loss rate in Msun/yr, setting the absolute wind density "
                              "(default: Clark & Crowther 2004, clumping-corrected)")
-    parser.add_argument("--v-inf", type=float, default=1750.0,
+    parser.add_argument("--v-inf", type=float, default=D["v_inf"],
                         help="Wind terminal velocity in km/s")
-    parser.add_argument("--mu-wind", type=float, default=MU_WIND_DEFAULT,
+    parser.add_argument("--mu-wind", type=float, default=D["mu_wind"],
                         help="Mean mass per hydrogen-equivalent nucleus")
-    parser.add_argument("--f-opacity", type=float, default=1.0,
+    parser.add_argument("--f-opacity", type=float, default=D["f_opacity"],
                         help="Effective-opacity factor on the Mdot-derived column "
                              "(ionization, clumping, abundances); ~0.01-0.03 for IC 10 X-1")
     parser.add_argument("--wind-model", type=str, choices=list(WIND_MODEL_IDS),
-                        default="smooth_pl", help="Dimensionless wind density profile")
-    parser.add_argument("--Rb", type=float, default=5.0,
+                        default=D["wind_model"], help="Dimensionless wind density profile")
+    parser.add_argument("--Rb", type=float, default=spl["Rb"],
                         help="Break radius (solar radii) for smooth_pl")
-    parser.add_argument("--p", type=float, default=4.0,
+    parser.add_argument("--p", type=float, default=spl["p"],
                         help="Inner-region power-law slope for smooth_pl")
-    # Must match default_wind_params() and the MCMC's WIND_SHAPE_FIXED, or a
-    # CLI-generated model would use a different break sharpness than the fit.
-    parser.add_argument("--Delta", type=float, default=2.0,
-                        help="Break sharpness for smooth_pl (larger = sharper)")
-    parser.add_argument("--fconf", type=float, default=10.0,
+    parser.add_argument("--Delta", type=float, default=spl["Delta"],
+                        help="Break sharpness for smooth_pl (larger = sharper; the MCMC "
+                             "holds it at this value)")
+    parser.add_argument("--fconf", type=float, default=conf["fconf"],
                         help="Overdensity amplitude for confinement")
-    parser.add_argument("--ell", type=float, default=0.5,
+    parser.add_argument("--ell", type=float, default=conf["ell"],
                         help="Compression scale length (solar radii) for confinement")
-    parser.add_argument("--beta", type=float, default=1.0,
+    parser.add_argument("--beta", type=float, default=beta["beta"],
                         help="CAK velocity-law exponent for beta_law")
-    parser.add_argument("--H", type=float, default=1.0,
+    parser.add_argument("--H", type=float, default=beta["H"],
                         help="Inner acceleration scale height (solar radii) for beta_law; "
                              "the effective break radius is R + 3H")
     parser.add_argument("--output", type=str, default="xrb_lightcurve_output.csv",

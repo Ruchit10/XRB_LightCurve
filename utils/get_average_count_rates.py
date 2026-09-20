@@ -5,12 +5,12 @@ Calculate time-averaged count rates for each energy band.
 These are the count rates that correspond to your combined spectrum,
 and should be used with XSPEC model flux to compute conversion factors.
 
-Usage:
-    python get_average_count_rates.py
+Usage (from the repository root, after utils/convert_fits_to_txt.py):
+    python utils/get_average_count_rates.py
 """
 
 import glob
-import os
+
 
 def calculate_average_rate(band):
     """Calculate time-averaged count rate for a given band."""
@@ -32,11 +32,10 @@ def calculate_average_rate(band):
                     parts = line.split('\t')
                     counts = float(parts[1])  # COUNTS column
                     exposure = float(parts[4])  # EXPOSURE column
-                    
-                    total_counts += counts
-                    total_exposure += exposure
-                except:
-                    pass
+                except (ValueError, IndexError):
+                    continue
+                total_counts += counts
+                total_exposure += exposure
     
     avg_rate = total_counts / total_exposure if total_exposure > 0 else 0
     
@@ -77,8 +76,8 @@ def main():
     print("HOW TO USE THESE VALUES")
     print("-"*80)
     print()
-    print("1. Run XSPEC to get model flux for each band:")
-    print("   ./get_conversion_factors.sh")
+    print("1. In XSPEC, after fitting the combined spectrum, run `flux E_min E_max`")
+    print("   for each band (e.g. `flux 0.5 7.0` for broad).")
     print()
     print("2. For each band, XSPEC will report model flux (erg/cm²/s)")
     print()
@@ -96,7 +95,7 @@ def main():
     print()
     for band in bands:
         if band.lower() in rates:
-            print(f"   python add_flux_simple.py \\")
+            print("   python utils/add_flux_simple.py \\")
             print(f"       data/IC_10_X1_LC/{band}_converted/ \\")
             print(f"       data/IC_10_X1_LC/{band}_with_flux/ \\")
             print(f"       <conversion_factor_{band.lower()}>")

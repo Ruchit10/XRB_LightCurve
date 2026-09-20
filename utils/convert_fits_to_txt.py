@@ -78,8 +78,8 @@ def convert_fits_to_txt(input_file, output_file):
 
 
 def main():
-    # Base directory
-    base_dir = Path(__file__).parent / 'data' / 'IC_10_X1_LC'
+    # Repository data directory (this script lives in utils/).
+    base_dir = Path(__file__).resolve().parent.parent / 'data' / 'IC_10_X1_LC'
     
     # Subdirectories to process
     subdirs = ['Broad', 'Soft', 'Hard']
@@ -123,11 +123,11 @@ def main():
     
     # Summary
     print(f"\n{'='*60}")
-    print(f"CONVERSION SUMMARY")
+    print("CONVERSION SUMMARY")
     print(f"{'='*60}")
     print(f"Successfully converted: {total_converted} files")
     print(f"Failed: {total_failed} files")
-    print(f"\nConverted files saved in:")
+    print("\nConverted files saved in:")
     for subdir in subdirs:
         output_dir = base_dir / f"{subdir}_converted"
         if output_dir.exists():

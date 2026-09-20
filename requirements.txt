@@ -1,9 +1,9 @@
 # Core forward model. numba is REQUIRED: the Gauss-Legendre mega-kernel is the
 # only LOS integrator, and the only path producing the per-cell columns that the
-# nonlinear nH -> flux conversion needs.
+# nonlinear nH -> flux conversion needs. (scipy is no longer imported directly;
+# emcee and arviz pull it in.)
 numpy>=1.21.0
 pandas>=1.3.0
-scipy>=1.7.0
 numba>=0.56.0
 matplotlib>=3.5.0
 

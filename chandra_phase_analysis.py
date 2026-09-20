@@ -76,7 +76,7 @@ interpolation, the χ² fit) and every plot is drawn by
 All of those names are re-exported here, so ``from chandra_phase_analysis import
 *`` still works.
 
-Dependencies: numpy, pandas, matplotlib, scipy (in requirements.txt).
+Dependencies: numpy, pandas, matplotlib (in requirements.txt).
 """
 from __future__ import annotations
 
@@ -183,10 +183,10 @@ def main() -> None:
     parser.add_argument(
         "--obs-column",
         type=str,
-        default=None,
-        help="Column name in observation files to use (e.g., 'NET_RATE', 'FLUX', 'COUNT_RATE'). "
-             "If the observation files have headers, this column name will be used. "
-             "If not specified, uses 'rate' (assumes 3-column headerless format).",
+        default="rate",
+        help="Column name in observation files to use (e.g., 'NET_RATE', 'FLUX', 'COUNT_RATE', "
+             "'flux_t'). Matched case-insensitively against the file header; 'rate' also "
+             "names the second column of a headerless time/rate[/error] file.",
     )
     parser.add_argument(
         "--obs-error-column",
@@ -217,15 +217,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--fit-phase-shift",
-        "--rescale",
-        dest="fit_phase_shift",
         action="store_true",
         help="Optimize the model phase shift to minimize χ². By default the "
              "shift is held at 0. Flux is never rescaled: the model's absolute "
              "normalization is fixed by the wind mass-loss rate and the XSPEC "
              "flux-vs-nH table, and the only y-direction freedom is the "
-             "additive --scatter floor. "
-             "(--rescale is accepted as a deprecated alias.)",
+             "additive --scatter floor.",
     )
     
     # Phase binning options. As in mcmc_lightcurve_fit.py, the mode is selected
@@ -324,24 +321,19 @@ def main() -> None:
             "apply, so the file would just restate --sim-file."
         )
 
-    # Determine observation column to use
-    obs_column = args.obs_column if args.obs_column else "rate"
-    obs_error_column = args.obs_error_column
-    time_column = args.time_column
-    
-    if args.obs_column:
-        print(f"Using observation column: {obs_column}")
-        if obs_error_column:
-            print(f"Using error column: {obs_error_column}")
-        else:
-            print(f"Error column will be auto-detected")
-    if time_column:
-        print(f"Using time column: {time_column}")
+    obs_column = args.obs_column
+    print(f"Using observation column: {obs_column}")
+    if args.obs_error_column:
+        print(f"Using error column: {args.obs_error_column}")
+    else:
+        print("Error column will be auto-detected")
+    if args.time_column:
+        print(f"Using time column: {args.time_column}")
     df = load_data(
         args.data_dir,
         obs_column=obs_column,
-        obs_error_column=obs_error_column,
-        time_column=time_column,
+        obs_error_column=args.obs_error_column,
+        time_column=args.time_column,
     )
     print(f"Loaded {len(df)} data point(s) from {df['obs'].nunique()} observation(s).")
     
@@ -451,7 +443,7 @@ def main() -> None:
             stem, ext = os.path.splitext(base)
             write_model_lightcurve(
                 f"{stem}{ext or '.txt'}", df, sim_df, sim_column, shift, scatter_value,
-                red_chi2=chi2, shift_fitted=args.fit_phase_shift,
+                shift_fitted=args.fit_phase_shift,
                 obs_column=obs_column, sim_file=args.sim_file,
             )
 
