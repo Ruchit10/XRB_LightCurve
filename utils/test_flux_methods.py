@@ -47,7 +47,6 @@ BASE_PARAMS = dict(
     i0=78.0,
     dth=5.0,
     f_opacity=0.02,
-    verbose=False,
 )
 
 
@@ -63,6 +62,7 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
 
     try:
         results = simulate_lightcurve(
+            verbose=False,
             flux_method=flux_method,
             flux_csv_path=csv_path,
             wind_model=wind_model,
@@ -96,11 +96,9 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
         print("✗ fl is not strictly positive at every visible phase")
         ok = False
     # The likelihood path must see exactly the curve the DataFrame reports.
-    # (`verbose` belongs to simulate_lightcurve only; unknown keywords raise.)
-    sim_params = {k: v for k, v in BASE_PARAMS.items() if k != "verbose"}
     phase, flux = simulate_band_flux(
         flux_method=flux_method, flux_csv_path=csv_path, wind_model=wind_model,
-        **sim_params,
+        **BASE_PARAMS,
     )
     col = flux_cols[0]
     if not (np.array_equal(phase, results["phase"].to_numpy())

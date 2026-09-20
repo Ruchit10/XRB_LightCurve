@@ -806,6 +806,110 @@ fit with the fixed searched shift gives the same total χ²; 18 rejected MCMC
 combinations and 8 rejected tabulated-fit combinations exit 2 with the
 intended message, and the valid freeze-one-fit-one wind-shape case runs.
 
+### Commit 6 — Final pre-release review: replot from the chain, shared helpers, edge cases
+
+A second ten-angle review of the whole tree (one angle ran PyXspec live under
+HEASoft) plus a 24-run smoke matrix (four parameterizations × two samplers ×
+three wind models, all green). Findings fixed:
+
+- **Replot reads `*_chain.npz` only.** It required `*_samples.csv` (so a
+  `--no-csv-output` fit could not be replotted) and checked the normalization
+  stamp only if a chain file happened to exist (so a samples-only legacy
+  directory replotted unchecked and was then stamped by the self-heal). The
+  chain file, always written right after sampling, now supplies chain,
+  log-prob, parameter names and metadata; the CSV is an export;
+  `--compact-output` (an NPZ nothing read) is gone; chain columns overlapping
+  the frozen set are refused.
+- **Never-restore set derived from the parser.** `build_parser` groups the
+  invocation-only options into *Execution* and *Output* argument groups and
+  `NEVER_RESTORED_DESTS` is built from them. `--seed` is accepted on
+  `--replot` (the chi2 subsample and wind-profile draws are random);
+  `--no-fit-phase-shift` and `--phase-shift` are mutually exclusive, for
+  validation and for the restore.
+- **From-chain χ² guard.** `-2(log_prob - log_prior)` only holds with the
+  sampled priors; on a replot with a typed `--prior-*`, or a rebuilt spec
+  whose parameters lack priors, the table falls back to model evaluation with
+  a note, and a chain whose mode differs from the command line gets that
+  mode's default priors with a warning.
+- **zeus start-up.** Initial walkers at `-inf` (outside `r < R`, `Rb ≥ R` or a
+  box) are redrawn up to 20 times; emcee only rejected moves from them, zeus
+  refused to start. `set_num_threads` failures are no longer swallowed and
+  `--numba-threads-per-worker` is checked against numba's limit.
+- **Silent inputs made loud.** `DirectLightCurveModel` rejects unknown
+  `sim_params` keys and `curve()` catches only the simulator's `ValueError` /
+  `ArithmeticError`; `--prior-*` overrides need `STD > 0`, `MIN < MAX` and the
+  mean inside the box; `_simulate_core` rejects `dth`/`d2h` that do not divide
+  360 (the reflection assumes a closed grid: `--gma0 20 --dth 7` copied 15 of
+  51 phases from the wrong partner); a table band with fewer than two usable
+  rows raises instead of vanishing; `check_phase_window` rejects `1 0`; the
+  scatter window must overlap the data window with positive length.
+- **One rule, one place.** `drop_invalid_flux_rows` (both fitters drop `≤ 0`;
+  the tabulated fitter used `!= 0`), `apply_phase_window`, `model_dump_path`,
+  `dest_to_flag`, `tabulated_model_arrays`, `validate_binning_args` /
+  `validate_phase_window_args`; `weighted_mean` lost its own repair rule and
+  the tabulated fitter sanitizes before binning (which also removes the
+  machine-epsilon errors that gave `--keep-zero-flux` bins weight 10²⁸); BIC's
+  `k` counts the profiled shift and uses the overlays' point estimate;
+  `--prior-fopa` exists (its override merge was dead code);
+  `interp_periodic_phases`, `plot_phase(shift_fitted)`, `stats['wind_model']`
+  removed.
+- **Windows and figures.** Constant-counts bins are formed along the phase
+  measured from the window's lower bound, so a wrapping window no longer merges
+  points across its seam into a bin centred in the excluded gap; the smoothed
+  curve is evaluated inside the window only; the orbit figure uses
+  `sin(gma) > 0` for "behind" (exactly edge-on `h == 0` everywhere) and states
+  when the emitter is never behind the companion; the smoothed-band legend no
+  longer says "MC".
+- **XSPEC script (verified live against HEASoft by the review).** The PHA
+  header's BACKFILE/RESPFILE/ANCRFILE pairing is kept and directory files fill
+  only the gaps: assigning `spectrum.response` replaces the Response object and
+  dropped the header's ARF whenever no `*.arf` matched, and `spectrum.response`
+  raises rather than returning None, so the previous guard was dead. The
+  RMF/ARF fallbacks no longer pick a background response; `.gz` responses are
+  matched; the model energy array is extended once so `calcFlux` is exact over
+  the band (XSPEC clips a band to the model array; bands outside 0.1–20 keV
+  are rejected); `chi2_red` is NaN, not 0, when dof ≤ 0; PyXspec is imported
+  after argument parsing so `--help` works without HEASoft. The `refit`
+  exponential is documented as orientation only: fitted with equal weights in
+  log space it misses the low-`nH` plateau by ~2× for the broad band.
+  `CHANDRA_BANDS` in `utils.utils` is the single band definition.
+- Known approximation, documented: under the jitter likelihood the shift is
+  profiled on the classical χ²; the difference to profiling on the jitter
+  variance is second order in `f`. Efficiency notes recorded for later: the
+  coarse shift scan could be an FFT correlation (~0.5 ms → 0.15 ms), the
+  log-uniform flux table allows direct indexing instead of bisection
+  (0.9 → 0.5 ms), and pool workers import matplotlib/arviz/zeus they never use
+  (~2.5 s per worker start).
+
+Verified in `henv`: forward model and likelihood bit-identical to the previous
+tree; tests 6/6; the group-3 and group-5 check scripts all green; a
+`--no-csv-output` fit replots; a samples-only directory is refused; zeus starts
+from a prior that puts half the initial ball at `-inf`; a wrapping window with
+`--counts-per-bin` keeps every bin centre inside the window; `--replot
+--save-chi2 --prior-R ...` falls back to model evaluation; the XSPEC script
+runs against the PyXspec stand-in (response, background, `calcFlux` and
+`fakeit` semantics mirrored from the live audit); pyflakes clean.
+
+### Commit 7 — `synthetic_data/`: fake spectra and synthetic light curves
+
+- `make_spectrum.py`: PyXspec `fakeit` of an absorbed power law through the IC
+  10 X-1 combined ACIS response (`--nH`, `--PhoIndex`, `--norm`, `--exposure`,
+  optional background, `--seed`), written to a directory that
+  `compute_flux_vs_nH.py --specdir` consumes; reports per band the model flux
+  (`calcFlux`), the fake net count rate and their ratio (`band_factors.json`).
+- `make_lightcurve.py`: the forward model at known parameters (every
+  `xrb_lightcurve.py` keyword), shifted, lifted by a scattered floor, converted
+  to counts with a flux-per-rate factor and `--dt`, Poisson-sampled over
+  visits with random gaps and an optional background, written in the CIAO
+  layout the fitters read unchanged, plus `<stem>_truth.json`.
+- README with the spectrum → table → light curve → fit sequence. Exercised end
+  to end: stand-in spectrum → table → light curve → both fitters; with the
+  injected floor passed as `--scatter`, the tabulated fit recovered the
+  injected shift 0.985 as 0.9848 (constant-counts bins), 0.9850 (100 bins)
+  and 0.9847 (unbinned); the default eclipse-window floor estimate assumes a
+  total eclipse and biases a partial dip's shift to 0.960, which the README
+  now says.
+
 ---
 
 ## Side Investigation — Reference Epoch
@@ -825,12 +929,13 @@ interpretability of plotted phases; the study script is not in the tree.
 | File | Lines | Description |
 | ---- | ----- | ----------- |
 | `xrb_lightcurve.py` | ~1050 | Forward model: profiles, Numba GL kernel (mirror-symmetric sectors, half the orbit by phase reflection), compiled per-cell flux conversion, `simulate_lightcurve` / `simulate_band_flux`, `SIM_DEFAULTS`, physical normalization. |
-| `mcmc_lightcurve_fit.py` | ~1950 | emcee/zeus MCMC: `MODES`, `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
-| `chandra_phase_analysis.py` | ~450 | CLI for the single-model χ² fit; re-exports the shared `utils/` API. |
-| `utils/utils.py` | ~1500 | Ephemeris, loading, `sanitize_errors`, both binners, smoothing, the periodic interpolator + phase-shift search, `fit_simulation`, model-dump blocks, run-config persistence. |
+| `mcmc_lightcurve_fit.py` | ~2140 | emcee/zeus MCMC: `MODES`, `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
+| `chandra_phase_analysis.py` | ~510 | CLI for the single-model χ² fit; re-exports the shared `utils/` API. |
+| `utils/utils.py` | ~1670 | Ephemeris, loading, `sanitize_errors`, both binners, smoothing, the periodic interpolator + phase-shift search, `fit_simulation`, model-dump blocks, run-config persistence. |
 | `utils/plot_utils.py` | ~900 | All plotting on the single `plot_lightcurve_fit`; geometry and wind-profile figures. |
 | `compute_flux_vs_nH.py` | ~380 | XSPEC flux-vs-nH table generator, one band per table. |
 | `plot_results.py` | 104 | Thin CLI over `utils/plot_utils.py` (`--geometric`, `--orbit`). |
+| `synthetic_data/` | ~410 | `make_spectrum.py` (PyXspec `fakeit`, per-band flux-per-rate) and `make_lightcurve.py` (CIAO-layout synthetic light curves + truth JSON). |
 
 ### Utilities, scripts, references
 `utils/` is a package (`utils.py`, `plot_utils.py`); `test_flux_methods.py` is

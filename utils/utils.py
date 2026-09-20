@@ -14,8 +14,7 @@ import from this module, so there is a single implementation of:
 * Gaussian phase smoothing (:func:`smooth_lightcurve`) and the eclipse-floor
   estimate (:func:`estimate_scattered_flux`)
 * the single periodic model interpolator (:func:`periodic_model`,
-  :func:`eval_periodic`, :func:`prepare_model_interpolator`,
-  :func:`interp_periodic_phases`)
+  :func:`eval_periodic`, :func:`prepare_model_interpolator`)
 * the periodic phase-shift search (:class:`PhaseShiftSearch`,
   :func:`build_phase_shift_search`, :func:`best_phase_shift`), shared by the
   tabulated-model χ² fit (:func:`fit_simulation`) and the MCMC likelihood
@@ -87,8 +86,8 @@ def check_phase_window(lo: float, hi: float) -> Tuple[float, float]:
     lo, hi = float(lo), float(hi)
     if not (0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0):
         raise ValueError(f"phase window bounds must lie in [0, 1], got {lo} and {hi}")
-    if lo == hi:
-        raise ValueError("phase window must not be empty (lo == hi); use 0 1 for the full orbit")
+    if (lo, hi) != (0.0, 1.0) and (lo % 1.0) == (hi % 1.0):
+        raise ValueError(f"phase window [{lo:g}, {hi:g}) is empty; use 0 1 for the full orbit")
     return lo, hi
 
 
@@ -104,6 +103,71 @@ def in_phase_window(phase, lo: float, hi: float) -> np.ndarray:
     if is_full_phase_window(lo, hi):
         return np.ones(phase.shape, dtype=bool)
     return np.mod(phase - lo, 1.0) < ((hi - lo) % 1.0)
+
+
+def phase_window_intervals(lo: float, hi: float) -> List[Tuple[float, float]]:
+    """The window as non-wrapping intervals on [0, 1): one, or two when it wraps."""
+    lo, hi = check_phase_window(lo, hi)
+    if is_full_phase_window(lo, hi):
+        return [(0.0, 1.0)]
+    return [(lo, hi)] if lo < hi else [(lo, 1.0), (0.0, hi)]
+
+
+def apply_phase_window(df: pd.DataFrame, lo: float, hi: float, column: str = "phase",
+                       verbose: bool = True) -> pd.DataFrame:
+    """Rows of *df* whose *column* lies inside the phase window.
+
+    The full window returns *df* unchanged; otherwise the kept count is
+    printed and an empty result raises ``ValueError``. Shared by both fitters
+    so they select the same rows for the same window.
+    """
+    lo, hi = check_phase_window(lo, hi)
+    if is_full_phase_window(lo, hi):
+        return df
+    out = df[in_phase_window(df[column].to_numpy(dtype=float), lo, hi)].reset_index(drop=True)
+    if verbose:
+        print(f"Phase window [{lo:g}, {hi:g}): kept {len(out)} of {len(df)} points")
+    if out.empty:
+        raise ValueError(f"No observed points fall inside the phase window [{lo:g}, {hi:g}).")
+    return out
+
+
+def drop_invalid_flux_rows(df: pd.DataFrame, column: str, drop_nonpositive: bool = True,
+                           verbose: bool = True) -> pd.DataFrame:
+    """Drop rows whose *column* is non-finite and, by default, ``<= 0``.
+
+    Zero-count bins (and negative background-subtracted rates) are the
+    ``<= 0`` rows; ``drop_nonpositive=False`` keeps them, and their zero errors
+    are then repaired by :func:`sanitize_errors`. One rule for both fitters.
+    """
+    values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+    keep = np.isfinite(values)
+    if drop_nonpositive:
+        keep &= values > 0
+    out = df[keep].reset_index(drop=True)
+    if verbose:
+        n_dropped = len(df) - len(out)
+        if n_dropped:
+            what = "non-positive/non-finite" if drop_nonpositive else "non-finite"
+            print(f"Dropped {n_dropped} {what} {column} rows before fitting")
+        if not drop_nonpositive:
+            n_zero = int(np.sum(values[keep] <= 0))
+            if n_zero:
+                print(f"Kept {n_zero} rows with {column} <= 0 (zero-count bins); their errors are "
+                      f"repaired by sanitize_errors")
+    return out
+
+
+def model_dump_path(plot_path: Optional[str], default: str = "model_lightcurve.txt") -> str:
+    """``<plot stem>_model.txt`` next to a figure, or *default* without a figure.
+
+    Used by both fitters so the model dump always sits beside the plot it
+    describes under either entry point.
+    """
+    if not plot_path:
+        return default
+    stem, _ = os.path.splitext(str(plot_path))
+    return f"{stem}_model.txt"
 
 
 def fmt_val(value: float, width: int = 0) -> str:
@@ -140,13 +204,23 @@ def band_label_from_column(column: str) -> str:
     return col
 
 
-# Energy-band display names and ranges (keV), for plot titles/legends.
+# Chandra energy bands (keV), the single definition shared by the flux-table
+# generator, the synthetic-data scripts and the plot labels.
+CHANDRA_BANDS: Dict[str, Tuple[float, float]] = {
+    "broad": (0.5, 7.0),
+    "soft": (0.5, 2.0),
+    "medium": (1.2, 2.0),
+    "hard": (2.0, 7.0),
+}
+
+# Chandra time system: MJD = MJDREF + t / 86400 for mission time t in seconds.
+MJDREF_CHANDRA: float = 50814.0
+
+# Energy-band display names and ranges, for plot titles/legends (physical order).
 BAND_INFO: Dict[str, Tuple[str, str]] = {
     "ultrasoft": ("Ultra-soft", "0.2-0.5 keV"),
-    "soft": ("Soft", "0.5-2 keV"),
-    "medium": ("Medium", "1.2-2.0 keV"),
-    "hard": ("Hard", "2.0-7.0 keV"),
-    "broad": ("Broad", "0.5-7.0 keV"),
+    **{band: (band.capitalize(), f"{lo:g}-{hi:g} keV") for band, (lo, hi) in
+       sorted(CHANDRA_BANDS.items(), key=lambda kv: (kv[1][0], kv[1][1]))},
 }
 
 
@@ -512,19 +586,8 @@ def load_observed_lightcurves(
         # presence check of the constant-counts binner.
         combined['counts'] = raw['counts'].astype(float)
 
-    n_before = len(combined)
-    valid = np.isfinite(combined['flux']) & np.isfinite(combined['time'])
-    if drop_nonpositive_flux:
-        valid &= combined['flux'] > 0
-    combined = combined.loc[valid].reset_index(drop=True)
-    if n_before - len(combined) > 0:
-        what = "non-positive/non-finite" if drop_nonpositive_flux else "non-finite"
-        print(f"Dropped {n_before - len(combined)} {what} flux rows before fitting")
-    if not drop_nonpositive_flux:
-        n_zero = int(np.sum(combined['flux'] <= 0))
-        if n_zero:
-            print(f"Kept {n_zero} rows with flux <= 0 (zero-count bins); their errors are "
-                  f"repaired by sanitize_errors")
+    combined = combined.loc[np.isfinite(combined['time'])].reset_index(drop=True)
+    combined = drop_invalid_flux_rows(combined, 'flux', drop_nonpositive=drop_nonpositive_flux)
     if 'error' in raw.columns:
         combined['flux_err'] = sanitize_errors(combined['flux_err'], context=f"{band} band light curves: ")
 
@@ -540,28 +603,21 @@ def load_observed_lightcurves(
 def weighted_mean(values: np.ndarray, errors: Optional[np.ndarray]) -> Tuple[float, float]:
     """Inverse-variance weighted mean of *values* and its error ``sqrt(1/Σw)``.
 
-    Zero, negative or non-finite errors are patched with the median valid
-    error; when no error is valid the spread of the values is used instead
-    (floored at machine epsilon). Without any errors the plain mean and the
-    standard error of the mean are returned. Shared by both phase binners so
-    they weight points identically.
+    Errors must already be valid (finite and > 0): the loaders repair them
+    once with :func:`sanitize_errors` before binning, so a bad error here is a
+    programming error and raises. Without errors (no error column at all) the
+    plain mean and the standard error of the mean are returned. Shared by both
+    phase binners so they weight points identically.
     """
     values = np.asarray(values, dtype=float)
     n = values.size
-    if errors is not None:
-        errors = np.asarray(errors, dtype=float)
     if errors is None or not np.any(np.isfinite(errors)):
         if n > 1:
             return float(np.mean(values)), float(np.std(values) / np.sqrt(n))
         return float(values[0]), 0.0
-
-    bad = (errors <= 0) | ~np.isfinite(errors)
-    valid = errors[~bad]
-    if valid.size:
-        errors = np.where(bad, np.median(valid), errors)
-    else:
-        spread = np.std(values) if n > 1 else abs(values[0]) * 0.1
-        errors = np.full(n, max(float(spread), np.finfo(float).eps))
+    errors = np.asarray(errors, dtype=float)
+    if np.any(~np.isfinite(errors) | (errors <= 0)):
+        raise ValueError("weighted_mean: errors must be finite and > 0 (run sanitize_errors first)")
     weights = 1.0 / errors ** 2
     return float(np.average(values, weights=weights)), float(np.sqrt(1.0 / np.sum(weights)))
 
@@ -661,12 +717,17 @@ def phase_bin_data_snr(
     rate_column: str = 'rate',
     error_column: str = 'error',
     verbose: bool = True,
+    phase_origin: float = 0.0,
 ) -> pd.DataFrame:
     """
     Adaptive phase binning with approximately constant counts per bin.
 
     Points are sorted by phase and grouped greedily until each bin reaches
-    ``counts_per_bin`` total counts, yielding variable phase-width bins.
+    ``counts_per_bin`` total counts, yielding variable phase-width bins. The
+    ordering (and the bin centres and edges) use the phase measured from
+    *phase_origin*, so a phase window that wraps through 0 (pass its lower
+    bound) never merges the points on either side of its seam into one bin
+    whose centre would lie in the excluded gap.
 
     Parameters
     ----------
@@ -709,7 +770,9 @@ def phase_bin_data_snr(
             f"and not all zero (non-finite: {int(np.sum(~np.isfinite(counts)))}, "
             f"negative: {int(np.sum(counts < 0))}, positive: {int(np.sum(counts > 0))}).")
     work[counts_column] = counts
-    work = work.sort_values('phase').reset_index(drop=True)
+    origin = float(phase_origin) % 1.0
+    work['_u'] = np.mod(work['phase'].to_numpy(dtype=float) - origin, 1.0)
+    work = work.sort_values('_u').reset_index(drop=True)
 
     target = float(counts_per_bin)
     bins: List[List[int]] = []
@@ -742,17 +805,15 @@ def phase_bin_data_snr(
                     if error_column in bin_df.columns else None)
         mean_rate, mean_err = weighted_mean(rate_vals, err_vals)
 
-        phase_vals = bin_df['phase'].to_numpy(dtype=float)
+        u_vals = bin_df['_u'].to_numpy(dtype=float)
         bin_counts = bin_df[counts_column].to_numpy(dtype=float)
         total_counts = float(np.sum(bin_counts))
-        if total_counts > 0:
-            phase_center = float(np.average(phase_vals, weights=bin_counts))
-        else:
-            phase_center = float(np.mean(phase_vals))
-
-        phase_lo = float(np.min(phase_vals))
-        phase_hi = float(np.max(phase_vals))
-        width = float(max(phase_hi - phase_lo, 0.0))
+        u_center = float(np.average(u_vals, weights=bin_counts)) if total_counts > 0 else float(np.mean(u_vals))
+        u_lo, u_hi = float(np.min(u_vals)), float(np.max(u_vals))
+        phase_center = (u_center + origin) % 1.0
+        phase_lo = (u_lo + origin) % 1.0
+        phase_hi = (u_hi + origin) % 1.0
+        width = float(max(u_hi - u_lo, 0.0))
 
         binned_data.append(
             {
@@ -944,15 +1005,6 @@ def prepare_model_interpolator(
     return periodic_model(sim_phase, sim_df[sim_column].to_numpy(dtype=float))
 
 
-def interp_periodic_phases(
-    obs_phases: np.ndarray,
-    model_phase: np.ndarray,
-    model_flux: np.ndarray,
-) -> np.ndarray:
-    """A periodic ``(phase, flux)`` curve interpolated onto *obs_phases*."""
-    return eval_periodic(*periodic_model(model_phase, model_flux), obs_phases)
-
-
 def sanitize_errors(errors, context: str = "") -> np.ndarray:
     """Measurement errors with non-finite or non-positive entries patched.
 
@@ -962,9 +1014,9 @@ def sanitize_errors(errors, context: str = "") -> np.ndarray:
     ``1e-3`` floor zero-weights a flux point of ``1e-13``, and ``sqrt`` of a
     flux is not a count error). If no error is valid a ``ValueError`` is
     raised: a χ² fit without measurement errors is not meaningful. This is the
-    one repair rule, applied at the load boundary
-    (:func:`load_observed_lightcurves`, ``mcmc_lightcurve_fit.load_fit_data``)
-    and by :func:`obs_errors`.
+    one repair rule, applied at the load boundary (:func:`load_observed_lightcurves`,
+    ``chandra_phase_analysis.main``, ``mcmc_lightcurve_fit.load_fit_data``) and
+    by :func:`obs_errors`; the binners receive already-valid errors.
     """
     err = np.array(errors, dtype=float, copy=True)
     bad = ~np.isfinite(err) | (err <= 0)
@@ -1113,6 +1165,29 @@ def write_model_blocks(f, model_phase, model_flux, obs_phase, obs_flux, obs_err,
                 f"{obs_model[idx]:.8e} {resid[idx]:.6f}\n")
 
 
+def tabulated_model_arrays(
+    obs_df: pd.DataFrame,
+    sim_df: pd.DataFrame,
+    sim_column: str,
+    shift: float,
+    scatter: float = 0.0,
+    n_model_points: int = MODEL_OVERLAY_N_POINTS,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The tabulated model as drawn and dumped: ``(model_phase, model_flux,
+    obs_phase, obs_model)`` for the given shift and additive floor.
+
+    One evaluation shared by ``plot_utils.plot_phase`` and
+    :func:`write_model_lightcurve`, so the plotted overlay and the dumped curve
+    are the same arrays.
+    """
+    phase_ext, flux_ext = prepare_model_interpolator(sim_df, sim_column)
+    obs_phase = np.mod(obs_df["phase"].to_numpy(dtype=float), 1.0)
+    model_phase = np.linspace(0.0, 1.0, int(n_model_points))
+    model_flux = eval_periodic(phase_ext, flux_ext, model_phase, shift, scatter)
+    obs_model = eval_periodic(phase_ext, flux_ext, obs_phase, shift, scatter)
+    return model_phase, model_flux, obs_phase, obs_model
+
+
 def write_model_lightcurve(
     path: str,
     obs_df: pd.DataFrame,
@@ -1139,17 +1214,12 @@ def write_model_lightcurve(
 
     Returns the path written.
     """
-    phase_ext, flux_ext = prepare_model_interpolator(sim_df, sim_column)
     shift = float(shift)
     scatter = float(scatter)
-
-    obs_phase = np.mod(obs_df["phase"].to_numpy(dtype=float), 1.0)
+    model_phase, model_flux, obs_phase, obs_model = tabulated_model_arrays(
+        obs_df, sim_df, sim_column, shift, scatter, n_model_points)
     obs_flux = obs_df["rate"].to_numpy(dtype=float)
     obs_err = obs_errors(obs_df)
-
-    model_phase = np.linspace(0.0, 1.0, int(n_model_points))
-    model_flux = eval_periodic(phase_ext, flux_ext, model_phase, shift, scatter)
-    obs_model = eval_periodic(phase_ext, flux_ext, obs_phase, shift, scatter)
 
     n_free = 1 if shift_fitted else 0
     dof = max(len(obs_flux) - n_free, 1)
@@ -1316,24 +1386,21 @@ def save_samples_csv_chunked(
 RUN_CONFIG_SUFFIX = "_run_config.json"
 
 # Options that define the *fit* are restored by --replot; options that only
-# control this invocation's output are not. `replot` itself must never be
-# restored (a saved fit recorded replot=False, which would cancel the replot)
-# and `output_dir` is defined by where the config was found. store_true flags
-# cannot be negated on the command line, so restoring no_plots/save_chi2/...
-# would make a fit run with --no-plots impossible to replot with figures.
-_RUN_CONFIG_NEVER_RESTORE = frozenset({
-    "replot", "output_dir",
-    "no_plots", "no_geometry_plots", "quiet", "smooth", "smooth_sigma",
-    "save_chi2", "chi2_n_samples", "compute_bic", "compact_output",
-    "no_csv_output", "csv_chunk_size", "n_threads", "numba_threads_per_worker",
-    "seed",
-})
+# control one invocation (the caller passes them as `never_restore`, derived
+# from its Execution/Output argument groups) are not. `replot` itself must never
+# be restored (a saved fit recorded replot=False, which would cancel the
+# replot) and `output_dir` is defined by where the config was found.
+# store_true flags cannot be negated on the command line, so restoring
+# no_plots/save_chi2/... would make a fit run with --no-plots impossible to
+# replot with figures.
+_RUN_CONFIG_NEVER_RESTORE = frozenset({"replot", "output_dir"})
 
 # Mutually exclusive option groups: typing one member on --replot must not
 # restore a saved sibling, which would trip the exclusivity check.
 _RUN_CONFIG_EXCLUSIVE_GROUPS = (
     frozenset({"n_phase_bins", "counts_per_bin", "no_phase_bin"}),
     frozenset({"reparam", "kepler", "kepler_mtot"}),
+    frozenset({"no_fit_phase_shift", "phase_shift"}),
 )
 
 # Stamped into every new run config. i0 was formerly measured from the line of
@@ -1402,6 +1469,58 @@ def find_run_configs(
     return sorted(glob.glob(os.path.join(output_dir, f"{b}_{w}{RUN_CONFIG_SUFFIX}")))
 
 
+def dest_to_flag(parser: argparse.ArgumentParser) -> Dict[str, str]:
+    """dest -> the long option a user would type (``prior_M_X`` is spelled ``--prior-MX``)."""
+    out: Dict[str, str] = {}
+    for action in parser._actions:
+        longs = [o for o in action.option_strings if o.startswith("--")]
+        if longs:
+            out[action.dest] = longs[0]
+    return out
+
+
+def validate_binning_args(err, args) -> None:
+    """Binning options shared by both fitters: exclusivity and positivity."""
+    if args.no_phase_bin and (args.n_phase_bins is not None or args.counts_per_bin is not None):
+        err("--no-phase-bin excludes --n-phase-bins and --counts-per-bin.")
+    if args.n_phase_bins is not None and args.counts_per_bin is not None:
+        err("Specify either --n-phase-bins (fixed-width) or --counts-per-bin (constant counts), not both.")
+    if args.n_phase_bins is not None and args.n_phase_bins <= 0:
+        err("--n-phase-bins must be > 0.")
+    if args.counts_per_bin is not None and args.counts_per_bin <= 0:
+        err("--counts-per-bin must be > 0.")
+
+
+def validate_phase_window_args(err, args, fit_shift_enabled: bool, fixed_shift_hint: str,
+                               scatter_window_used: bool) -> Tuple[float, float, bool]:
+    """Phase-window rules shared by both fitters; returns ``(lo, hi, partial)``.
+
+    A partial window with the shift search enabled is rejected (the symmetric
+    model makes the eclipse width degenerate with a free shift when only one
+    edge is in the data), and the scattered-flux window must overlap the data
+    window whenever the floor is estimated from the data.
+    """
+    try:
+        lo, hi = check_phase_window(*args.phase_window)
+    except ValueError as e:
+        err(f"--phase-window: {e}")
+    partial = not is_full_phase_window(lo, hi)
+    if partial and fit_shift_enabled:
+        err("A partial --phase-window needs a fixed phase shift. The model is symmetric about "
+            "mid-eclipse, so with only one eclipse edge in the data the eclipse width is "
+            f"degenerate with a free shift: {fixed_shift_hint}")
+    s_lo, s_hi = map(float, args.scatter_eclipse_phase)
+    if not (0.0 <= s_lo <= s_hi <= 1.0):
+        err("--scatter-eclipse-phase must satisfy 0 <= PHASE_MIN <= PHASE_MAX <= 1.")
+    if partial and scatter_window_used:
+        # Positive-length overlap: a window that only touches the open end [lo, hi)
+        # of the data window holds no data points.
+        if not any(max(a, s_lo) < min(b, s_hi) for a, b in phase_window_intervals(lo, hi)):
+            err(f"--scatter-eclipse-phase {s_lo:g} {s_hi:g} lies outside --phase-window "
+                f"{lo:g} {hi:g}, so the scattered flux cannot be estimated from the data.")
+    return lo, hi, partial
+
+
 def explicit_cli_dests(parser: argparse.ArgumentParser, argv: Optional[List[str]] = None) -> set:
     """Argparse dests corresponding to options the user actually typed.
 
@@ -1436,14 +1555,20 @@ def apply_saved_run_config(
     parser: argparse.ArgumentParser,
     args,
     argv: Optional[List[str]] = None,
+    explicit: Optional[set] = None,
+    never_restore=(),
 ) -> Optional[str]:
     """Fill in options the user did not type from a previous run's config.
 
     Intended for ``--replot``, so that flag alone reproduces the original run's
     band, wind model, data selection, binning and priors. Explicit command-line
-    values always win. Returns the config path used, or None.
+    values always win (*explicit* is the typed set from
+    :func:`explicit_cli_dests`, computed here when not given), and the dests
+    in *never_restore* (invocation-only options) plus ``replot``/``output_dir``
+    are never restored. Returns the config path used, or None.
     """
-    explicit = explicit_cli_dests(parser, argv)
+    explicit = explicit_cli_dests(parser, argv) if explicit is None else set(explicit)
+    never = _RUN_CONFIG_NEVER_RESTORE | set(never_restore)
 
     candidates = find_run_configs(
         args.output_dir,
@@ -1509,15 +1634,10 @@ def apply_saved_run_config(
             f"model the posterior never saw. Refit instead."
         )
 
-    # dest -> the flag the user would type ('prior_M_X' is spelled '--prior-MX').
-    dest_to_flag: Dict[str, str] = {}
-    for action in parser._actions:
-        longs = [o for o in action.option_strings if o.startswith("--")]
-        if longs:
-            dest_to_flag[action.dest] = longs[0]
+    flag_of = dest_to_flag(parser)
     known_dests = {a.dest for a in parser._actions}
 
-    blocked = set(_RUN_CONFIG_NEVER_RESTORE)
+    blocked = set(never)
     for group in _RUN_CONFIG_EXCLUSIVE_GROUPS:
         if explicit & group:
             blocked |= group
@@ -1539,12 +1659,12 @@ def apply_saved_run_config(
         print(f"  original command: {config['command']}")
     if restored:
         for dest, value in sorted(restored):
-            print(f"    {dest_to_flag.get(dest, '--' + dest)} = {value!r}")
+            print(f"    {flag_of.get(dest, '--' + dest)} = {value!r}")
     else:
         print("    (nothing to restore — command line already matches)")
     overridden = sorted(
-        dest_to_flag.get(d, '--' + d) for d in explicit
-        if d not in _RUN_CONFIG_NEVER_RESTORE and d in saved_args
+        flag_of.get(d, '--' + d) for d in explicit
+        if d not in never and d in saved_args
     )
     if overridden:
         print(f"  kept from the command line: {', '.join(overridden)}")

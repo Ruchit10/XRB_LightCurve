@@ -89,6 +89,9 @@ python mcmc_lightcurve_fit.py \
 
 # -----------------------------------------------------------------------------
 # 3d. Regenerate every plot from a finished run (no resampling).
-#     All options are restored from <band>_<wind>_run_config.json.
+#     All fit-defining options are restored from <band>_<wind>_run_config.json;
+#     output options (--smooth, --compute-bic, --save-chi2, ...) are typed. Only
+#     fits made since Phase 34 carry the wind_normalization stamp; the older
+#     lam-mode results in mcmc_results/ are refused and must be refitted.
 # -----------------------------------------------------------------------------
-python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results
+python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results/broad --compute-bic

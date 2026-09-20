@@ -51,7 +51,6 @@ import argparse
 import copy
 import multiprocessing as mp
 import os
-import re
 import sys
 import time
 import warnings
@@ -100,17 +99,18 @@ from utils.utils import (
     RUN_CONFIG_SUFFIX,
     WIND_NORMALIZATION,
     PhaseShiftSearch,
+    apply_phase_window,
     apply_saved_run_config,
     best_phase_shift,
     build_phase_shift_search,
-    check_phase_window,
+    dest_to_flag,
     estimate_scattered_flux,
     eval_periodic,
     explicit_cli_dests,
     fmt_val,
     in_phase_window,
-    is_full_phase_window,
     load_observed_lightcurves,
+    model_dump_path,
     periodic_model,
     phase_bin_data,
     phase_bin_data_snr,
@@ -119,6 +119,8 @@ from utils.utils import (
     save_run_config,
     save_samples_csv_chunked,
     smooth_lightcurve,
+    validate_binning_args,
+    validate_phase_window_args,
     write_model_blocks,
 )
 from utils.plot_utils import (
@@ -559,6 +561,10 @@ class DirectLightCurveModel:
     per-sample wind-shape parameters.
     """
 
+    # Simulation constants a run may fix through sim_params (everything else
+    # is either sampled or set by the constructor).
+    SIM_CONSTANTS = ('gma0', 'd2h', 'mdot', 'v_inf', 'mu_wind', 'f_opacity')
+
     def __init__(self, band: str, flux_csv_path: str, wind_model: str = 'smooth_pl',
                  dth: float = 2.0, flux_method: str = "interpolate",
                  sim_params: Optional[Dict] = None):
@@ -574,6 +580,10 @@ class DirectLightCurveModel:
             raise ValueError(f"flux_method must be 'interpolate' or 'refit', got '{flux_method}'")
         if not os.path.exists(flux_csv_path):
             raise FileNotFoundError(f"Flux CSV not found: {flux_csv_path}")
+        unknown = set(self.sim_params) - set(self.SIM_CONSTANTS)
+        if unknown:
+            raise ValueError(f"sim_params keys {sorted(unknown)} are not simulation constants; "
+                             f"allowed: {self.SIM_CONSTANTS}")
         # Fail here, not once per likelihood call: a band missing from the table
         # would otherwise make every log-probability -inf, and the sampler would
         # still run to completion with frozen walkers.
@@ -588,8 +598,7 @@ class DirectLightCurveModel:
 
         Constants not set in ``sim_params`` take the simulator's own defaults.
         """
-        const = {k: self.sim_params.get(k, SIM_DEFAULTS[k])
-                 for k in ('gma0', 'd2h', 'mdot', 'v_inf', 'mu_wind', 'f_opacity')}
+        const = {k: self.sim_params.get(k, SIM_DEFAULTS[k]) for k in self.SIM_CONSTANTS}
         if f_opacity is not None:
             const['f_opacity'] = float(f_opacity)
         return dict(
@@ -606,7 +615,9 @@ class DirectLightCurveModel:
         the simulation fails."""
         try:
             return simulate_band_flux(**self.sim_kwargs(d1, d2, r, R, i0, wind_params, f_opacity))
-        except Exception as e:
+        except (ValueError, ArithmeticError) as e:
+            # The simulator's own rejections (r >= R, non-finite geometry) and
+            # numerical failures; a TypeError or KeyError is a bug and propagates.
             warnings.warn(f"Model evaluation failed: {e}")
             return None
 
@@ -780,11 +791,8 @@ _WORKER: Dict[str, object] = {}
 
 def _init_worker(max_numba_threads: int, spec, priors, model, data) -> None:
     """Pool initializer: cap Numba threads per worker and store the fit context."""
-    try:
-        import numba
-        numba.set_num_threads(max(1, int(max_numba_threads)))
-    except Exception:
-        pass
+    import numba
+    numba.set_num_threads(max(1, int(max_numba_threads)))   # raises above NUMBA_NUM_THREADS
     _WORKER.update(spec=spec, priors=priors, model=model, data=data)
 
 
@@ -855,13 +863,26 @@ def run_mcmc(
     # would sample a model that can never be evaluated to completion, with
     # acceptance 0 and a "posterior" equal to the initial ball.
     lp0 = np.array([log_probability(p, spec, priors, model, data) for p in pos])
-    n_bad = int(np.sum(~np.isfinite(lp0)))
-    if n_bad == n_walkers:
+    if not np.any(np.isfinite(lp0)):
         raise RuntimeError(
             "Every initial walker has log-probability -inf: the model cannot be evaluated "
             "near the prior means (check the flux table, the wind model and the priors).")
+    # Walkers that start outside the constraints (r < R, Rb >= R, the boxes) are
+    # redrawn: emcee would only reject moves from them, zeus refuses to start.
+    for _ in range(20):
+        bad = ~np.isfinite(lp0)
+        if not bad.any():
+            break
+        fresh = initial_positions(spec, priors, n_walkers)
+        pos[bad] = fresh[bad]
+        lp0[bad] = [log_probability(p, spec, priors, model, data) for p in pos[bad]]
+    n_bad = int(np.sum(~np.isfinite(lp0)))
     if n_bad:
-        warnings.warn(f"{n_bad} of {n_walkers} initial walkers start at log-probability -inf.")
+        msg = (f"{n_bad} of {n_walkers} initial walkers still have log-probability -inf after "
+               f"redrawing; the prior means or a --freeze value sit at a constraint boundary.")
+        if sampler_type == 'zeus':
+            raise RuntimeError(msg + " zeus cannot start from -inf walkers.")
+        warnings.warn(msg)
 
     print(f"\nStarting MCMC ({sampler_type}) with {n_walkers} walkers, {n_steps} steps"
           f"{f', {n_threads} threads' if n_threads > 1 else ' (serial)'}")
@@ -1098,22 +1119,18 @@ def compute_chi2_for_samples(model, spec: ParamSpec, samples: np.ndarray, data: 
         print(f"Chi-square data saved to: {output_path} ({os.path.getsize(output_path) / 1024:.1f} KB)")
 
 
-def compute_bic_metrics(samples: np.ndarray, spec: ParamSpec, model, data: FitData,
-                        log_prob: Optional[np.ndarray] = None) -> Dict[str, object]:
-    """BIC = k ln n - 2 ln L_hat at the max-log-prob sample (median fallback)."""
-    if samples is None or len(samples) == 0:
-        return {}
-    theta_hat, source = np.median(samples, axis=0), "median_fallback"
-    if log_prob is not None and len(log_prob) == len(samples):
-        finite = np.isfinite(log_prob)
-        if finite.any():
-            theta_hat = samples[int(np.argmax(np.where(finite, log_prob, -np.inf)))]
-            source = "map_log_prob"
+def compute_bic_metrics(stats: Dict, spec: ParamSpec, model, data: FitData) -> Dict[str, object]:
+    """BIC = k ln n - 2 ln L_hat at the point estimate of *stats* (MAP when
+    available, else the medians), the same point the overlays and dumps use."""
+    theta_hat, key = point_estimate_theta(stats, spec)
+    source = "map_log_prob" if key == 'map' else "median_fallback"
     logL_hat = log_likelihood(theta_hat, spec, model, data)
     n = int(len(data.flux))
     if n <= 0 or not np.isfinite(logL_hat):
         return {}
-    k = spec.n_dim
+    # Fitted parameters: the sampled dimensions plus the per-sample profiled
+    # phase shift, the same count degrees_of_freedom uses.
+    k = spec.n_dim + (1 if data.fit_phase_shift else 0)
     return {"bic": float(k * np.log(n) - 2.0 * logL_hat), "logL_hat": float(logL_hat),
             "k_params": float(k), "n_obs": float(n), "theta_source": source}
 
@@ -1202,7 +1219,7 @@ def plot_best_fit(model, spec: ParamSpec, data: FitData, stats: Dict, band: str,
     )
     print(f"Best-fit plot saved to: {output_path}")
 
-    model_txt = re.sub(r'\.png$', '', str(output_path)) + "_model.txt"
+    model_txt = model_dump_path(output_path)
     try:
         _write_bestfit_model_txt(
             model_txt, spec=spec, data=data, theta=theta, point_key=key,
@@ -1375,7 +1392,7 @@ def postprocess_fit(args, spec: ParamSpec, priors: Dict, model, data: FitData,
     if chain is not None:
         run_arviz_diagnostics(chain, spec, args.output_dir, suffix)
     if args.compute_bic:
-        bic_info = compute_bic_metrics(samples, spec, model, data, log_prob=log_prob_flat)
+        bic_info = compute_bic_metrics(stats, spec, model, data)
         if bic_info:
             stats.update(bic_info)
             print("\nBIC: {bic:.3f}  (logL_hat={logL_hat:.3f}, k={k_params:.0f}, "
@@ -1400,11 +1417,19 @@ def postprocess_fit(args, spec: ParamSpec, priors: Dict, model, data: FitData,
                                       suffix, verbose=not args.quiet)
 
     if args.save_chi2:
+        # chi2 = -2 (log_prob - log_prior) only holds with the priors the chain was
+        # sampled under: on a replot with a typed --prior-* (or a rebuilt spec
+        # whose parameters lack priors) fall back to evaluating the model.
+        chain_priors = priors
+        if sampler is None and (getattr(args, '_prior_typed', False)
+                                or any(n not in priors for n in spec.active_names)):
+            print("Note: priors differ from the sampled ones; chi2 is evaluated from the model.")
+            chain_priors = None
         compute_chi2_for_samples(
             model, spec, samples, data,
             output_path=os.path.join(args.output_dir, f"{suffix}_chi2.csv.gz"),
-            n_samples=args.chi2_n_samples, verbose=True, log_prob=log_prob_flat, priors=priors)
-    stats['wind_model'] = spec.wind_model
+            n_samples=args.chi2_n_samples, verbose=True, log_prob=log_prob_flat,
+            priors=chain_priors)
     return stats
 
 
@@ -1433,12 +1458,8 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
                                  output_path=path, log_prob=log_prob_flat,
                                  chunk_size=args.csv_chunk_size)
         print(f"Samples saved to: {path}")
-    if args.compact_output:
-        path = os.path.join(args.output_dir, f"{suffix}_samples.npz")
-        np.savez_compressed(path, samples=samples, param_names=np.array(spec.active_names, dtype=str),
-                            log_prob=log_prob_flat)
-        print(f"Compact samples saved to: {path}")
-    # The chain file carries the metadata --replot needs to rebuild the spec.
+    # The chain file is what --replot reads: the post-burn chain and log-prob plus
+    # the metadata that rebuilds the ParamSpec.
     path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
     np.savez_compressed(
         path, chain=chain, log_prob=sampler.get_log_prob(discard=args.n_burn),
@@ -1475,53 +1496,49 @@ def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
                          priors_for) -> Optional[Tuple[Dict, ParamSpec]]:
     """Regenerate every output from a saved chain without re-sampling.
 
-    The saved chain, not the command line, defines the parameterization: the
-    mode, likelihood, period and frozen values are read from ``*_chain.npz``,
-    and the sampled dimensions from the columns of ``*_samples.csv``.
-    *priors_for(spec)* returns the active priors of the rebuilt spec.
+    The chain file ``*_chain.npz`` (always written, right after sampling) is
+    the single source: the post-burn chain and log-probabilities, the sampled
+    parameter names in chain order, and the metadata that defines the
+    parameterization (mode, likelihood, period, frozen values) and the wind
+    normalization the posterior was sampled under. The ``*_samples.csv`` export
+    is not needed. *priors_for(spec)* returns the active priors of the rebuilt
+    spec.
     """
     suffix = f"{band}_{spec.wind_model}"
     print(f"\n{'#' * 60}\n# Replotting {band.upper()} band - {WIND_MODELS[spec.wind_model]}\n{'#' * 60}")
 
     chain_path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
-    samples_path = os.path.join(args.output_dir, f"{suffix}_samples.csv")
-    if not os.path.exists(samples_path):
-        print(f"Samples file not found: {samples_path}")
+    if not os.path.exists(chain_path):
+        print(f"Chain file not found: {chain_path} (every fit since Phase 34 writes it; older "
+              f"results were sampled under a different model and must be refitted).")
+        return None
+    meta = np.load(chain_path, allow_pickle=True)
+    if str(meta.get('wind_normalization', 'missing')) != WIND_NORMALIZATION:
+        print(f"Error: {chain_path} was sampled under a different wind normalization "
+              f"(stamp: {meta.get('wind_normalization', 'missing')!s}, current: "
+              f"{WIND_NORMALIZATION}); its posterior cannot be re-evaluated with the "
+              f"current model. Refit instead.")
         return None
 
-    chain = None
-    saved = {'mode': spec.mode, 'likelihood': spec.likelihood,
-             'orbital_period_s': spec.orbital_period_s, 'frozen': dict(spec.frozen)}
-    if os.path.exists(chain_path):
-        meta = np.load(chain_path, allow_pickle=True)
-        if str(meta.get('wind_normalization', 'missing')) != WIND_NORMALIZATION:
-            print(f"Error: {chain_path} was sampled under a different wind normalization "
-                  f"(stamp: {meta.get('wind_normalization', 'missing')!s}, current: "
-                  f"{WIND_NORMALIZATION}); its posterior cannot be re-evaluated with the "
-                  f"current model. Refit instead.")
-            return None
-        chain = meta['chain']
-        saved['mode'] = str(meta.get('mode', saved['mode']))
-        saved['likelihood'] = str(meta.get('likelihood', saved['likelihood']))
-        saved['orbital_period_s'] = float(meta.get('orbital_period_s', saved['orbital_period_s']))
-        fn, fv = list(meta.get('frozen_names', [])), list(meta.get('frozen_values', []))
-        if len(fn) == len(fv):
-            saved['frozen'] = {str(k): float(v) for k, v in zip(fn, fv)}
-        # Cheapest detector of a replot that bins the data differently from the
-        # fit, which would report a chi2/dof for data the posterior never saw.
-        n_obs_saved = float(meta.get('n_obs', np.nan))
-        if np.isfinite(n_obs_saved) and int(n_obs_saved) != len(data.flux):
-            warnings.warn(
-                f"Replot is using {len(data.flux)} observed points but the saved fit used "
-                f"{int(n_obs_saved)}. The reported chi2/dof will not match the original run; "
-                f"check the data/binning flags or rerun --replot where a *{RUN_CONFIG_SUFFIX} "
-                f"file restores them.")
-        print(f"Loaded saved chain from: {chain_path}  shape {chain.shape} "
-              f"(mode={saved['mode']}, likelihood={saved['likelihood']})")
+    chain = np.asarray(meta['chain'], dtype=float)
+    log_prob_chain = np.asarray(meta['log_prob'], dtype=float)
+    loaded_names = [str(n) for n in meta['param_names']]
+    saved = {'mode': str(meta['mode']), 'likelihood': str(meta['likelihood']),
+             'orbital_period_s': float(meta['orbital_period_s'])}
+    fn, fv = list(meta['frozen_names']), list(meta['frozen_values'])
+    saved['frozen'] = {str(k): float(v) for k, v in zip(fn, fv)}
+    # Cheapest detector of a replot that bins the data differently from the
+    # fit, which would report a chi2/dof for data the posterior never saw.
+    n_obs_saved = float(meta.get('n_obs', np.nan))
+    if np.isfinite(n_obs_saved) and int(n_obs_saved) != len(data.flux):
+        warnings.warn(
+            f"Replot is using {len(data.flux)} observed points but the saved fit used "
+            f"{int(n_obs_saved)}. The reported chi2/dof will not match the original run; "
+            f"check the data/binning flags or rerun --replot where a *{RUN_CONFIG_SUFFIX} "
+            f"file restores them.")
+    print(f"Loaded saved chain from: {chain_path}  shape {chain.shape} "
+          f"(mode={saved['mode']}, likelihood={saved['likelihood']})")
 
-    print(f"Loading existing samples from: {samples_path}")
-    samples_df = pd.read_csv(samples_path)
-    loaded_names = [c for c in samples_df.columns if c != 'log_prob']
     shape_names = WIND_SHAPE_FIT[spec.wind_model]
     spec = build_param_spec(
         likelihood=saved['likelihood'], mode=saved['mode'], wind_model=spec.wind_model,
@@ -1529,25 +1546,21 @@ def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
         fit_scatter='f_scatter' in loaded_names, fit_fopacity='log_fopa' in loaded_names,
         frozen=saved['frozen'], orbital_period_s=saved['orbital_period_s'])
     missing = [n for n in spec.active_names if n not in loaded_names]
-    if missing:
-        hint = ""
-        for mode in MODES:
-            if mode != spec.mode and all(n in loaded_names for n in geometry_names(mode)):
-                hint = f" The columns look like '{mode}' mode ({MODES[mode]['flag'] or 'no mode flag'})."
-        print(f"Error: samples file lacks column(s) {missing} expected by '{spec.mode}' mode. "
-              f"Columns present: {loaded_names}.{hint}")
+    if set(loaded_names) & set(saved['frozen']):
+        print(f"Error: chain columns {loaded_names} include frozen parameters "
+              f"{sorted(set(loaded_names) & set(saved['frozen']))}; the chain file is inconsistent.")
         return None
-    # Use the saved column order as the active order.
-    spec.active_names = list(loaded_names)
-    samples = samples_df[loaded_names].to_numpy(dtype=float)
-    log_prob_flat = (samples_df['log_prob'].to_numpy(dtype=float)
-                     if 'log_prob' in samples_df.columns else None)
-    print(f"  Loaded {len(samples)} samples; columns: {loaded_names}")
+    if missing or chain.shape[2] != len(loaded_names):
+        print(f"Error: chain columns {loaded_names} do not match the '{spec.mode}' mode "
+              f"parameters {spec.active_names} (missing {missing}).")
+        return None
+    spec.active_names = list(loaded_names)     # the saved chain order is the active order
+    samples = chain.reshape(-1, chain.shape[2])
+    log_prob_flat = log_prob_chain.reshape(-1)
+    print(f"  {len(samples)} post-burn samples; columns: {loaded_names}")
 
     stats = compute_statistics(samples, spec, log_prob=log_prob_flat)
     print_results(stats, spec, band)
-    if chain is not None and chain.shape[2] != spec.n_dim:
-        chain = None  # column mismatch: skip ArviZ rather than mislabel
     return postprocess_fit(args, spec, priors_for(spec), model, data, samples, stats, band,
                            chain, log_prob_flat, smoothed, sampler=None), spec
 
@@ -1648,6 +1661,14 @@ def _parse_prior_overrides(parser, args, names, kind: str = "") -> Dict[str, Dic
                 raise ValueError("expected 4 values")
         except Exception as e:
             parser.error(f"Invalid format for --prior-{name}: {e}")
+        mean, std, lo, hi = parts
+        if std <= 0 or not np.isfinite(std):
+            parser.error(f"--prior-{name}: STD must be > 0 (got {std}).")
+        if not lo < hi:
+            parser.error(f"--prior-{name}: MIN must be < MAX (got {lo}, {hi}).")
+        if not lo < mean < hi:
+            parser.error(f"--prior-{name}: MEAN {mean} lies outside the box ({lo}, {hi}); every "
+                         f"walker would start at the box edge.")
         out[name] = dict(zip(('mean', 'std', 'min', 'max'), parts))
         print(f"Custom prior for {kind}{name}: mean={parts[0]}, std={parts[1]}, "
               f"min={parts[2]}, max={parts[3]}")
@@ -1750,9 +1771,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-walkers", type=int, default=32, help="Number of walkers")
     parser.add_argument("--n-steps", type=int, default=5000, help="Number of steps")
     parser.add_argument("--n-burn", type=int, default=1000, help="Burn-in steps to discard")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Seed for the walker initialisation, the sampler moves and every "
-                             "random subset, so a run can be reproduced exactly")
     parser.add_argument("--no-fit-phase-shift", action="store_true",
                         help="Disable the per-sample phase-shift alignment and hold the shift at 0 "
                              "(by default every likelihood call minimises chi2 over a phase shift).")
@@ -1762,38 +1780,48 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase-shift-grid-size", type=int, default=None,
                         help="Coarse trial shifts per likelihood call before the dense refinement. "
                              "Default: max(number of data points, model phases), at most 400.")
-    parser.add_argument("--n-threads", type=int, default=1,
-                        help="Worker processes for parallel likelihood evaluation (1 = serial)")
-    parser.add_argument("--numba-threads-per-worker", type=int, default=None, metavar="N",
-                        help="Numba threads inside each worker when --n-threads > 1 "
-                             "(default: cpu_count // n_threads)")
-    parser.add_argument("--compute-bic", action="store_true",
-                        help="Report the Bayesian information criterion at the MAP sample")
     parser.add_argument("--dth", type=float, default=2.0,
                         help="Model phase resolution in degrees (360/dth phases, half of them by "
                              "reflection; larger = faster, coarser eclipse edges)")
 
-    # Output
-    parser.add_argument("--output-dir", type=str, default="mcmc_results", help="Output directory")
-    parser.add_argument("--no-geometry-plots", action="store_true",
+    # Everything in these two groups controls one invocation, not the fit, and is
+    # therefore never restored by --replot (see NEVER_RESTORED_DESTS).
+    execution = parser.add_argument_group(
+        'Execution', 'How this invocation runs; not part of the fit definition.')
+    execution.add_argument("--n-threads", type=int, default=1,
+                           help="Worker processes for parallel likelihood evaluation (1 = serial)")
+    execution.add_argument("--numba-threads-per-worker", type=int, default=None, metavar="N",
+                           help="Numba threads inside each worker when --n-threads > 1 "
+                                "(default: cpu_count // n_threads)")
+    execution.add_argument("--seed", type=int, default=None,
+                           help="Seed for the walker initialisation, the sampler moves and every "
+                                "random subset, so a run can be reproduced exactly")
+    execution.add_argument("--quiet", action="store_true", help="Suppress the progress bar")
+    execution.add_argument("--replot", action="store_true",
+                           help="Regenerate outputs from the saved chain without re-sampling. Every "
+                                "option not typed is restored from the run's <band>_<wind>_run_config.json.")
+
+    output = parser.add_argument_group('Output', 'What this invocation writes.')
+    output.add_argument("--output-dir", type=str, default="mcmc_results", help="Output directory")
+    output.add_argument("--no-geometry-plots", action="store_true",
                         help="Skip the projected-orbit, geometry-vs-phase and wind-profile figures")
-    parser.add_argument("--no-plots", action="store_true", help="Skip all figures")
-    parser.add_argument("--smooth", action="store_true",
-                        help="Overlay a Gaussian-smoothed observed curve with an MC band")
-    parser.add_argument("--smooth-sigma", type=float, default=0.01, help="Smoothing kernel width in phase")
-    parser.add_argument("--quiet", action="store_true", help="Suppress the progress bar")
-    parser.add_argument("--compact-output", action="store_true", help="Also save samples as NPZ")
-    parser.add_argument("--no-csv-output", action="store_true", help="Skip the *_samples.csv table")
-    parser.add_argument("--csv-chunk-size", type=int, default=50000, help="Rows per chunk when writing CSV")
-    parser.add_argument("--replot", action="store_true",
-                        help="Regenerate outputs from saved results without re-sampling. Every "
-                             "option not typed is restored from the run's <band>_<wind>_run_config.json.")
-    parser.add_argument("--save-chi2", action="store_true",
+    output.add_argument("--no-plots", action="store_true", help="Skip all figures")
+    output.add_argument("--smooth", action="store_true",
+                        help="Overlay a Gaussian-smoothed observed curve with its 1-sigma band")
+    output.add_argument("--smooth-sigma", type=float, default=0.01, help="Smoothing kernel width in phase")
+    output.add_argument("--compute-bic", action="store_true",
+                        help="Report the Bayesian information criterion at the MAP sample")
+    output.add_argument("--no-csv-output", action="store_true",
+                        help="Skip the *_samples.csv export (the chain NPZ is always written)")
+    output.add_argument("--csv-chunk-size", type=int, default=50000, help="Rows per chunk when writing CSV")
+    output.add_argument("--save-chi2", action="store_true",
                         help="Write per-sample chi2 to {band}_{wind_model}_chi2.csv.gz")
-    parser.add_argument("--chi2-n-samples", type=int, default=None,
+    output.add_argument("--chi2-n-samples", type=int, default=None,
                         help="Random subset size for --save-chi2. Default: every sample with "
                              "--likelihood chi2 (read from the chain, no model calls), "
                              f"{CHI2_TABLE_DEFAULT_SAMPLES} with jitter (one model call each).")
+    parser.set_defaults(_never_restore=frozenset(
+        a.dest for group in (execution, output) for a in group._group_actions))
 
     sim = parser.add_argument_group('Simulation Parameters', 'Passed to simulate_lightcurve')
     sim.add_argument("--gma0", type=float, default=SIM_DEFAULTS['gma0'], help="Starting phase angle in degrees")
@@ -1823,6 +1851,11 @@ def build_parser() -> argparse.ArgumentParser:
             help=f"Prior for {desc}. Default: {prior['mean']},{prior['std']},{prior['min']},{prior['max']}",
             **({'dest': dest} if dest else {}))
 
+    prior_group.add_argument(
+        "--prior-fopa", type=str, default=None, metavar="MEAN,STD,MIN,MAX", dest="prior_log_fopa",
+        help=f"Prior for log10 f_opacity (--fit-fopacity). Default: {FOPACITY_PRIOR['mean']},"
+             f"{FOPACITY_PRIOR['std']},{FOPACITY_PRIOR['min']},{FOPACITY_PRIOR['max']}")
+
     shape_group = parser.add_argument_group(
         'Wind-Shape Prior Customization', 'Only active with --fit-wind-shape (format: mean,std,min,max).')
     for sname in ALL_WIND_SHAPE_NAMES:
@@ -1833,6 +1866,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Dests of the Execution and Output groups plus the two that define a replot
+# itself; apply_saved_run_config never restores them.
+NEVER_RESTORED_DESTS = frozenset(build_parser().get_default('_never_restore')) | {'replot', 'output_dir'}
+
+
 def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Optional[Dict[str, float]]]:
     """Load, filter and bin the observations for *band*; also the smoothed curve
     and the data-driven f_scatter prior when requested."""
@@ -1840,18 +1878,19 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
                                        error_column=args.obs_error_column,
                                        time_column=args.time_column,
                                        drop_nonpositive_flux=not args.keep_zero_flux)
-    lo, hi = args.phase_window
-    if not is_full_phase_window(lo, hi):
-        n_all = len(obs_df)
-        obs_df = obs_df[in_phase_window(obs_df['phase'].to_numpy(dtype=float), lo, hi)].reset_index(drop=True)
-        print(f"Phase window [{lo:g}, {hi:g}): kept {len(obs_df)} of {n_all} points")
-        if obs_df.empty:
-            raise ValueError(f"No observed points fall inside the phase window [{lo}, {hi}).")
+    obs_df = apply_phase_window(obs_df, *args.phase_window)
+    if 'flux_err' in obs_df.columns and not np.isfinite(obs_df['flux_err']).any():
+        if args.no_phase_bin:
+            raise ValueError("The light curves carry no measurement errors and --no-phase-bin "
+                             "needs them; bin the data or add an error column.")
+        warnings.warn("The light curves carry no measurement errors; the binned errors come "
+                      "from the scatter within each bin (std / sqrt(n)).")
     is_binned = not args.no_phase_bin
     if is_binned:
         cols = dict(rate_column='flux', error_column='flux_err')
         if args.counts_per_bin is not None:
-            obs_df = phase_bin_data_snr(obs_df, counts_per_bin=args.counts_per_bin, **cols)
+            obs_df = phase_bin_data_snr(obs_df, counts_per_bin=args.counts_per_bin,
+                                        phase_origin=args.phase_window[0], **cols)
         else:
             obs_df = phase_bin_data(obs_df, n_bins=(args.n_phase_bins or 50), **cols)
 
@@ -1862,7 +1901,7 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
     err = sanitize_errors(obs_df['flux_err'], context="binned light curve: ")
     width = obs_df['width'].to_numpy(dtype=float) if ('width' in obs_df.columns and is_binned) else None
 
-    fit_shift = not args.no_fit_phase_shift and args.phase_shift is None
+    fit_shift = shift_is_searched(args)
     data = FitData.build(phase, flux, err, fit_phase_shift=fit_shift,
                          shift_grid_size=args.phase_shift_grid_size,
                          n_model=int(round(360.0 / float(args.dth))),
@@ -1871,7 +1910,9 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
 
     smoothed = None
     if args.smooth:
+        grid = np.linspace(0.0, 1.0, 300, endpoint=False)
         smoothed = smooth_lightcurve(phase, flux, err, sigma=float(args.smooth_sigma),
+                                     eval_phase=grid[in_phase_window(grid, *args.phase_window)],
                                      verbose=not args.quiet)
 
     scatter_prior = None
@@ -1887,14 +1928,9 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
     return data, smoothed, scatter_prior
 
 
-def _flag_names(parser: argparse.ArgumentParser) -> Dict[str, str]:
-    """dest -> the long option the user would type."""
-    out: Dict[str, str] = {}
-    for action in parser._actions:
-        longs = [o for o in action.option_strings if o.startswith("--")]
-        if longs:
-            out[action.dest] = longs[0]
-    return out
+def shift_is_searched(args) -> bool:
+    """True when the per-sample phase-shift search is on (no fixed shift given)."""
+    return not args.no_fit_phase_shift and args.phase_shift is None
 
 
 def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen: Dict[str, float],
@@ -1906,55 +1942,34 @@ def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen
     values restored by --replot never trip these checks.
     """
     err = parser.error
-    flag = _flag_names(parser)
+    flag = dest_to_flag(parser)
     mode = spec.mode
 
-    # --- data and binning ------------------------------------------------------
-    if args.no_phase_bin and (args.n_phase_bins is not None or args.counts_per_bin is not None):
-        err("--no-phase-bin excludes --n-phase-bins and --counts-per-bin.")
-    if args.n_phase_bins is not None and args.counts_per_bin is not None:
-        err("Specify either --n-phase-bins or --counts-per-bin, not both.")
-    if args.n_phase_bins is not None and args.n_phase_bins <= 0:
-        err("--n-phase-bins must be > 0.")
-    if args.counts_per_bin is not None and args.counts_per_bin <= 0:
-        err("--counts-per-bin must be > 0.")
-    try:
-        lo, hi = check_phase_window(*args.phase_window)
-    except ValueError as e:
-        err(f"--phase-window: {e}")
-    partial = not is_full_phase_window(lo, hi)
-
-    # --- phase shift -----------------------------------------------------------
-    fit_shift = not args.no_fit_phase_shift and args.phase_shift is None
-    if partial and fit_shift:
-        err("A partial --phase-window needs a fixed phase shift. The model is symmetric about "
-            "mid-eclipse, so with only one eclipse edge in the data the eclipse width is "
-            "degenerate with a free shift: pass --phase-shift SHIFT (the shift of a full-orbit "
-            "fit) or --no-fit-phase-shift to hold it at 0.")
+    # --- data, binning, phase window (rules shared with chandra_phase_analysis) ---
+    validate_binning_args(err, args)
+    fit_shift = shift_is_searched(args)
+    validate_phase_window_args(
+        err, args, fit_shift_enabled=fit_shift,
+        fixed_shift_hint="pass --phase-shift SHIFT (the shift of a full-orbit fit) or "
+                         "--no-fit-phase-shift to hold it at 0.",
+        scatter_window_used=args.fit_scatter)
+    if args.no_fit_phase_shift and args.phase_shift is not None:
+        err("--no-fit-phase-shift holds the shift at 0 and --phase-shift holds it at SHIFT; use one.")
     if not fit_shift and 'phase_shift_grid_size' in explicit:
         err("--phase-shift-grid-size has no effect when the phase shift is held fixed.")
     if args.phase_shift_grid_size is not None and args.phase_shift_grid_size < 3:
         err("--phase-shift-grid-size must be >= 3.")
 
     # --- scattered flux --------------------------------------------------------
-    s_lo, s_hi = map(float, args.scatter_eclipse_phase)
-    if not (0.0 <= s_lo <= s_hi <= 1.0):
-        err("--scatter-eclipse-phase must satisfy 0 <= PHASE_MIN <= PHASE_MAX <= 1.")
     if 'scatter_eclipse_phase' in explicit and not args.fit_scatter:
         err("--scatter-eclipse-phase only centres the f_scatter prior; add --fit-scatter.")
-    if args.fit_scatter and partial:
-        probe = np.linspace(s_lo, s_hi, 201)
-        if not np.any(in_phase_window(probe, lo, hi)):
-            err(f"--scatter-eclipse-phase {s_lo:g} {s_hi:g} lies outside --phase-window "
-                f"{lo:g} {hi:g}, so the f_scatter prior cannot be centred on the data.")
     if args.fit_scatter and 'f_scatter' in frozen:
         err("--fit-scatter and --freeze f_scatter contradict each other.")
     if args.fit_fopacity and 'log_fopa' in frozen:
         err("--fit-fopacity and --freeze log_fopa contradict each other.")
 
     # --- sampling --------------------------------------------------------------
-    sampling = {'n_walkers', 'n_steps', 'n_burn', 'sampler', 'n_threads',
-                'numba_threads_per_worker', 'seed'}
+    sampling = {'n_walkers', 'n_steps', 'n_burn', 'sampler', 'n_threads', 'numba_threads_per_worker'}
     if args.replot:
         typed = sorted(flag[d] for d in sampling & explicit)
         if typed:
@@ -1974,10 +1989,13 @@ def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen
         if args.numba_threads_per_worker is not None:
             if args.n_threads <= 1:
                 err("--numba-threads-per-worker only applies to pooled runs (--n-threads > 1).")
-            if args.numba_threads_per_worker < 1:
-                err("--numba-threads-per-worker must be >= 1.")
-        if args.seed is not None and not (0 <= args.seed < 2 ** 32):
-            err("--seed must be in [0, 2^32).")
+            import numba
+            if not 1 <= args.numba_threads_per_worker <= numba.config.NUMBA_NUM_THREADS:
+                err(f"--numba-threads-per-worker must be in [1, {numba.config.NUMBA_NUM_THREADS}] "
+                    f"(numba's thread limit on this machine).")
+
+    if args.seed is not None and not (0 <= args.seed < 2 ** 32):
+        err("--seed must be in [0, 2^32).")
 
     # --- model -----------------------------------------------------------------
     for name in ('dth', 'd2h'):
@@ -2013,6 +2031,8 @@ def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen
                 err(f"{flag[dest]} has no effect without --fit-wind-shape.")
 
     # --- output ----------------------------------------------------------------
+    if 'prior_log_fopa' in explicit and not (args.fit_fopacity or 'log_fopa' in frozen):
+        err("--prior-fopa has no effect without --fit-fopacity.")
     if 'chi2_n_samples' in explicit and not args.save_chi2:
         err("--chi2-n-samples has no effect without --save-chi2.")
     if args.chi2_n_samples is not None and args.chi2_n_samples <= 0:
@@ -2035,7 +2055,8 @@ def main():
     # Restore everything not typed explicitly before validating or deriving.
     restored_config = None
     if args.replot:
-        restored_config = apply_saved_run_config(parser, args)
+        restored_config = apply_saved_run_config(parser, args, explicit=explicit,
+                                                 never_restore=NEVER_RESTORED_DESTS)
         if restored_config is None:
             print(f"\nNo saved run config found in {args.output_dir} (looked for *{RUN_CONFIG_SUFFIX}). "
                   f"Using the command line and argparse defaults.")
@@ -2053,6 +2074,7 @@ def main():
     except Exception as e:
         parser.error(str(e))
     validate_args(parser, args, spec, frozen, explicit)
+    args._prior_typed = any(d.startswith('prior_') for d in explicit)
     if args.seed is not None:
         # Covers initial_positions, zeus, the chi2 subsample and the wind-profile
         # draws; run_mcmc hands the same state to emcee.
@@ -2061,6 +2083,7 @@ def main():
     geometry_priors = default_geometry_priors(mode)
     geometry_priors.update(_parse_prior_overrides(parser, args, geometry_names(mode)))
     shape_prior_overrides = _parse_prior_overrides(parser, args, ALL_WIND_SHAPE_NAMES, kind="shape param ")
+    shape_prior_overrides.update(_parse_prior_overrides(parser, args, ('log_fopa',)))
     for fname, fval in frozen.items():
         fp = geometry_priors.get(fname) or ({**WIND_SHAPE_PRIORS[fname], **shape_prior_overrides.get(fname, {})}
                                             if fname in WIND_SHAPE_PRIORS else None)
@@ -2079,7 +2102,13 @@ def main():
                                       wind_model=args.wind_model, dth=args.dth, sim_params=sim_params)
 
         def priors_for(s: ParamSpec) -> Dict[str, Dict[str, float]]:
-            return get_active_priors(s, geometry_priors, shape_prior_overrides, scatter_prior)
+            # A replot rebuilds the spec from the chain; if its mode differs from
+            # the command line's, the command-line geometry priors do not apply.
+            gp = geometry_priors if s.mode == mode else default_geometry_priors(s.mode)
+            if s.mode != mode:
+                warnings.warn(f"The saved chain uses the '{s.mode}' parameterization, not "
+                              f"'{mode}'; default geometry priors of '{s.mode}' are used.")
+            return get_active_priors(s, gp, shape_prior_overrides, scatter_prior)
 
         if args.replot:
             result = replot_from_existing(band, args, spec, model, data, smoothed, priors_for)

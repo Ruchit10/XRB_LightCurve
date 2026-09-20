@@ -95,7 +95,8 @@ Neither analysis script imports the other. Everything they share lives in
   caller's names, so `flux`/`flux_err` needs no rename wrapper),
   `smooth_lightcurve`, `estimate_scattered_flux`, the single periodic model
   interpolator (`periodic_model`, `eval_periodic`, `prepare_model_interpolator`,
-  `interp_periodic_phases`), `obs_errors`, the tabulated-model χ² fit
+  `tabulated_model_arrays`), `sanitize_errors`, `obs_errors`, the shared row
+  filters (`drop_invalid_flux_rows`, `apply_phase_window`), the tabulated-model χ² fit
   `fit_simulation`, the periodic phase-shift search it shares with the MCMC
   likelihood (`PhaseShiftSearch`, `build_phase_shift_search`,
   `best_phase_shift`), `save_samples_csv_chunked`, and CLI run-config
@@ -220,7 +221,10 @@ is missing. There is no trapezoid fallback: the kernel is also the only path
 that returns per-cell columns, and converting the *mean* column instead badly
 understates eclipse-core leakage.
 
-**Per-cell flux conversion is compiled too.** `_cell_flux_loglog` (linear
+**Per-cell flux conversion is compiled too.** (The `refit` exponential is an
+orientation-level approximation only: fitted with equal weights in log space
+over a table spanning many decades, it misses the low-`nH` plateau by ~2× for
+the broad band; `interpolate` is the quantitative path.) `_cell_flux_loglog` (linear
 interpolation in log–log space with end-segment extrapolation, the column
 clipped to `[1e-6, 1e6] × 1e22`) and `_cell_flux_exp` (`A·e^{-B·N}`) each take
 the kernel's per-cell columns and areas and return the area-averaged flux per
@@ -401,8 +405,12 @@ of `*.txt`.
 ### Binning
 
 Two mutually exclusive binners, both reducing each bin with the shared
-`weighted_mean(values, errors)` (inverse-variance mean, `error = √(1/Σw)`,
-invalid errors patched with the median valid error):
+`weighted_mean(values, errors)` (inverse-variance mean, `error = √(1/Σw)`).
+The binners receive errors that `sanitize_errors` has already repaired (both
+loaders run it before binning) and raise on an invalid one; without any error
+column they fall back to the mean and `std/√n` of each bin, which both fitters
+report with a warning (the χ² is then computed against scatter-derived errors,
+which only `--no-phase-bin` refuses outright):
 
 - **`phase_bin_data(df, n_bins=50, min_points_per_bin=3, …)`** — fixed-width
   phase bins; bins below `min_points_per_bin` are dropped. Variable counts per
@@ -465,8 +473,9 @@ Shared by both the single-model and MCMC plot paths:
   in `[0, 1)` is bracketed; `eval_periodic` accepts an array-valued `shift` so
   batched trial-shift scans use the identical expression.
   `prepare_model_interpolator(sim_df, column)` is the CSV front end (accepts a
-  `phase` or `deg` column) and `interp_periodic_phases(obs_phases, phase, flux)`
-  the array-in/array-out convenience. `fit_simulation`'s χ², the `plot_phase`
+  `phase` or `deg` column) and `tabulated_model_arrays` evaluates the overlay
+  curve and the model at the observed phases once for both the plot and the
+  model dump. `fit_simulation`'s χ², the `plot_phase`
   overlay, the residual panel, `write_model_lightcurve` and the MCMC likelihood
   all route through it, so they cannot silently disagree. (Before Phase 34 the
   MCMC and the tabulated path had separate interpolators whose wrap ranges
@@ -603,7 +612,7 @@ dimensions:
 | `confinement`  | `fconf, ell` | —             | `R_star = R` |
 | `beta_law`     | `beta, H`    | —             | `R_star = R` |
 
-Registries: `WIND_MODELS`, `WIND_SHAPE_FIT`, `WIND_SHAPE_FIXED`,
+Registries: `WIND_MODELS`, `WIND_SHAPE_FIT`,
 `WIND_SHAPE_PRIORS`, `ALL_WIND_SHAPE_NAMES`; plot labels for every parameter
 live in `PARAM_LABELS`. Priors are overridable via
 `--prior-Rb/-p/-fconf/-ell/-beta/-H` using `mean,std,min,max`.
@@ -611,7 +620,7 @@ live in `PARAM_LABELS`. Priors are overridable via
 dimensions; `--freeze H=1.0` recovers a one-parameter beta-law fit.
 
 `--fit-fopacity` additionally promotes `log10 f_opacity` to a free dimension
-(prior `FOPACITY_PRIOR`, centred at `-1.5`).
+(prior `FOPACITY_PRIOR`, centred at `-1.5`; override with `--prior-fopa`).
 
 ### Likelihoods
 
@@ -700,13 +709,17 @@ window. Both options are fit-defining and are restored by `--replot`.
 - Walkers initialized at `prior['mean'] ± 0.1·prior['std']`, clipped just inside
   each box; `r ≥ R` walkers are repaired when both are free. The initial
   ensemble is evaluated before sampling: the run aborts if every walker is at
-  `-inf` (and warns if some are), and emcee starts from the evaluated `State`.
+  `-inf`; walkers at `-inf` (outside `r < R`, `Rb ≥ R` or a box) are redrawn
+  up to 20 times, because zeus refuses to start from any `-inf` walker where
+  emcee would merely reject moves from it; emcee starts from the evaluated
+  `State`.
   `main()` rejects `--n-burn ≥ --n-steps`, which used to fail only after the
   full run with an empty chain.
 - `--seed N` makes a run reproducible: `np.random.seed` covers the initial
   ball, zeus, the `--save-chi2` subsample and the wind-profile draws, and emcee
   is handed the same global state (`sampler.random_state`). The seed is
-  recorded in the run metadata and the summary.
+  recorded in the run metadata and the summary; it is also accepted on
+  `--replot`, whose chi2 subsample and wind-profile draws are random too.
 - `main()` exits with status 1 on any failure (2 for argument errors), so shell
   chains and batch jobs can tell a failed fit from a finished one.
 - `--n-threads N > 1` opens a `spawn` multiprocessing pool. The fit context
@@ -734,8 +747,13 @@ keeps the `flux ≤ 0` rows instead: 15 % of the in-eclipse CIAO bins are
 genuine zero-count 100 s bins, and dropping them raises the eclipse-window
 mean — the `f_scatter` prior centre — by 18 %. Kept rows have zero errors,
 which `sanitize_errors` replaces by the median valid error.
-`chandra_phase_analysis.py` has the same flag for its zero-rate filter. It then bins, builds the `FitData`, and computes the smoothed
-curve and the data-driven `f_scatter` prior when requested.
+Both fitters apply the same rule through `drop_invalid_flux_rows`
+(non-finite rows always go; `≤ 0` rows unless `--keep-zero-flux`). The loader
+then applies the `--phase-window`, bins (constant-counts bins are formed along
+the phase measured from the window's lower bound, so a wrapping window never
+merges the points on either side of its seam), builds the `FitData`, and
+computes the smoothed curve (inside the window only) and the data-driven
+`f_scatter` prior when requested.
 
 Binning mode is chosen by argument presence, not a mode flag:
 
@@ -747,8 +765,9 @@ Binning mode is chosen by argument presence, not a mode flag:
 | neither | 50 fixed-width bins (backward-compatible default) |
 
 Supplying both `--n-phase-bins` and `--counts-per-bin` is an error. Errors are
-repaired once, by `sanitize_errors` (median valid error, with a warning); data
-without any valid error is rejected, since the likelihood needs σ.
+repaired once, by `sanitize_errors` (median valid error, with a warning),
+before binning; unbinned data without any valid error is rejected, and binned
+data without an error column proceed on `std/√n` bin errors with a warning.
 
 ### Argument validation
 
@@ -796,10 +815,12 @@ values restored by `--replot`. The rules, all `parser.error` (exit 2):
   effective independent samples, convergence flag (`n_steps > 50·max τ`).
 - `run_arviz_diagnostics` — ArviZ summary (`r_hat`, `ess_*`, `mcse_*`, HDI),
   written to `*_arviz_summary.csv`. Version-agnostic via `_build_inference_data`.
-- `compute_bic_metrics` — `BIC = k·ln n - 2 ln L̂`, with `k = len(active_names)`,
-  `n = len(obs_flux)` *after* binning/filtering, and `L̂` evaluated by calling
-  the run's actual likelihood at the max-log-prob sample (`theta_source =
-  map_log_prob`, or `median_fallback`). BIC is the model-comparison metric;
+- `compute_bic_metrics` — `BIC = k·ln n - 2 ln L̂`, with `k` the sampled
+  dimensions plus the profiled phase shift (the count `degrees_of_freedom`
+  uses), `n = len(obs_flux)` *after* binning/filtering, and `L̂` evaluated by
+  calling the run's actual likelihood at the same point estimate the overlays
+  use (`point_estimate_theta`: MAP, `theta_source = map_log_prob`; medians only
+  when no log-probabilities exist, `median_fallback`). BIC is the model-comparison metric;
   `ΔBIC` is reported relative to the best model in the run. Enable with
   `--compute-bic`.
 - `compute_chi2_for_samples` (`--save-chi2`) — per-sample χ² and reduced χ²,
@@ -861,13 +882,15 @@ All three live in `utils/plot_utils.py`.
   model.
 
 `--replot` regenerates everything from saved results without re-running MCMC:
-`replot_from_existing` reads `*_chain.npz` for run metadata (`mode`,
-`frozen_names`/`frozen_values`, `orbital_period_s`, `likelihood`) and
-`*_samples.csv` for the posterior, rebuilds the `ParamSpec` with the saved
-column order as its active set (shape parameters, `f_scatter` and `log_fopa`
-are detected from the column names), then runs the same `postprocess_fit` as a
-fresh fit. Result directories written before Phase 34 carry no
-`wind_normalization` stamp and are refused (see below).
+`replot_from_existing` reads **`*_chain.npz`**, the one file every fit writes
+right after sampling, for the post-burn chain and log-probabilities, the
+sampled parameter names in chain order, the metadata that rebuilds the
+`ParamSpec` (`mode`, `frozen_names`/`frozen_values`, `orbital_period_s`,
+`likelihood`) and the `wind_normalization` stamp, then runs the same
+`postprocess_fit` as a fresh fit. The `*_samples.csv` export is not needed, so
+a fit run with `--no-csv-output` replots too, and a directory holding only a
+samples CSV (an unstamped legacy result) is refused. Result directories written
+before Phase 34 carry no stamp and are refused (see below).
 
 **Every option not given explicitly is restored from `*_run_config.json`**, so
 `python mcmc_lightcurve_fit.py --replot` on its own reproduces the original
@@ -876,21 +899,26 @@ binning, `--dth`/`--d2h`, the wind normalization, priors and model flags. This m
 those options change the *observed arrays*: replotting with different binning
 silently reports a χ²/dof for a dataset the posterior never saw. Explicit flags
 always win over the saved values, so a single option can be overridden in place
-(`--replot --smooth-sigma 0.02`). As a backstop, `replot_from_existing` compares
+(`--replot --smooth --smooth-sigma 0.02`; output options such as `--smooth` are
+never restored, so they are typed along with their sub-options). As a
+backstop, `replot_from_existing` compares
 the observed point count against `n_obs` in the chain metadata and warns on a
 mismatch. `--band` and `--flux-csv` are therefore only required when *not*
 replotting.
 
 Three rules keep the restore honest (`utils.apply_saved_run_config`):
 
-- **Output-control options are never restored** (`_RUN_CONFIG_NEVER_RESTORE`:
-  `no_plots`, `no_geometry_plots`, `quiet`, `smooth`, `smooth_sigma`,
-  `save_chi2`, `chi2_n_samples`, `compute_bic`, `compact_output`,
-  `no_csv_output`, `csv_chunk_size`, `n_threads`, `numba_threads_per_worker`,
-  `seed`, plus `replot` and `output_dir`). `store_true` flags cannot be negated
-  on the command line, so restoring them made a fit run with `--no-plots`
-  impossible to replot with figures. Only options that define the fit — data,
-  binning, model, priors, sampler settings — come back.
+- **Invocation-only options are never restored.** `build_parser` puts them in
+  the *Execution* group (`--n-threads`, `--numba-threads-per-worker`, `--seed`,
+  `--quiet`, `--replot`) and the *Output* group (`--output-dir`,
+  `--no-plots`, `--no-geometry-plots`, `--smooth`, `--smooth-sigma`,
+  `--compute-bic`, `--no-csv-output`, `--csv-chunk-size`, `--save-chi2`,
+  `--chi2-n-samples`), and `NEVER_RESTORED_DESTS` is derived from those two
+  groups, so a new output option is classified where it is defined.
+  `store_true` flags cannot be negated on the command line, so restoring them
+  made a fit run with `--no-plots` impossible to replot with figures. Only
+  options that define the fit — data, binning, model, priors, sampler settings
+  — come back.
 - **Mutually exclusive siblings are not restored** when one member was typed:
   `--replot --n-phase-bins 30` on a `--counts-per-bin` run no longer trips the
   exclusivity check (the `n_obs` warning then says the binning differs), and
@@ -903,8 +931,9 @@ Three rules keep the restore honest (`utils.apply_saved_run_config`):
   χ²/dof, overlays and BIC for a model the posterior never saw (the old
   `mcmc_results/` fits did exactly that silently, with `N_H` 20–50 × 10²²
   instead of the chain's 0.53), so `--replot` exits with an error asking for a
-  refit. The self-healing run config for pre-config directories is written
-  only after a replot has succeeded.
+  refit. The self-healing run config for a directory that has a stamped chain
+  but no run config (a deleted or never-written config) is written only after
+  a replot has succeeded.
 
 ---
 
@@ -929,9 +958,17 @@ every printed "±" was 0); the ~200 lines of index-vs-component-name fallbacks
 that could not execute are gone; spectrum files are matched on their **file
 names** (matching the full path picked the background as the source whenever a
 directory was called `src`), with the background identified before the source;
-the background and the RMF/ARF that are found are attached explicitly and a
-failure to attach propagates; the energy grid and plot device are set once
-rather than per `nH` point; `np.trapz` → `np.trapezoid`; and the exponential
+the PHA header's own BACKFILE/RESPFILE/ANCRFILE pairing is kept and the
+background, RMF or ARF found in the directory are attached only where the
+header left a gap (assigning `spectrum.response` replaces the Response object
+and would silently drop the header's ARF; a spectrum without any response is
+an error and the files in use are printed); the model energy array is
+extended to 0.1–20 keV once and the band flux at each `nH` is XSPEC's own
+`AllModels.calcFlux` read back from the loaded spectrum (energy flux
+`flux[0]`, photon flux `flux[3]`), exact over the band, instead of a
+trapezoid over a plot grid (XSPEC clips a band to the model energy array, so
+bands outside 0.1–20 keV are rejected); PyXspec is imported after argument
+parsing so `--help` works without HEASoft; and the exponential
 law drawn on the figure is `utils.fit_exponential`, the function the
 simulator's `refit` method uses. HEASoft is not importable from plain `henv`,
 so the script's control flow was exercised end to end against a PyXspec
@@ -974,15 +1011,46 @@ CIAO layout needs none of this.
 
 ---
 
+## Synthetic data (`synthetic_data/`)
+
+Generators for injection–recovery tests; everything they write is read by the
+pipeline unchanged and the bands are `utils.utils.CHANDRA_BANDS`.
+
+- **`make_spectrum.py`** (PyXspec) fakes an absorbed power law through the IC 10
+  X-1 combined ACIS response with `AllData.fakeit` (`--nH`, `--PhoIndex`,
+  `--norm`, `--exposure`, optional real background, `--seed` via `Xset.seed`)
+  into `--out-dir`, which then serves as `--specdir` for
+  `compute_flux_vs_nH.py`. It also reports, per band, the model flux
+  (`AllModels.calcFlux`), the fake net count rate and their ratio, the
+  flux-per-count-rate factor written to `band_factors.json`.
+- **`make_lightcurve.py`** evaluates the forward model at known parameters
+  (every `xrb_lightcurve.py` keyword, same defaults), shifts it by
+  `--phase-shift` (mid-eclipse lands at data phase `0.5 + shift`), adds
+  `--scatter`, converts flux to expected counts per `--dt` bin with
+  `--flux-per-rate` (default `1.13e-11`, the real broad-band `flux_t/rate`),
+  adds `--bkg-rate`, Poisson-samples (`--noiseless` to skip) over `--visits`
+  (`start:duration,...` in seconds after `REF_EPOCH`) or one visit of
+  `--n-orbits`, removes random `--gap-fraction`/`--gap-duration` blocks, and
+  writes the CIAO layout `# Columns: dt, t_raw, mjd, phase, counts, rate,
+  rate_err, flux_t` (`rate_err = √(counts + bkg counts)/dt`, so an empty bin
+  carries a zero error like the real files) plus `<stem>_truth.json` with every
+  injected value, `mid_eclipse_data_phase`, the bin and zero-count counts.
+- The package README gives the spectrum → table → light curve → fit sequence.
+  On the 15803-like synthetic broad light curve the tabulated fit recovered the
+  injected shift to 0.0007 in phase. The exact degeneracies of the model apply
+  to synthetic data too (`q`, and the length scale with `f_opacity`), so
+  recovery is judged on `a`, `R`, `i0`, `f_opacity` jointly.
+
+---
+
 ## Outputs
 
 Per `(band, wind_model)` in `--output-dir`, prefixed `{band}_{wind_model}_`:
 
 | File | Contents |
 | ---- | -------- |
-| `*_samples.csv` | Flat post-burn-in samples + `log_prob` (chunked writer; skip with `--no-csv-output`). |
-| `*_samples.npz` | Same, compact binary (`--compact-output`). |
-| `*_chain.npz` | Full chain, log-prob, and run metadata (`mode`, frozen params, `likelihood`, `wind_model`, `n_obs`, …) for `--replot` / post-hoc BIC. |
+| `*_chain.npz` | Post-burn chain and log-prob plus the run metadata (`param_names`, `mode`, frozen params, `likelihood`, `wind_model`, `orbital_period_s`, `n_obs`, `wind_normalization`). The file `--replot` reads; always written, right after sampling. |
+| `*_samples.csv` | Flat post-burn-in samples + `log_prob`, a plain-text export (chunked writer; skip with `--no-csv-output`). |
 | `*_run_config.json` | The complete CLI configuration of the fit (`created`, `command`, every argparse value). Written before sampling starts, so it survives an interrupted run. `--replot` restores from it. |
 | `*_corner.png`, `*_trace.png`, `*_bestfit.png` | Diagnostic plots. |
 | `*_geometry_orbit.png`, `*_geometry_phase.png`, `*_wind_profile.png` | Binary-geometry figures at the point estimate (`--no-geometry-plots` to skip). |
@@ -1057,11 +1125,12 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
 #    come from the original fit:
 python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results/broad/smooth_pl/geom
 
-#    Override a single option in place (explicit flags beat the saved config):
-python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results --smooth-sigma 0.02
+#    Override a single option in place (explicit flags beat the saved config;
+#    output options are never restored, so type --smooth with its width):
+python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results --smooth --smooth-sigma 0.02
 
-#    For results predating run-config saving, pass the original options once;
-#    a config is then written automatically for next time.
+#    For a stamped result whose run config is missing, pass the original
+#    options once; a config is then written automatically for next time.
 python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
     --data-dir data/IC_10_X1_LC_CIAO --obs-column flux_t --time-column t_raw \
     --wind-model smooth_pl --counts-per-bin 100 \
@@ -1096,17 +1165,20 @@ longer imported there).
 | File | Lines | Role |
 | ---- | ----- | ---- |
 | [xrb_lightcurve.py](xrb_lightcurve.py) | ~1050 | Forward model: profiles, Numba LOS kernel (half the orbit by phase reflection) and per-cell flux conversion, `simulate_lightcurve` / `simulate_band_flux`, `SIM_DEFAULTS`, physical normalization. |
-| [mcmc_lightcurve_fit.py](mcmc_lightcurve_fit.py) | ~1950 | emcee/zeus MCMC: `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
-| [chandra_phase_analysis.py](chandra_phase_analysis.py) | ~450 | CLI front end for the single-model χ² fit; re-exports the shared `utils/` API. |
-| [utils/utils.py](utils/utils.py) | ~1500 | Shared layer: ephemeris, loading, `sanitize_errors`, both binners, smoothing, the periodic interpolator + phase-shift search, `fit_simulation`, model-dump blocks, run-config persistence. |
+| [mcmc_lightcurve_fit.py](mcmc_lightcurve_fit.py) | ~2140 | emcee/zeus MCMC: `ParamSpec`, `FitData`, prior/likelihood, phase-shift search, BIC, plots, replot, summary. |
+| [chandra_phase_analysis.py](chandra_phase_analysis.py) | ~510 | CLI front end for the single-model χ² fit; re-exports the shared `utils/` API. |
+| [utils/utils.py](utils/utils.py) | ~1670 | Shared layer: ephemeris, loading, `sanitize_errors`, both binners, smoothing, the periodic interpolator + phase-shift search, `fit_simulation`, model-dump blocks, run-config persistence. |
 | [utils/plot_utils.py](utils/plot_utils.py) | ~900 | All plotting, built on the single `plot_lightcurve_fit`. |
-| [compute_flux_vs_nH.py](compute_flux_vs_nH.py) | ~380 | XSPEC `flux vs nH` table generator (one band per table). |
+| [compute_flux_vs_nH.py](compute_flux_vs_nH.py) | ~360 | XSPEC `flux vs nH` table generator (one band per table). |
 | [plot_results.py](plot_results.py) | 104 | Thin CLI over `utils/plot_utils.py` for simulation CSVs (`--geometric`, `--orbit`). |
+| [synthetic_data/](synthetic_data/) | ~410 | `make_spectrum.py` (PyXspec `fakeit` + per-band flux-per-rate factors) and `make_lightcurve.py` (CIAO-layout light curves from the forward model with a truth record). |
 
 ### Utilities (`utils/`)
 `utils/` is a package (`__init__.py`). Two modules are library code imported by
 the analysis scripts — `utils.py` and `plot_utils.py` (see Core above).
-`test_flux_methods.py` is the regression test. The rest are standalone
+`test_flux_methods.py` is the regression test. `CHANDRA_BANDS` in `utils.py`
+is the single definition of the energy bands used by the flux-table generator,
+the synthetic-data scripts and the plot labels. The rest are standalone
 one-time data-prep scripts for the legacy `IC_10_X1_LC` layout, not part of
 the package API: `convert_fits_to_txt.py`, `add_flux_simple.py`,
 `get_average_count_rates.py` (`add_flux_to_lightcurves.py`, which failed on

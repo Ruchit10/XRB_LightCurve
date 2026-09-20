@@ -32,13 +32,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from utils.utils import (
-    MODEL_OVERLAY_N_POINTS,
     band_label_from_column,
     detect_energy_bands,
-    eval_periodic,
     get_band_display_name,
     obs_errors,
-    prepare_model_interpolator,
+    tabulated_model_arrays,
 )
 
 try:
@@ -290,7 +288,7 @@ def plot_lightcurve_fit(
             if np.any(np.isfinite(serr)):
                 ax.fill_between(
                     sphase, sflux - serr, sflux + serr,
-                    color='green', alpha=0.2, label='Smoothed 1$\\sigma$ (MC)', zorder=3,
+                    color='green', alpha=0.2, label='Smoothed 1$\\sigma$', zorder=3,
                 )
 
     # --- labels, title, legend ------------------------------------------------
@@ -346,7 +344,6 @@ def plot_phase(
     sim_column: str = "fl",
     chi2: float | None = None,
     ax: plt.Axes | None = None,
-    shift_fitted: bool = False,
     obs_column_name: str = "rate",
     is_binned: bool = False,
     smooth_df: Optional[pd.DataFrame] = None,
@@ -381,9 +378,6 @@ def plot_phase(
     ax : Axes, optional
         Matplotlib axes to plot on. If None, creates a new figure (with a
         residual panel when a model and errors are available).
-    shift_fitted : bool, default False
-        Whether the phase shift was optimized (True) or held at 0 (False);
-        recorded for callers, not used in the drawing.
     obs_column_name : str, default "rate"
         Name of the observable column being plotted (for the y-axis label).
     is_binned : bool, default False
@@ -402,13 +396,10 @@ def plot_phase(
 
     model_phase = model_flux = obs_model = None
     if has_model:
-        # Overlay and residuals both come from the same evaluator used by
-        # fit_simulation's χ², so the drawn curve, the residual panel and the
-        # displayed χ² are guaranteed to describe the same model.
-        model_ext = prepare_model_interpolator(sim_df, sim_column)
-        model_phase = np.linspace(0.0, 1.0, MODEL_OVERLAY_N_POINTS)
-        model_flux = eval_periodic(*model_ext, model_phase, shift, scatter)
-        obs_model = eval_periodic(*model_ext, obs_phase, shift, scatter)
+        # The same arrays write_model_lightcurve dumps, from the evaluator
+        # fit_simulation's χ² uses, so curve, residuals and χ² agree.
+        model_phase, model_flux, _, obs_model = tabulated_model_arrays(
+            df, sim_df, sim_column, shift, scatter)
 
     ylabel = (
         obs_column_name.replace("_", " ").title()
@@ -570,7 +561,12 @@ def plot_orbit_geometry(
                             zorder=2, label=f'Companion (R = {float(R):.2f} R$_\\odot$)'))
     ax.plot(L, h, '-', color='0.4', lw=1.2, zorder=3,
             label='Compact-object track (projected)')
-    behind = h > 0  # emitter behind the companion: only these can be occulted
+    # Emitter behind the companion: the kernel's own test is sin(gma) > 0, which
+    # stays meaningful exactly edge-on where h == 0 for every phase.
+    if "deg" in sim_df.columns:
+        behind = np.sin(np.deg2rad(sim_df["deg"].to_numpy(dtype=float))) > 0
+    else:
+        behind = h > 0
     ax.plot(L[behind], h[behind], '.', color='C0', ms=3, zorder=4,
             label='Behind companion')
     if np.any(eclipsed):
@@ -585,8 +581,9 @@ def plot_orbit_geometry(
         ax.plot(L[i_zero], h[i_zero], '*', color='k', ms=13, zorder=7,
                 label='Phase 0')
     l_proj = np.hypot(L, h)
-    i_min = int(np.argmin(np.where(h > 0, l_proj, np.inf)))
-    if np.isfinite(l_proj[i_min]):
+    masked = np.where(h > 0, l_proj, np.inf)
+    i_min = int(np.argmin(masked)) if np.any(behind) else None
+    if i_min is not None:
         ax.plot(L[i_min], h[i_min], 'v', color='crimson', ms=8, zorder=7,
                 label=f'Min projected sep. = {l_proj[i_min]:.2f} R$_\\odot$')
 
@@ -630,7 +627,10 @@ def plot_orbit_geometry(
     ax2.grid(alpha=0.25)
 
     # Eclipse condition, stated numerically so the figure is self-contained.
-    if np.isfinite(l_proj[i_min]):
+    if i_min is None:
+        fig.text(0.5, 0.005, 'the emitter is never behind the companion (no phase with h > 0)',
+                 ha='center', fontsize=9, color='0.25')
+    else:
         verdict = ('total eclipse' if l_proj[i_min] <= float(R) - float(r)
                    else 'partial eclipse' if l_proj[i_min] <= float(R) + float(r)
                    else 'no eclipse')

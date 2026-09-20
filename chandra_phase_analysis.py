@@ -93,24 +93,28 @@ import pandas as pd
 from utils.utils import (
     ORBITAL_PERIOD,
     REF_EPOCH,
+    apply_phase_window,
     band_label_from_column,
-    check_phase_window,
+    dest_to_flag,
     detect_flux_columns,
+    drop_invalid_flux_rows,
     estimate_scattered_flux,
     eval_periodic,
     explicit_cli_dests,
     fit_simulation,
     frac,
     in_phase_window,
-    interp_periodic_phases,
-    is_full_phase_window,
     load_data,
+    model_dump_path,
     obs_errors,
     phase_bin_data,
     phase_bin_data_snr,
     prepare_model_interpolator,
     read_observation,
+    sanitize_errors,
     smooth_lightcurve,
+    validate_binning_args,
+    validate_phase_window_args,
     write_model_lightcurve,
 )
 from utils.plot_utils import (
@@ -129,7 +133,6 @@ __all__ = [
     "eval_periodic",
     "fit_simulation",
     "frac",
-    "interp_periodic_phases",
     "load_data",
     "main",
     "obs_errors",
@@ -148,19 +151,6 @@ __all__ = [
 # Command-line interface
 # -----------------------------------------------------------------------------
 
-def _default_model_output(plot_output: str | None) -> str:
-    """Model-light-curve path derived from the plot path, for bare --write-model.
-
-    Mirrors ``mcmc_lightcurve_fit.plot_best_fit``, which writes its model dump as
-    ``<plot>_model.txt`` beside the figure, so the text file sits next to the
-    plot it describes under either entry point.
-    """
-    if not plot_output:
-        return "model_lightcurve.txt"
-    stem, _ = os.path.splitext(str(plot_output))
-    return f"{stem}_model.txt"
-
-
 def _validate_args(parser: argparse.ArgumentParser, args, explicit: set) -> None:
     """Reject argument combinations that contradict each other or have no effect.
 
@@ -168,16 +158,15 @@ def _validate_args(parser: argparse.ArgumentParser, args, explicit: set) -> None
     for options that were actually given.
     """
     err = parser.error
+    flag = dest_to_flag(parser)
 
     # --- fit-only options -------------------------------------------------------
     if args.fit and not args.sim_file:
         err("--fit requires --sim-file.")
-    fit_only = {'sim_file': '--sim-file', 'sim_column': '--sim-column',
-                'fit_phase_shift': '--fit-phase-shift', 'phase_shift': '--phase-shift',
-                'scatter': '--scatter', 'scatter_eclipse_phase': '--scatter-eclipse-phase',
-                'write_model': '--write-model'}
+    fit_only = ('sim_file', 'sim_column', 'fit_phase_shift', 'phase_shift', 'scatter',
+                'scatter_eclipse_phase', 'write_model')
     if not args.fit:
-        typed = [flag for dest, flag in fit_only.items() if dest in explicit]
+        typed = [flag[dest] for dest in fit_only if dest in explicit]
         if typed:
             err(f"{', '.join(typed)} only {'applies' if len(typed) == 1 else 'apply'} "
                 f"to a fit: add --fit.")
@@ -185,36 +174,14 @@ def _validate_args(parser: argparse.ArgumentParser, args, explicit: set) -> None
         err("--fit-phase-shift searches the shift; --phase-shift holds it fixed. Use one.")
     if 'scatter' in explicit and 'scatter_eclipse_phase' in explicit:
         err("--scatter fixes the scattered flux, so --scatter-eclipse-phase has no effect.")
-    s_lo, s_hi = map(float, args.scatter_eclipse_phase)
-    if not (0.0 <= s_lo <= s_hi <= 1.0):
-        err("--scatter-eclipse-phase must satisfy 0 <= PHASE_MIN <= PHASE_MAX <= 1.")
 
-    # --- phase window ---------------------------------------------------------------
-    try:
-        lo, hi = check_phase_window(*args.phase_window)
-    except ValueError as e:
-        err(f"--phase-window: {e}")
-    partial = not is_full_phase_window(lo, hi)
-    if partial and args.fit_phase_shift:
-        err("A partial --phase-window needs a fixed phase shift. The model is symmetric about "
-            "mid-eclipse, so with only one eclipse edge in the data the eclipse width is "
-            "degenerate with a free shift: drop --fit-phase-shift and pass --phase-shift SHIFT "
-            "(the shift of a full-orbit fit; 0 if omitted).")
-    if partial and args.fit and args.scatter is None:
-        probe = np.linspace(s_lo, s_hi, 201)
-        if not np.any(in_phase_window(probe, lo, hi)):
-            err(f"--scatter-eclipse-phase {s_lo:g} {s_hi:g} lies outside --phase-window "
-                f"{lo:g} {hi:g}; pass --scatter explicitly.")
-
-    # --- binning ----------------------------------------------------------------------
-    if args.no_phase_bin and (args.n_phase_bins is not None or args.counts_per_bin is not None):
-        err("--no-phase-bin excludes --n-phase-bins and --counts-per-bin.")
-    if args.n_phase_bins is not None and args.counts_per_bin is not None:
-        err("Specify either --n-phase-bins (fixed-width) or --counts-per-bin (constant counts), not both.")
-    if args.n_phase_bins is not None and args.n_phase_bins <= 0:
-        err("--n-phase-bins must be > 0.")
-    if args.counts_per_bin is not None and args.counts_per_bin <= 0:
-        err("--counts-per-bin must be > 0.")
+    # --- phase window and binning (rules shared with mcmc_lightcurve_fit) ------------
+    validate_phase_window_args(
+        err, args, fit_shift_enabled=args.fit_phase_shift,
+        fixed_shift_hint="drop --fit-phase-shift and pass --phase-shift SHIFT (the shift of a "
+                         "full-orbit fit; 0 if omitted).",
+        scatter_window_used=(args.fit and args.scatter is None))
+    validate_binning_args(err, args)
     if 'min_points_per_bin' in explicit and (args.no_phase_bin or args.counts_per_bin is not None):
         err("--min-points-per-bin only applies to fixed-width binning (--n-phase-bins).")
     if args.min_points_per_bin < 1:
@@ -324,8 +291,9 @@ def main() -> None:
     parser.add_argument(
         "--keep-zero-flux",
         action="store_true",
-        help="Keep rows whose rate/flux is exactly zero (zero-count bins) instead of "
-             "dropping them as gaps; their zero errors are replaced by the median valid error.",
+        help="Keep rows with rate/flux <= 0 (zero-count bins, negative background-subtracted "
+             "rates) instead of dropping them; their zero errors are replaced by the median "
+             "valid error. Same rule as mcmc_lightcurve_fit.py.",
     )
     parser.add_argument(
         "--phase-window",
@@ -412,31 +380,24 @@ def main() -> None:
     )
     print(f"Loaded {len(df)} data point(s) from {df['obs'].nunique()} observation(s).")
     
-    # NaN rows are always dropped; rows with exactly zero rate/flux (zero-count
-    # bins, usually zero-exposure gaps) unless --keep-zero-flux.
-    n_before = len(df)
-    keep = df['rate'].notna()
-    if not args.keep_zero_flux:
-        keep &= df['rate'] != 0
-    df = df[keep].reset_index(drop=True)
-    n_removed = n_before - len(df)
-    if n_removed > 0:
-        print(f"Removed {n_removed} {'NaN' if args.keep_zero_flux else 'zero/NaN'} flux data "
-              f"points ({len(df)} remaining)")
-
-    lo, hi = args.phase_window
-    if not is_full_phase_window(lo, hi):
-        n_all = len(df)
-        df = df[in_phase_window(df['phase'].to_numpy(dtype=float), lo, hi)].reset_index(drop=True)
-        print(f"Phase window [{lo:g}, {hi:g}): kept {len(df)} of {n_all} points")
-        if df.empty:
-            parser.error(f"no observed points fall inside --phase-window {lo:g} {hi:g}.")
-    
-    # Show which columns are present in the loaded data
-    if 'error' in df.columns:
-        print(f"Using data column: '{obs_column}' (with error column)")
+    # Same row rules as the MCMC loader: non-finite rows always go, rows with
+    # rate/flux <= 0 (zero-count bins, zero-exposure gaps) unless --keep-zero-flux.
+    df = drop_invalid_flux_rows(df, 'rate', drop_nonpositive=not args.keep_zero_flux)
+    try:
+        df = apply_phase_window(df, *args.phase_window)
+    except ValueError as e:
+        parser.error(str(e))
+    # One error repair, before binning (the MCMC loader does the same).
+    if 'error' in df.columns and df['error'].notna().any():
+        try:
+            df['error'] = sanitize_errors(df['error'], context=f"{args.data_dir}: ")
+        except ValueError as e:
+            parser.error(str(e))
     else:
-        print(f"Using data column: '{obs_column}' (no error column found)")
+        df = df.drop(columns=['error'], errors='ignore')
+        if args.no_phase_bin or args.fit:
+            print("Warning: the observations carry no measurement errors; binned errors come "
+                  "from the scatter within each bin (std / sqrt(n)) and a chi2 fit needs them.")
     
     # Apply phase binning if requested. Mode is chosen by argument presence:
     # --no-phase-bin > --counts-per-bin > --n-phase-bins > 50 fixed-width bins.
@@ -456,6 +417,7 @@ def main() -> None:
                 rate_column='rate',
                 error_column='error',
                 verbose=True,
+                phase_origin=args.phase_window[0],
             )
         else:
             df = phase_bin_data(
@@ -470,11 +432,13 @@ def main() -> None:
 
     smooth_df = None
     if args.smooth:
+        grid = np.linspace(0.0, 1.0, 300, endpoint=False)
         smooth_df = smooth_lightcurve(
             df["phase"].to_numpy(dtype=float),
             df["rate"].to_numpy(dtype=float),
             df["error"].to_numpy(dtype=float) if "error" in df.columns else None,
             sigma=float(args.smooth_sigma),
+            eval_phase=grid[in_phase_window(grid, *args.phase_window)],
             verbose=True,
         )
 
@@ -520,7 +484,7 @@ def main() -> None:
         )
 
         if args.write_model is not None:
-            base = args.write_model or _default_model_output(args.output)
+            base = args.write_model or model_dump_path(args.output)
             stem, ext = os.path.splitext(base)
             write_model_lightcurve(
                 f"{stem}{ext or '.txt'}", df, sim_df, sim_column, shift, scatter_value,
@@ -530,7 +494,7 @@ def main() -> None:
 
         plot_phase(
             df, args.output, sim_df, shift, sim_column, chi2,
-            shift_fitted=args.fit_phase_shift, obs_column_name=obs_column,
+            obs_column_name=obs_column,
             is_binned=is_binned, smooth_df=smooth_df, scatter=scatter_value,
         )
     else:

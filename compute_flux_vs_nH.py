@@ -28,8 +28,8 @@ Example:
 Notes:
 - XSPEC's absorption nH is in 1e22 cm^-2; the grid here is given in cm^-2 and
   the CSV carries both (`nH_cm2`, `nH_1e22`).
-- The model is sampled directly (AllModels.setEnergies + Plot("model")), i.e.
-  the intrinsic model flux, not a data-derived quantity.
+- The band flux is XSPEC's own ``calcFlux`` of the fitted model (absorbed
+  model flux, not a data-derived quantity), read back from the loaded spectrum.
 - The fitting range and the flux band may differ (fit 0.5-7 keV, tabulate soft).
 """
 
@@ -42,29 +42,28 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from utils.utils import fit_exponential
+from utils.utils import CHANDRA_BANDS, fit_exponential
 
-try:
-    from xspec import AllData, AllModels, Fit, Model, Plot, Xset  # type: ignore
-except Exception as exc:
-    print("Error: XSPEC Python module not available in this environment.")
-    print("Initialise HEASoft (PyXspec) first, e.g. under the 'henv' conda env.")
-    print(f"Details: {exc}")
-    sys.exit(1)
+# PyXspec is imported in main(), after argument parsing, so --help and argument
+# errors work without an initialised HEASoft.
+AllData = AllModels = Fit = Model = Xset = None
 
 
-INSTRUMENT_BANDS = {
-    "chandra": {
-        "broad": (0.5, 7.0),
-        "soft": (0.5, 2.0),
-        "medium": (1.2, 2.0),
-        "hard": (2.0, 7.0),
-    },
-}
+def _import_xspec() -> None:
+    global AllData, AllModels, Fit, Model, Xset
+    try:
+        from xspec import AllData as _d, AllModels as _m, Fit as _f, Model as _mo, Xset as _x  # type: ignore
+    except Exception as exc:
+        print("Error: XSPEC Python module not available in this environment.")
+        print("Initialise HEASoft (PyXspec) first: export HEADAS=<heasoft dir>; . $HEADAS/headas-init.sh")
+        print(f"Details: {exc}")
+        sys.exit(1)
+    AllData, AllModels, Fit, Model, Xset = _d, _m, _f, _mo, _x
+
+
+INSTRUMENT_BANDS = {"chandra": CHANDRA_BANDS}
 ABSORPTION_MODELS = ("phabs", "tbabs", "wabs")
 
-_KEV_TO_ERG = 1.60218e-9                                   # 1 keV in erg
-_trapezoid = getattr(np, "trapezoid", None) or np.trapz    # numpy 2 renamed trapz
 
 
 # ----------------------------------------------------------------------------
@@ -90,33 +89,36 @@ def find_spectrum_files(specdir: str) -> Tuple[str, Optional[str], Optional[str]
 
     Returns ``(src, bkg, rmf, arf)``; the last three may be None.
     """
-    spectra = []
-    for pattern in ("*.pha", "*.pha.gz", "*.pi", "*.pi.gz"):
-        spectra.extend(glob.glob(os.path.join(specdir, pattern)))
-    spectra = sorted(spectra)
+    def files(*patterns):
+        return sorted(p for pat in patterns for p in glob.glob(os.path.join(specdir, pat)))
+
+    def source_first(paths):
+        # Prefer a name marked as source; never fall back to a background file.
+        not_bkg = [p for p in paths if _pick([p], ("bkg", "background")) is None]
+        return _pick(not_bkg, ("src", "source")) or (not_bkg[0] if not_bkg else None)
+
+    spectra = files("*.pha", "*.pha.gz", "*.pi", "*.pi.gz")
     if not spectra:
         raise FileNotFoundError(f"No PHA/PI files found in {specdir}")
-
     bkg = _pick(spectra, ("bkg", "background"))
-    candidates = [p for p in spectra if p != bkg]
-    if not candidates:
+    src = source_first(spectra)
+    if src is None:
         raise FileNotFoundError(f"Only a background spectrum found in {specdir}")
-    src = _pick(candidates, ("src", "source")) or candidates[0]
-
-    rmfs = sorted(glob.glob(os.path.join(specdir, "*.rmf")))
-    arfs = sorted(glob.glob(os.path.join(specdir, "*.arf")))
-    rmf = _pick(rmfs, ("src", "source")) or (rmfs[0] if rmfs else None)
-    arf = _pick(arfs, ("src", "source")) or (arfs[0] if arfs else None)
+    rmf = source_first(files("*.rmf", "*.rmf.gz"))
+    arf = source_first(files("*.arf", "*.arf.gz"))
     return src, bkg, rmf, arf
 
 
 def load_xspec_spectrum(src: str, bkg: Optional[str], rmf: Optional[str], arf: Optional[str]) -> None:
-    """Load the spectrum into XSPEC and attach the background and responses found.
+    """Load the spectrum into XSPEC; fill in whatever the PHA header did not supply.
 
-    XSPEC resolves file names relative to the working directory, hence the
-    temporary chdir. Attaching is not guarded: a background or response that
-    cannot be attached used to be swallowed, and the fit proceeded silently
-    without it.
+    PyXspec first loads the BACKFILE / RESPFILE / ANCRFILE named in the PHA
+    header. Those calibrated pairings are kept: the files found in the
+    directory are attached only where the header left a gap, because
+    assigning ``spectrum.response`` replaces the Response object and would
+    silently drop the header's ARF. A spectrum that ends up without a response
+    is an error (the fit would have no effective area). XSPEC resolves file
+    names relative to the working directory, hence the temporary chdir.
     """
     AllData.clear()
     AllModels.clear()
@@ -125,12 +127,27 @@ def load_xspec_spectrum(src: str, bkg: Optional[str], rmf: Optional[str], arf: O
         os.chdir(os.path.dirname(os.path.abspath(src)))
         AllData(os.path.basename(src))
         spectrum = AllData(1)
-        if bkg:
+        if bkg and not spectrum.background:
             spectrum.background = os.path.basename(bkg)
-        if rmf:
+        if not spectrum.responsesUsed:
+            if rmf is None:
+                raise ValueError(f"no response for {os.path.basename(src)}: the header names none "
+                                 "(or names a file missing from its directory) and no *.rmf is "
+                                 "present there; the fit needs a response.")
             spectrum.response = os.path.basename(rmf)
         if arf:
-            spectrum.response.arf = os.path.basename(arf)
+            try:
+                has_arf = bool(spectrum.response.arf)
+            except Exception:           # PyXspec raises when the response has no ARF
+                has_arf = False
+            if not has_arf:
+                spectrum.response.arf = os.path.basename(arf)
+        try:
+            arf_in_use = spectrum.response.arf
+        except Exception:
+            arf_in_use = None
+        print(f"  Response in use: {spectrum.response.rmf}  ARF: {arf_in_use or 'none'}  "
+              f"background: {spectrum.background.fileName if spectrum.background else 'none'}")
     finally:
         os.chdir(cwd)
 
@@ -186,7 +203,7 @@ def fit_model(
         params[f"{name}_error"] = float(model(index).sigma)
     params["statistic"] = float(Fit.statistic)
     params["dof"] = float(Fit.dof)
-    params["chi2_red"] = params["statistic"] / params["dof"] if params["dof"] > 0 else 0.0
+    params["chi2_red"] = params["statistic"] / params["dof"] if params["dof"] > 0 else float("nan")
 
     print("\nBest-fit parameters:")
     print(f"  {model_name}.nH = {params['nH']:.6f} +/- {params['nH_error']:.6f} x 10^22 cm^-2")
@@ -211,35 +228,24 @@ def freeze_powerlaw_params():
 # Flux vs nH
 # ----------------------------------------------------------------------------
 
-def integrate_fluxes(E: np.ndarray, y: np.ndarray, band: Tuple[float, float]) -> Tuple[float, float]:
-    """Photon and energy flux of ``y(E)`` [photons/cm^2/s/keV] over *band* [keV].
-
-    Returns ``(photons/cm^2/s, erg/cm^2/s)``; NaN when fewer than two grid
-    points fall inside the band.
-    """
-    e1, e2 = band
-    mask = (E >= e1) & (E <= e2)
-    if np.count_nonzero(mask) < 2:
-        return float("nan"), float("nan")
-    E_b, y_b = E[mask], y[mask]
-    return float(_trapezoid(y_b, E_b)), float(_trapezoid(E_b * y_b, E_b)) * _KEV_TO_ERG
-
-
 def vary_nh_and_compute(nH_values_cm2: np.ndarray, band_name: str,
                         band: Tuple[float, float]) -> pd.DataFrame:
-    """Step nH over the grid and integrate the model spectrum over *band*.
+    """Step nH over the grid and let XSPEC integrate the model flux over *band*.
 
-    Assumes the model has been fitted. The energy grid and the plot device
-    are set once; only the nH value changes between points, so the model is
-    re-evaluated on the same 2000-point log grid every time.
+    Assumes the model has been fitted. ``AllModels.calcFlux`` integrates the
+    current model exactly over the band, and the result is read back from the
+    loaded spectrum: ``flux[0]`` is the energy flux (erg cm^-2 s^-1),
+    ``flux[3]`` the photon flux (photons cm^-2 s^-1). XSPEC clips the band to
+    the model energy array, so that array is first extended to 0.1-20 keV
+    (``setEnergies``), which covers any band of the supported instruments.
     """
     e1, e2 = band
     if e1 >= e2:
         raise ValueError(f"Invalid band {e1}-{e2} keV (min >= max)")
-
+    if e1 < 0.1 or e2 > 20.0:
+        raise ValueError(f"Band {e1}-{e2} keV lies outside the 0.1-20 keV model energy array.")
     nh_par = freeze_powerlaw_params()
-    Plot.xAxis = "keV"
-    Plot.device = "/null"
+    spectrum = AllData(1)
     AllModels.setEnergies("0.1 20.0 2000 log")
 
     rows = []
@@ -248,15 +254,13 @@ def vary_nh_and_compute(nH_values_cm2: np.ndarray, band_name: str,
     for i, nH_cm2 in enumerate(nH_values_cm2):
         nH_1e22 = float(nH_cm2) / 1.0e22
         nh_par.values = nH_1e22
-        Plot("model")
-        E = np.asarray(Plot.x(1), dtype=float)
-        y = np.asarray(Plot.model(1), dtype=float)
-        flux_ph, flux_erg = integrate_fluxes(E, y, band)
+        AllModels.calcFlux(f"{e1} {e2}")
+        flux = spectrum.flux
         rows.append({
             "nH_cm2": float(nH_cm2),
             "nH_1e22": nH_1e22,
-            f"flux_{band_name}_ph": flux_ph,
-            f"flux_{band_name}_erg": flux_erg,
+            f"flux_{band_name}_ph": float(flux[3]),
+            f"flux_{band_name}_erg": float(flux[0]),
         })
         if (i + 1) % report_every == 0:
             print(f"  Progress: {i + 1}/{len(nH_values_cm2)}")
@@ -290,9 +294,12 @@ def plot_table(df: pd.DataFrame, band_name: str, band: Tuple[float, float],
         ok = np.isfinite(flux) & (flux > 0) & (nh > 0)
         ax.plot(nh[ok] * 1e22, flux[ok], "o", ms=4, alpha=0.7, label=label)
         if np.count_nonzero(ok) >= 2:
+            # Orientation only: one exponential cannot follow a table spanning many
+            # decades (equal weights in log space let the absorbed tail dominate),
+            # which is why the simulator interpolates the table by default.
             A, B = fit_exponential(nh[ok], flux[ok])
             ax.plot(nh[ok] * 1e22, A * np.exp(-B * nh[ok]), "--", lw=2, alpha=0.9,
-                    label=f"$F = {A:.3e}\\,e^{{-{B:.4f}\\,n_H}}$  ($n_H$ in $10^{{22}}$ cm$^{{-2}}$)")
+                    label=f"refit law $F = {A:.3e}\\,e^{{-{B:.4f}\\,n_H}}$ (orientation only)")
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.grid(True, which="both", alpha=0.3)
@@ -348,6 +355,7 @@ def main():
 
     if not os.path.isdir(args.specdir):
         parser.error(f"specdir not found: {args.specdir}")
+    _import_xspec()
     bands = INSTRUMENT_BANDS[args.instrument]
     band_name = args.band or ("broad" if "broad" in bands else next(iter(bands)))
     if band_name not in bands:

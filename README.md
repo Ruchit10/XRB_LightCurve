@@ -192,8 +192,11 @@ combinations are rejected up front with a message naming the flags.
 1. **`interpolate`** (default) — log-log interpolation of the XSPEC table.
    Most faithful to the spectral model.
 2. **`refit`** — fits `A·exp(−B·nH)` to the same table (once per table, then
-   cached) and uses the analytic form. Smoother, at the cost of a small
-   systematic error where the true curve departs from a single exponential.
+   cached) and uses the analytic form. A single exponential cannot follow a
+   table spanning many decades: with equal weights in log space the absorbed
+   tail dominates and the law misses the low-`nH` plateau by a factor ~2 for
+   the broad band (worse for soft). Keep `interpolate` for any quantitative
+   work; `refit` is a smooth stand-in for method comparisons only.
 
 Both conversions are applied per emitter cell inside a compiled kernel.
 
@@ -227,6 +230,7 @@ flux conversion averaged over the disk (**not** the conversion of `fl`).
 | `plot_results.py` | Standalone plots from a simulation CSV |
 | `utils/utils.py` | Data loading, phase binning, smoothing, χ² fit |
 | `utils/plot_utils.py` | All plotting routines, shared by both fit scripts |
+| `synthetic_data/` | Synthetic spectrum (PyXspec `fakeit`) and CIAO-layout light curves with a truth record, for injection–recovery tests |
 | `notebooks/` | Exploratory analysis |
 | `legacy_r_code/` | Original R implementation, kept for reference |
 | `changes_tracked.md` | Development history |
@@ -254,9 +258,12 @@ sampling `(M_X, M_RH)` lays that flat direction diagonally across both axes.
 **Reproducing a run** — pass `--seed N`; the walker initialisation, the
 sampler and every random subset then follow that seed.
 
-**Zero-count bins** — rows with zero flux are dropped on load by default;
-`--keep-zero-flux` (both fitters) keeps them, with their zero errors replaced
-by the median valid error.
+**Zero-count bins** — rows with flux ≤ 0 are dropped on load by default;
+`--keep-zero-flux` (both fitters, same rule) keeps them, with their zero errors
+replaced by the median valid error before binning.
+
+**Replotting a `--no-csv-output` fit** works: `--replot` reads the chain file,
+which every fit writes right after sampling; the samples CSV is only an export.
 
 **`--replot` refuses a result directory** — directories written before the
 physical wind normalization carry no `wind_normalization` stamp and cannot be

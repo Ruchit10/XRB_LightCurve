@@ -503,9 +503,7 @@ def get_available_bands_from_csv(df: pd.DataFrame, flux_type: str = "erg") -> li
     )
 
 
-def load_flux_vs_nh_csv(
-    csv_path: str, flux_type: str = "erg", verbose: bool = True
-) -> Tuple[pd.DataFrame, list]:
+def load_flux_vs_nh_csv(csv_path: str, flux_type: str = "erg") -> Tuple[pd.DataFrame, list]:
     """
     Load a flux vs nH CSV from compute_flux_vs_nH.py.
 
@@ -525,9 +523,6 @@ def load_flux_vs_nh_csv(
             f"No flux columns found in CSV for flux_type='{flux_type}'. "
             f"Expected columns like flux_{{band}}_{flux_type}"
         )
-    if verbose:
-        print(f"Detected energy bands in CSV: {', '.join(bands)}")
-
     nh = pd.to_numeric(df["nH_1e22"], errors="coerce")
     keep = nh.notna() & (nh > 0)
     any_flux = np.zeros(len(df), dtype=bool)
@@ -548,7 +543,7 @@ def _build_flux_context(csv_path: str, flux_type: str) -> Dict[str, object]:
     if cached is not None:
         return cached
 
-    df, bands = load_flux_vs_nh_csv(csv_path, flux_type=flux_type, verbose=False)
+    df, bands = load_flux_vs_nh_csv(csv_path, flux_type=flux_type)
     df_sorted = df.sort_values("nH_1e22")
     nh_base = pd.to_numeric(df_sorted["nH_1e22"], errors="coerce").to_numpy(dtype=float)
 
@@ -559,7 +554,9 @@ def _build_flux_context(csv_path: str, flux_type: str) -> Dict[str, object]:
         ).to_numpy(dtype=float)
         valid = np.isfinite(nh_base) & (nh_base > 0) & np.isfinite(flux_vals) & (flux_vals > 0)
         if np.count_nonzero(valid) < 2:
-            continue
+            raise ValueError(
+                f"{csv_path}: band '{band}' has {int(np.count_nonzero(valid))} usable rows "
+                f"(finite nH > 0 and flux > 0); the interpolation needs at least two.")
         nh_csv = nh_base[valid]
         flux_csv = flux_vals[valid]
         if np.any(np.diff(nh_csv) <= 0):
@@ -721,6 +718,12 @@ def _simulate_core(
             f"is smaller than the companion.")
     if d1 + d2 <= 0.0:
         raise ValueError(f"Need d1 + d2 > 0 (got d1={d1}, d2={d2}).")
+    for name, step in (("dth", dth), ("d2h", d2h)):
+        # The phase grid and the sector grid must close: int(360 / step) rings
+        # would otherwise leave a gap, and the phase reflection assumes a
+        # closed grid.
+        if step <= 0.0 or abs(360.0 / step - round(360.0 / step)) > 1e-9:
+            raise ValueError(f"{name} must be positive and divide 360 evenly (got {step}).")
 
     # Only the input convention changes here: `incl` is the internal angle from
     # the line of sight that the kernel's geometry assumes.
@@ -735,7 +738,7 @@ def _simulate_core(
     model_id, p1, p2, p3 = pack_wind_params(wind_model, wind_params)
 
     gma0_rad = gma0 * np.pi / 180.0
-    n_phases = int(360 / dth)
+    n_phases = int(round(360.0 / dth))     # dth divides 360 (checked above)
     gma_values = gma0_rad + np.arange(n_phases) * (dth * np.pi / 180.0)
 
     # Phases gma and pi - gma are geometrically identical (see
