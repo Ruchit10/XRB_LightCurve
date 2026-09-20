@@ -87,11 +87,12 @@ except ImportError:
 from xrb_lightcurve import (
     simulate_lightcurve,
     simulate_band_flux,
+    WIND_MODEL_IDS,
     WIND_MODEL_PARAM_KEYS,
-    R_STAR_TIED_MODELS,
     MU_WIND_DEFAULT,
     default_wind_params,
     evaluate_g_profile,
+    flux_table_bands,
 )
 from utils.utils import (
     ORBITAL_PERIOD,
@@ -215,19 +216,17 @@ WIND_MODELS = {
 }
 
 # Shape parameters that become free MCMC dimensions under --fit-wind-shape.
-# R_star (confinement, beta_law) is tied to the geometry parameter R.
+# R_star (confinement, beta_law) is tied to the geometry parameter R; any other
+# shape parameter (smooth_pl's poorly identifiable Delta) keeps the simulator
+# default from xrb_lightcurve.default_wind_params.
 WIND_SHAPE_FIT = {
     'smooth_pl':   ['Rb', 'p'],
     'confinement': ['fconf', 'ell'],
     'beta_law':    ['beta', 'H'],
 }
-
-# Shape parameters passed as constants (poor identifiability).
-WIND_SHAPE_FIXED = {
-    'smooth_pl':   {'Delta': 2.0},
-    'confinement': {},
-    'beta_law':    {},
-}
+assert set(WIND_MODELS) == set(WIND_MODEL_IDS), "WIND_MODELS must describe every xrb_lightcurve wind model"
+for _model, _names in WIND_SHAPE_FIT.items():
+    assert set(_names) <= set(WIND_MODEL_PARAM_KEYS[_model]), f"WIND_SHAPE_FIT[{_model!r}] names unknown to xrb_lightcurve"
 
 # Default priors for wind-shape parameters; override with --prior-<name>.
 # beta ~ 0.8-1 is the CAK range for OB/WR winds; H is the acceleration scale
@@ -391,20 +390,22 @@ class ParamSpec:
         return float(d1), float(d2), float(r), float(R), float(i0)
 
     def wind_params(self, theta, R_value: float) -> Optional[Dict[str, float]]:
-        """Wind-shape dict for simulate_lightcurve, or None for the model defaults.
+        """Wind-shape dict for the simulator, or None for the model defaults.
 
-        Fitted shape values come from the sample, frozen ones from ``frozen``,
-        anything else from the prior mean; R_star is tied to R.
+        Fitted shape values come from the sample and frozen ones from
+        ``frozen``; every other parameter keeps the simulator default
+        (``default_wind_params``, which also ties R_star to R), so freezing one
+        parameter never changes the value of another and the CLI simulator
+        reproduces the fitted curve.
         """
-        shape_names = WIND_SHAPE_FIT.get(self.wind_model, [])
+        shape_names = WIND_SHAPE_FIT[self.wind_model]
         if not self.fit_wind_shape and not any(n in self.frozen for n in shape_names):
             return None
-        wp: Dict[str, float] = dict(WIND_SHAPE_FIXED.get(self.wind_model, {}))
+        wp = default_wind_params(self.wind_model, R_value)
         for name in shape_names:
             v = self.value(theta, name)
-            wp[name] = float(WIND_SHAPE_PRIORS[name]['mean']) if v is None else v
-        if self.wind_model in R_STAR_TIED_MODELS:
-            wp['R_star'] = float(R_value)
+            if v is not None:
+                wp[name] = v
         return wp
 
     def f_scatter(self, theta) -> float:
@@ -561,8 +562,17 @@ class DirectLightCurveModel:
         self.sim_params = sim_params or {}
         if self.wind_model not in WIND_MODELS:
             raise ValueError(f"wind_model must be one of {list(WIND_MODELS)}, got '{wind_model}'")
+        if self.flux_method not in ('interpolate', 'refit'):
+            raise ValueError(f"flux_method must be 'interpolate' or 'refit', got '{flux_method}'")
         if not os.path.exists(flux_csv_path):
             raise FileNotFoundError(f"Flux CSV not found: {flux_csv_path}")
+        # Fail here, not once per likelihood call: a band missing from the table
+        # would otherwise make every log-probability -inf, and the sampler would
+        # still run to completion with frozen walkers.
+        bands = flux_table_bands(flux_csv_path)
+        if self.band not in bands:
+            raise ValueError(f"Band '{band}' is not in {flux_csv_path} (available: {bands}). "
+                             "The model is run one band at a time: pass the table for this band.")
 
     def sim_kwargs(self, d1, d2, r, R, i0, wind_params=None, f_opacity=None,
                    scattered_flux: float = 0.0) -> Dict[str, object]:
@@ -669,9 +679,11 @@ def aligned_model_flux(theta, spec: ParamSpec, model: DirectLightCurveModel,
 def log_prior(theta, priors: Dict[str, Dict[str, float]], spec: ParamSpec) -> float:
     """Box + Gaussian prior per active dimension, plus physical constraints.
 
-    Constraints are applied to *resolved* values so they hold under freezing
-    and the Kepler mappings: r < R always, Rb >= R for smooth_pl. The
-    reparameterized mode adds the Jacobian |d(d1,d2)/d(a,q)| = a.
+    Priors are stated directly on the sampled parameters of every mode (a and
+    q under --reparam, the masses under the Kepler modes), so no
+    change-of-variables Jacobian is applied. Constraints are applied to
+    *resolved* values so they hold under freezing and the Kepler mappings:
+    r < R always, Rb >= R for smooth_pl.
     """
     for name, value in zip(spec.active_names, theta):
         prior = priors.get(name)
@@ -687,12 +699,6 @@ def log_prior(theta, priors: Dict[str, Dict[str, float]], spec: ParamSpec) -> fl
         prior = priors.get(name)
         if prior is not None:
             log_p += -0.5 * ((theta[i] - prior['mean']) / prior['std']) ** 2
-
-    if spec.mode == 'reparam':
-        a_value = spec.value(theta, 'a')
-        if a_value is None or a_value <= 0:
-            return -np.inf
-        log_p += np.log(a_value)
 
     if spec.wind_model == 'smooth_pl':
         rb_val = spec.value(theta, 'Rb')
@@ -743,10 +749,15 @@ def chi2_terms(theta, spec: ParamSpec, model, data: FitData) -> Dict[str, float]
     return {'chi2': chi2, 'chi2_eff': chi2_eff, 'shift': float(shift), 'model': model_flux}
 
 
-def degrees_of_freedom(spec: ParamSpec, n_obs: int) -> int:
-    """Observations minus physical free parameters (log_f is not physical)."""
+def degrees_of_freedom(spec: ParamSpec, n_obs: int, fit_phase_shift: bool = False) -> int:
+    """Observations minus fitted model parameters.
+
+    Counts the sampled physical parameters and the profiled phase shift (one
+    parameter, the convention ``fit_simulation`` uses too); the jitter term
+    log_f describes the errors rather than the model and is not counted.
+    """
     n_phys = spec.n_dim - (1 if 'log_f' in spec.active_names else 0)
-    return int(n_obs - n_phys)
+    return int(n_obs - n_phys - (1 if fit_phase_shift else 0))
 
 
 # =============================================================================
@@ -832,6 +843,18 @@ def run_mcmc(
     """Run the ensemble sampler; returns ``(sampler, flat_samples_after_burn)``."""
     pos = initial_positions(spec, priors, n_walkers)
 
+    # Evaluate the initial ensemble up front: emcee accepts walkers at -inf and
+    # would sample a model that can never be evaluated to completion, with
+    # acceptance 0 and a "posterior" equal to the initial ball.
+    lp0 = np.array([log_probability(p, spec, priors, model, data) for p in pos])
+    n_bad = int(np.sum(~np.isfinite(lp0)))
+    if n_bad == n_walkers:
+        raise RuntimeError(
+            "Every initial walker has log-probability -inf: the model cannot be evaluated "
+            "near the prior means (check the flux table, the wind model and the priors).")
+    if n_bad:
+        warnings.warn(f"{n_bad} of {n_walkers} initial walkers start at log-probability -inf.")
+
     print(f"\nStarting MCMC ({sampler_type}) with {n_walkers} walkers, {n_steps} steps"
           f"{f', {n_threads} threads' if n_threads > 1 else ' (serial)'}")
     print(f"Parameterization: {spec.mode}  | Likelihood: {LIKELIHOOD_TYPES[spec.likelihood]}")
@@ -872,12 +895,13 @@ def run_mcmc(
         else:
             sampler = emcee.EnsembleSampler(
                 n_walkers, spec.n_dim, log_prob_fn, args=args, pool=pool)
+            state = emcee.State(pos, log_prob=lp0)   # already evaluated above
             if progress and HAS_TQDM:
-                for _ in tqdm(sampler.sample(pos, iterations=n_steps),
+                for _ in tqdm(sampler.sample(state, iterations=n_steps),
                               total=n_steps, desc="MCMC Sampling"):
                     pass
             else:
-                sampler.run_mcmc(pos, n_steps, progress=progress)
+                sampler.run_mcmc(state, n_steps, progress=progress)
     finally:
         if pool is not None:
             pool.close()
@@ -1026,7 +1050,7 @@ def compute_chi2_for_samples(model, spec: ParamSpec, samples: np.ndarray, data: 
     if verbose:
         print(f"Computing chi-square for {len(indices)} samples"
               f"{' from the stored log-probabilities' if from_chain else ''}...")
-    dof = degrees_of_freedom(spec, len(data.flux))
+    dof = degrees_of_freedom(spec, len(data.flux), data.fit_phase_shift)
     use_eff = spec.likelihood == 'jitter'
     iterator = (tqdm(indices, desc="Computing χ²")
                 if (HAS_TQDM and verbose and not from_chain) else indices)
@@ -1135,7 +1159,7 @@ def plot_best_fit(model, spec: ParamSpec, data: FitData, stats: Dict, band: str,
     if obs_model is None:
         obs_model = np.full_like(data.phase, np.nan)
     shift = terms['shift']
-    dof = degrees_of_freedom(spec, len(data.flux))
+    dof = degrees_of_freedom(spec, len(data.flux), data.fit_phase_shift)
     red_chi2 = terms['chi2'] / dof if dof > 0 else np.nan
     red_chi2_eff = terms['chi2_eff'] / dof if (dof > 0 and np.isfinite(terms['chi2_eff'])) else np.nan
     f_best = (float(np.exp(theta[spec.index('log_f')]))
@@ -1397,11 +1421,35 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
         sampler_type=args.sampler, progress=not args.quiet, n_threads=args.n_threads,
         numba_threads_per_worker=getattr(args, "numba_threads_per_worker", None))
     fit_elapsed = float(time.time() - fit_start)
+    log_prob_flat = sampler.get_log_prob(discard=args.n_burn, flat=True)
+    chain = sampler.get_chain(discard=args.n_burn)
 
-    try:
-        log_prob_flat = sampler.get_log_prob(discard=args.n_burn, flat=True)
-    except Exception:
-        log_prob_flat = None
+    # Persist the sampling result first: everything below (statistics, ArviZ,
+    # figures, the chi2 table) can fail or be interrupted, and --replot needs
+    # only these files.
+    if not args.no_csv_output:
+        path = os.path.join(args.output_dir, f"{suffix}_samples.csv")
+        save_samples_csv_chunked(samples=samples, param_names=spec.active_names,
+                                 output_path=path, log_prob=log_prob_flat,
+                                 chunk_size=args.csv_chunk_size)
+        print(f"Samples saved to: {path}")
+    if args.compact_output:
+        path = os.path.join(args.output_dir, f"{suffix}_samples.npz")
+        np.savez_compressed(path, samples=samples, param_names=np.array(spec.active_names, dtype=str),
+                            log_prob=log_prob_flat)
+        print(f"Compact samples saved to: {path}")
+    # The chain file carries the metadata --replot needs to rebuild the spec.
+    path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
+    np.savez_compressed(
+        path, chain=chain, log_prob=sampler.get_log_prob(discard=args.n_burn),
+        param_names=np.array(spec.active_names, dtype=str), n_burn=int(args.n_burn),
+        likelihood=spec.likelihood, mode=spec.mode, wind_model=spec.wind_model,
+        frozen_names=np.array(list(spec.frozen.keys()), dtype=str),
+        frozen_values=np.array(list(spec.frozen.values()), dtype=float),
+        orbital_period_s=float(spec.orbital_period_s),
+        n_obs=float(len(data.flux)))   # --replot compares this with the data it loads
+    print(f"Full chain saved to: {path}")
+
     stats = compute_statistics(samples, spec, log_prob=log_prob_flat)
     print_results(stats, spec, band)
     stats['_diagnostics'] = print_diagnostics(sampler, args.sampler, spec.active_names)
@@ -1415,42 +1463,8 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
         'phase_shift_resolution': (float(data.shift_search.resolution)
                                    if data.shift_search is not None else None),
     }
-
-    chain = sampler.get_chain(discard=args.n_burn)
-    stats = postprocess_fit(args, spec, priors, model, data, samples, stats, band, chain,
-                            log_prob_flat, smoothed, sampler=sampler)
-
-    if not getattr(args, "no_csv_output", False):
-        path = os.path.join(args.output_dir, f"{suffix}_samples.csv")
-        save_samples_csv_chunked(samples=samples, param_names=spec.active_names,
-                                 output_path=path, log_prob=log_prob_flat,
-                                 chunk_size=getattr(args, "csv_chunk_size", 50000))
-        print(f"Samples saved to: {path}")
-    if getattr(args, "compact_output", False):
-        path = os.path.join(args.output_dir, f"{suffix}_samples.npz")
-        np.savez_compressed(path, samples=samples, param_names=np.array(spec.active_names, dtype=str),
-                            log_prob=(log_prob_flat if log_prob_flat is not None else np.array([])))
-        print(f"Compact samples saved to: {path}")
-
-    # The chain file carries the metadata --replot needs to rebuild the spec.
-    try:
-        path = os.path.join(args.output_dir, f"{suffix}_chain.npz")
-        np.savez_compressed(
-            path, chain=chain, log_prob=sampler.get_log_prob(discard=args.n_burn),
-            param_names=spec.active_names, n_burn=args.n_burn, likelihood=spec.likelihood,
-            reparam=(spec.mode == 'reparam'), mode=spec.mode,
-            frozen_names=np.array(list(spec.frozen.keys()), dtype=str),
-            frozen_values=np.array(list(spec.frozen.values()), dtype=float),
-            orbital_period_s=float(spec.orbital_period_s), wind_model=spec.wind_model,
-            fit_wind_shape=spec.fit_wind_shape,
-            bic=stats.get("bic", np.nan), logL_hat=stats.get("logL_hat", np.nan),
-            k_params=stats.get("k_params", np.nan),
-            # Always recorded (not just with --compute-bic): --replot checks it.
-            n_obs=float(stats.get("n_obs", len(data.flux))))
-        print(f"Full chain saved to: {path}")
-    except Exception as e:
-        warnings.warn(f"Could not save full chain: {e}")
-    return stats
+    return postprocess_fit(args, spec, priors, model, data, samples, stats, band, chain,
+                           log_prob_flat, smoothed, sampler=sampler)
 
 
 def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
@@ -1472,13 +1486,12 @@ def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
         print(f"Samples file not found: {samples_path}")
         return None
 
-    chain = log_prob_chain = None
+    chain = None
     saved = {'mode': spec.mode, 'likelihood': spec.likelihood,
              'orbital_period_s': spec.orbital_period_s, 'frozen': dict(spec.frozen)}
     if os.path.exists(chain_path):
         meta = np.load(chain_path, allow_pickle=True)
         chain = meta['chain']
-        log_prob_chain = meta['log_prob'] if 'log_prob' in meta else None
         saved['mode'] = str(meta.get('mode', saved['mode']))
         saved['likelihood'] = str(meta.get('likelihood', saved['likelihood']))
         saved['orbital_period_s'] = float(meta.get('orbital_period_s', saved['orbital_period_s']))
@@ -1860,6 +1873,9 @@ def main():
         parser.error("--n-phase-bins must be > 0.")
     if args.counts_per_bin is not None and args.counts_per_bin <= 0:
         parser.error("--counts-per-bin must be > 0.")
+    if not args.replot and not (0 <= args.n_burn < args.n_steps):
+        parser.error(f"--n-burn must satisfy 0 <= n_burn < n_steps "
+                     f"(got n_burn={args.n_burn}, n_steps={args.n_steps}).")
     if args.smooth_sigma <= 0:
         parser.error("--smooth-sigma must be > 0.")
     lo, hi = map(float, args.scatter_eclipse_phase)

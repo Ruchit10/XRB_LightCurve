@@ -614,6 +614,44 @@ and `--compute-bic`, emcee with a 2-process pool, zeus with `--smooth`, and
 counting constructions over 20 likelihood calls: 0), so the Phase 33 item
 "return arrays, not a DataFrame, on the likelihood path" is closed.
 
+### Commit 2 — Persist before plotting, validate up front, one prior and one default per parameter
+
+1. **Chain persisted first.** `run_single_fit` wrote the samples CSV and the
+   chain NPZ only after `postprocess_fit` (ArviZ, corner, best-fit and
+   geometry figures, the chi2 table), none of which was guarded, so any
+   exception there (corner raises on a constant column; ArviZ API mismatch;
+   Ctrl-C) discarded a finished run and `--replot` had nothing to read. The
+   three save blocks now run straight after sampling. The chain NPZ drops
+   the fields replot never read (`reparam`, `fit_wind_shape`, `bic`,
+   `logL_hat`, `k_params`); BIC lives in `*_model_metrics.csv` and the summary.
+2. **`--n-burn ≥ --n-steps` rejected** at argument time; it used to fail in
+   `np.percentile` on an empty chain after the whole run.
+3. **Band validated at construction.** `DirectLightCurveModel` checked only
+   that the flux CSV existed; a band absent from the table raised inside every
+   likelihood call, was caught and turned into `-inf`, and emcee sampled the
+   whole run with acceptance 0 and a "posterior" equal to the initial ball.
+   The constructor now checks the band (`xrb_lightcurve.flux_table_bands`)
+   and the flux method; `run_mcmc` evaluates the initial ensemble, aborts
+   when every walker is `-inf`, warns when some are, and hands emcee the
+   evaluated `State`.
+4. **Reparam Jacobian removed.** `log_prior` added `+log a` in `--reparam`
+   mode although the priors are stated directly on `(a, q)`; the effective
+   prior was `a·N(a)` (mode +4.3 %, ~+13 % in a derived `M_tot` because `a` is
+   prior-anchored through the exact scale invariance) and the Kepler modes,
+   equally reparameterizations, had no such term. Priors live in the sampled
+   space of every mode.
+5. **One default per wind-shape parameter.** `ParamSpec.wind_params` filled
+   unfitted, unfrozen shape parameters from the prior means (`fconf` 5,
+   `ell` 1.0, `beta` 0.8) while the simulator and CLI use
+   `default_wind_params` (10, 0.5, 1.0), so `--freeze ell=0.3` without
+   `--fit-wind-shape` silently changed `fconf`. Defaults now come from
+   `default_wind_params` (which also ties `R_star`); `WIND_SHAPE_FIXED` is
+   gone and the registries are asserted against `xrb_lightcurve` at import.
+6. **One dof convention.** `degrees_of_freedom` counts the profiled phase
+   shift, as `fit_simulation` always did, so the χ²/dof on the best-fit
+   figure, in the model dump and in the chi2 table is comparable with the
+   tabulated fit.
+
 ---
 
 ## Side Investigation — Reference Epoch

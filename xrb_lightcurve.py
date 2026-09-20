@@ -611,6 +611,11 @@ def _select_band(ctx: Dict[str, object], band: Optional[str]) -> str:
     return band
 
 
+def flux_table_bands(csv_path: str, flux_type: str = "erg") -> list:
+    """Bands available in a flux-vs-nH table (loads and caches the table)."""
+    return list(_build_flux_context(csv_path, flux_type=flux_type)["bands"])
+
+
 def default_wind_params(wind_model: str, R: float) -> Dict[str, float]:
     """
     Return sensible default parameters for a given wind model.

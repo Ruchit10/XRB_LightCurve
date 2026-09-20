@@ -495,9 +495,11 @@ Phase 33 consolidation).
 ### Forward model: direct only
 
 `DirectLightCurveModel` holds the run's band, flux table, wind model, `dth`
-(default 2°) and simulation constants; `curve(d1, d2, r, R, i0, wind_params,
-f_opacity)` calls `simulate_band_flux` and returns the kernel's native
-`(phase, flux)` arrays. Nothing is resampled: the likelihood interpolates that
+(default 2°) and simulation constants, and validates the band against the
+table at construction (a band missing from the table used to surface only as
+`-inf` on every likelihood call, which emcee samples to completion with frozen
+walkers); `curve(d1, d2, r, R, i0, wind_params, f_opacity)` calls
+`simulate_band_flux` and returns the kernel's native `(phase, flux)` arrays. Nothing is resampled: the likelihood interpolates that
 curve once, directly onto the (shifted) observed phases. At ≈ 7 ms per curve
 this is fast enough for MCMC and is the only path that supports per-sample
 wind-shape parameters.
@@ -523,7 +525,7 @@ class ParamSpec:
 
     value(theta, name)          # sampled or frozen value, else None
     geometry(theta)             # -> (d1, d2, r, R, i0), NaNs if unphysical
-    wind_params(theta, R)       # shape dict for the simulator (R_star tied to R)
+    wind_params(theta, R)       # shape dict for the simulator (unfitted names: simulator defaults, R_star = R)
     f_scatter(theta); f_opacity(theta)
     derived(rows)               # vectorized a/q/d1/d2/M_X/M_RH per mode
 ```
@@ -609,10 +611,21 @@ dimensions; `--freeze H=1.0` recovers a one-parameter beta-law fit.
 `(min, max)` per dimension, then a soft Gaussian penalty
 `-½((θ-mean)/std)²`. Physical constraints are applied on *resolved* values (so
 they hold under freezing and Kepler mode): `r < R` always, and `Rb ≥ R` for
-`smooth_pl`. `reparam` mode adds the change-of-variables Jacobian `+log(a)`;
-`phys` and `kepler` need none (their priors are already in the sampled space).
-`get_active_priors` merges geometry + jitter + shape + scatter priors and drops
-frozen entries.
+`smooth_pl`. Priors are stated directly on the sampled parameters of every
+mode, so no change-of-variables Jacobian is applied. (Before Phase 34 `reparam`
+added `+log(a)` on top of Gaussian priors already stated on `a` and `q`, which
+tilted the effective prior to `a·N(a)`, +4.3 % in the mode of `a`; because `a`
+is prior-anchored through the exact scale invariance, that leaked ~+13 % into
+a derived `M_tot`. The Kepler modes never had such a term.) `get_active_priors`
+merges geometry + jitter + shape + scatter priors and drops frozen entries.
+
+Unfitted, unfrozen wind-shape parameters take the **simulator defaults**
+(`default_wind_params`, which also ties `R_star` to `R`), never prior means:
+freezing one shape parameter therefore leaves the others unchanged, and
+`xrb_lightcurve.py` with the same `--freeze` values reproduces the fitted
+curve exactly. The registries are checked against `xrb_lightcurve` at import
+(`WIND_MODELS` keys = `WIND_MODEL_IDS`, `WIND_SHAPE_FIT` ⊆
+`WIND_MODEL_PARAM_KEYS`).
 
 ### Per-sample phase-shift alignment
 
@@ -649,7 +662,11 @@ the shift search.
 - `--sampler emcee` (default, stretch move) or `zeus` (ensemble slice sampler;
   better for correlated posteriors).
 - Walkers initialized at `prior['mean'] ± 0.1·prior['std']`, clipped just inside
-  each box; `r ≥ R` walkers are repaired when both are free.
+  each box; `r ≥ R` walkers are repaired when both are free. The initial
+  ensemble is evaluated before sampling: the run aborts if every walker is at
+  `-inf` (and warns if some are), and emcee starts from the evaluated `State`.
+  `main()` rejects `--n-burn ≥ --n-steps`, which used to fail only after the
+  full run with an empty chain.
 - `--n-threads N > 1` opens a `spawn` multiprocessing pool. The fit context
   (`ParamSpec`, priors, model, `FitData`) is sent to each worker once through
   the pool initializer `_init_worker`, and the sampler calls
@@ -712,7 +729,12 @@ non-finite / non-positive errors are patched to
   (`--chi2-n-samples`).
 - `postprocess_fit` — the block shared by a fresh fit and `--replot`: ArviZ,
   BIC, corner/trace/best-fit/geometry figures, the chi2 table.
-  `write_summary` writes `mcmc_summary.txt`.
+  `write_summary` writes `mcmc_summary.txt`. `run_single_fit` writes the
+  samples CSV, the optional compact NPZ and the chain NPZ **immediately after
+  sampling**, before statistics and figures, so a plotting or ArviZ failure (or
+  a Ctrl-C) can no longer discard the chain; `--replot` needs only those files.
+  χ²/dof values reported by the MCMC count the profiled phase shift as one
+  fitted parameter, the same convention as `fit_simulation`.
 
 ### Plots
 
