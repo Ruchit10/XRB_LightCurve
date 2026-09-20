@@ -28,7 +28,7 @@ ACIS response (override with `--rmf/--arf`, optional `--bkg`), copies the RMF
 and ARF next to the fake PHA so the output directory is self-contained, and
 prints, per band, the model flux, the fake count rate and their ratio. That
 ratio is the `--flux-per-rate` the light-curve generator needs. Without HEASoft, use an
-existing table (`temp/flux_vs_nH_tbabs_broad.csv`) and the default factor
+the tracked table (`synthetic_data/flux_vs_nH_tbabs_broad.csv`) and the default factor
 `1.13e-11` erg cm⁻² s⁻¹ per count s⁻¹ (the broad-band `flux_t/rate` of Chandra
 ObsID 15803; other observations span 0.85–1.49e-11).
 

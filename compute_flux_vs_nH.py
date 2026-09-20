@@ -21,7 +21,7 @@ conda environment. Everything else needs only numpy, pandas and matplotlib
 (`utils.utils` is numpy/pandas only, so this script never imports numba).
 
 Example:
-  python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec --model tbabs \\
+  python compute_flux_vs_nH.py --specdir spectra/ic10x1 --model tbabs \\
       --band broad --out_csv flux_vs_nH_broad.csv --out_png flux_vs_nH_broad.png \\
       --nH_min 1e20 --nH_max 1e24 --nH_points 60
 
@@ -334,8 +334,9 @@ def main():
         description="Tabulate the model flux vs nH with XSPEC ({phabs,tbabs,wabs}*powerlaw)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--specdir", type=str, default=os.path.join(os.getcwd(), "data", "IC10X1_spec"),
-                        help="Directory containing the PHA/PI (+ background, RMF, ARF) spectrum files")
+    parser.add_argument("--specdir", type=str, required=True,
+                        help="Directory containing the PHA/PI (+ background, RMF, ARF) spectrum files, "
+                             "e.g. the output directory of synthetic_data/make_spectrum.py")
     parser.add_argument("--model", type=str, choices=ABSORPTION_MODELS, default="tbabs",
                         help="Absorption model, multiplied by a power law")
     parser.add_argument("--statistic", type=str, choices=["chi", "cstat"], default="chi",

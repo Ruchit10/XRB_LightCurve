@@ -1041,34 +1041,34 @@ documented ones.
 
 ## Data layout
 
-```
-data/
-├── IC10X1_spec/                     spectra (PHA/PI + RMF/ARF + background)
-├── ind_spectrum/                    per-observation spectra
-├── IC_10_X1_LC/                     original + converted light curves
-│   ├── {Broad,Soft,Hard}/           original FITS-masquerading-as-.txt
-│   ├── {Broad,Soft,Hard}_converted/ plain text after FITS conversion
-│   └── {Broad,Soft,Hard}_with_flux/ + FLUX / FLUX_ERR columns
-├── IC_10_X1_LC_CIAO/                CIAO-reduced, preferred input
-│   ├── {broad,soft,medium,hard,ultra_soft}/
-│   │     <obsid>_100s_<band>_data_plus_flux.txt
-│   │     └── single/                single-observation subsets (e.g. 15803)
-└── combined_flux/                   pre-folded combined light curves
-```
+The repository distributes **synthetic data only**. The Chandra light curves
+and spectra of IC 10 X-1 that the model was developed on stay on the author's
+disk under `data/` (ignored by git, see `.gitignore`), together with the real
+fit results in `mcmc_results/`; a companion paper will publish those fits. What
+is tracked is `synthetic_data/`: the example flux table
+`flux_vs_nH_tbabs_broad.csv` (TBabs × power law with the IC 10 X-1 spectral
+parameters, 1001 `nH` points from 1e15 to 1e26 cm⁻², the table the tests and
+examples use) and whatever synthetic light curves, tables and truth records
+the generators write there (the blanket `*.csv`/`*.txt`/`*.json` ignore rules
+are negated under `synthetic_data/`).
 
-CIAO file columns: `dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t`
-(no `flux_t_err` — derived, see above). ObsIDs in play: 3953, 7082, 8458,
-11080–11086, 15803, 26188 (+ 29793). 15803 (~1.73 d, longer than one orbit) is
-the only observation containing a complete clean eclipse, which makes it the
-natural single-observation test case.
+The loaders accept three file layouts, all whitespace-delimited `*.txt`:
 
-Time-averaged count rates (cts/s): broad 0.1132, soft 0.0635, hard 0.0497.
+| Layout | Columns | Notes |
+| ------ | ------- | ----- |
+| CIAO (real light curves) | `# Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t` | `flux_t = rate × c`; no `flux_t_err` (derived from `rate_err`); exposure recovered as `counts / rate`; a zero-count row cannot be told from a GTI gap. |
+| Synthetic | CIAO columns + `exposure` | Written by `synthetic_data/make_lightcurve.py`; zero-count rows are known to be observed. |
+| Legacy | `TIME COUNTS COUNT_RATE COUNT_RATE_ERR EXPOSURE NET_COUNTS NET_RATE ERR_RATE FLUX FLUX_ERR` | `EXPOSURE` used directly; `EXPOSURE = 0` rows dropped as unobserved. |
+| Headerless | `time rate [error]` | Seconds since MJDREF; no counts, so inverse-variance bins. |
 
-Conversion pipeline for the legacy `IC_10_X1_LC` layout (run from the
-repository root): `utils/convert_fits_to_txt.py` → `utils/add_flux_simple.py`,
-with the time-averaged count rates from `utils/get_average_count_rates.py`
-turned into a flux conversion factor by `flux / rate` from the XSPEC fit. The
-CIAO layout needs none of this.
+`--data-dir` takes a directory of such files or a parent with `{band}/`,
+`{band}/single/` or `{Band}_with_flux/` sub-folders. Phase is always
+recomputed from the time column with `REF_EPOCH` / `ORBITAL_PERIOD`
+(IC 10 X-1 ephemeris; change the constants in `utils/utils.py` for another
+system). The one-off scripts that produced the legacy layout from CIAO FITS
+products (`convert_fits_to_txt.py`, `add_flux_simple.py`,
+`get_average_count_rates.py`) and the author's command log
+(`rkp_run_w_mcmc_cmds.sh`) live in `extras/`, untracked.
 
 ---
 
@@ -1135,7 +1135,7 @@ Per `(band, wind_model)` in `--output-dir`, prefixed `{band}_{wind_model}_`:
 
 ```bash
 # 1. Build the XSPEC flux-vs-nH table, one band per file (needs XSPEC / henv)
-python compute_flux_vs_nH.py --specdir ./data/IC10X1_spec --model tbabs \
+python compute_flux_vs_nH.py --specdir spectra/ic10x1 --model tbabs \
     --band broad \
     --out_csv flux_vs_nH_tbabs_broad.csv --out_png flux_vs_nH_tbabs_broad.png \
     --nH_min 1e20 --nH_max 1e24 --nH_points 60
@@ -1148,7 +1148,7 @@ python xrb_lightcurve.py --flux_method interpolate \
 
 # 3. Fold the data and χ²-fit that one model (phase shift free; flux never rescaled)
 python chandra_phase_analysis.py \
-    --data-dir data/IC_10_X1_LC_CIAO/broad \
+    --data-dir lightcurves/broad \
     --obs-column flux_t --time-column t_raw \
     --fit --sim-file sim_broad.csv --fit-phase-shift \
     --smooth --n-phase-bins 100 --output fit_broad.png
@@ -1156,7 +1156,7 @@ python chandra_phase_analysis.py \
 # 4. MCMC — geometry only, adaptive constant-SNR bins
 python mcmc_lightcurve_fit.py --band broad \
     --flux-csv flux_vs_nH_tbabs_broad.csv \
-    --data-dir data/IC_10_X1_LC_CIAO \
+    --data-dir lightcurves \
     --obs-column flux_t --time-column t_raw \
     --wind-model smooth_pl --reparam --likelihood chi2 \
     --counts-per-bin 100 --sampler zeus --dth 4.0 \
@@ -1166,7 +1166,7 @@ python mcmc_lightcurve_fit.py --band broad \
 # 5. MCMC — Kepler masses + wind shape + scattered-flux floor
 python mcmc_lightcurve_fit.py --band broad \
     --flux-csv flux_vs_nH_tbabs_broad.csv \
-    --data-dir data/IC_10_X1_LC_CIAO \
+    --data-dir lightcurves \
     --obs-column flux_t --time-column t_raw \
     --wind-model smooth_pl --fit-wind-shape --kepler --fit-scatter \
     --likelihood jitter --counts-per-bin 100 \
@@ -1179,7 +1179,7 @@ python mcmc_lightcurve_fit.py --band broad \
 # 6. Raw unbinned + jitter (no binning at all)
 python mcmc_lightcurve_fit.py --band soft \
     --flux-csv flux_vs_nH_tbabs_soft.csv \
-    --data-dir data/IC_10_X1_LC_CIAO \
+    --data-dir lightcurves \
     --obs-column flux_t --time-column t_raw \
     --no-phase-bin --likelihood jitter --wind-model smooth_pl \
     --output-dir mcmc_results/soft/raw_jitter
@@ -1202,7 +1202,7 @@ python mcmc_lightcurve_fit.py --replot --output-dir mcmc_results --smooth --smoo
 #    For a stamped result whose run config is missing, pass the original
 #    options once; a config is then written automatically for next time.
 python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv \
-    --data-dir data/IC_10_X1_LC_CIAO --obs-column flux_t --time-column t_raw \
+    --data-dir lightcurves --obs-column flux_t --time-column t_raw \
     --wind-model smooth_pl --counts-per-bin 100 \
     --replot --compute-bic --output-dir mcmc_results/broad/smooth_pl/geom
 ```
@@ -1241,22 +1241,21 @@ MCMC fitter; the other scripts show a window only when `--output` is omitted.
 ### Utilities (`utils/`)
 `utils/` is a package (`__init__.py`). Two modules are library code imported by
 the analysis scripts — `utils.py` and `plot_utils.py` (see Core above).
-`test_flux_methods.py` is the regression test. `CHANDRA_BANDS` in `utils.py`
+`test_flux_methods.py` is the regression test (it runs on the tracked
+`synthetic_data/flux_vs_nH_tbabs_broad.csv`). `CHANDRA_BANDS` in `utils.py`
 is the single definition of the energy bands used by the flux-table generator,
-the synthetic-data scripts and the plot labels. The rest are standalone
-one-time data-prep scripts for the legacy `IC_10_X1_LC` layout, not part of
-the package API: `convert_fits_to_txt.py`, `add_flux_simple.py`,
-`get_average_count_rates.py` (`add_flux_to_lightcurves.py`, which failed on
-the converted layout and duplicated `add_flux_simple.py`, was removed in
-Phase 34).
+the synthetic-data scripts and the plot labels.
 
-### Scripts, references, untracked
-`rkp_run_w_mcmc_cmds.sh` — the worked command sequence. Reference PDFs:
-`Wind_Density.pdf` (profile equations), `stu2151.pdf` (Laycock et al. 2015),
-`manuscript_1.pdf` (2017 MS thesis). `paper/` — MDPI *Algorithms* manuscript
-skeleton and bibliography. Untracked and local only: `notebooks/` (predate
-Phases 31–33), `chandra_analysis_combined_flux.py` (see Known rough edges),
-`utils/benchmark_mcmc_performance.py`, `.cursor/plans/`, `temp/`, `legacy_r_code/`.
+### Not part of the release (on disk, ignored by git)
+`.gitignore` lists them: `data/` (Chandra light curves, spectra, responses),
+`mcmc_results/` (real fits), `notebooks/` (exploratory notebooks predating
+Phases 31–33, still calling removed functions), `legacy_r_code/` (the original
+R implementation), `extras/` (the legacy-layout conversion scripts and
+`rkp_run_w_mcmc_cmds.sh`), `temp/` (scratch), `paper/` (the MDPI *Algorithms*
+manuscript source), the reference PDFs (`Wind_Density.pdf`, `stu2151.pdf`,
+`manuscript_1.pdf`) and editor state. Earlier commits on this branch still
+contain the real light curves and the notebooks; a public release should
+start from fresh history or rewrite it.
 
 ### Documentation
 | File | Contents |
@@ -1274,11 +1273,12 @@ Phases 31–33), `chandra_analysis_combined_flux.py` (see Known rough edges),
   orbital-plane normal, so those chains store the complement of what the model
   expects. New run configs carry `"inclination_convention":
   "i0-from-orbital-normal"` and `--replot` warns when the stamp is absent; the
-  fix is to refit. The notebooks still pass old-convention `--i0` /
-  `--prior-i0` values (`rkp_run_w_mcmc_cmds.sh` has been updated).
-- **The notebooks have not been updated** for the `lam` / `broken_pl` /
-  `beta_law` / `legacy` removals. `notebooks/xrb_model_analysis_single_15803.ipynb`
-  in particular calls the deleted `compute_surface_density`.
+  fix is to refit. The (untracked) notebooks still pass old-convention `--i0`
+  / `--prior-i0` values (`extras/rkp_run_w_mcmc_cmds.sh` has been updated).
+- **The untracked notebooks have not been updated** for the `lam` /
+  `broken_pl` / `beta_law` / `legacy` removals;
+  `notebooks/xrb_model_analysis_single_15803.ipynb` in particular calls the
+  deleted `compute_surface_density`.
 - **Reference epoch is unresolved.** Laycock et al. define `T0` as the
   *mid-eclipse* time of ObsID 07082 at **phase 0.5**, whereas
   `frac((t-T0)/P)` puts it at phase 0.0. A recalibration study
@@ -1286,9 +1286,10 @@ Phases 31–33), `chandra_analysis_combined_flux.py` (see Known rough edges),
   `278800407.267`, which sits commented out beside `REF_EPOCH`. In practice the
   MCMC's per-sample phase-shift search absorbs the offset, so this mostly
   affects the interpretability of plotted phases.
-- **`.gitignore` excludes `*.csv`, `*.txt`, `*.png`**, so data, XSPEC tables,
-  and figures are not version-controlled — inputs must be regenerated or copied
-  in on a fresh clone.
+- **`.gitignore` excludes `*.csv`, `*.txt`, `*.png` everywhere except under
+  `synthetic_data/`**, so real data, XSPEC tables and figures are not
+  version-controlled; synthetic products are. A fresh clone has the example
+  flux table and needs HEASoft only to make new tables.
 - **`chandra_analysis_combined_flux.py` is an unmigrated, untracked fork.** It
   carries its own older copies of `fit_simulation`, `plot_phase` and the
   removed multi-column helpers, has no `scatter` support, and still fits a

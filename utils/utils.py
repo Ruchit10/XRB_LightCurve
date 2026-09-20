@@ -626,7 +626,7 @@ def resolve_band_directory(band: str, data_dir: str) -> str:
 
 def load_observed_lightcurves(
     band: str,
-    data_dir: str = "data/IC_10_X1_LC",
+    data_dir: str,
     flux_column: str = "FLUX",
     error_column: Optional[str] = None,
     time_column: Optional[str] = None,

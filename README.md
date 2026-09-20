@@ -92,7 +92,7 @@ Light curves are generated from column densities, so an XSPEC-derived
 
 ```bash
 python compute_flux_vs_nH.py \
-    --specdir ./data/IC10X1_spec --band broad \
+    --specdir spectra/ic10x1 --band broad \
     --out_csv flux_vs_nH_broad.csv \
     --out_png flux_vs_nH_broad.png \
     --nH_min 1e20 --nH_max 1e24 --nH_points 60
@@ -123,8 +123,8 @@ Single-model χ² fit against observed data:
 
 ```bash
 python chandra_phase_analysis.py \
-    --data-dir data/IC_10_X1_LC/Broad_with_flux/ \
-    --sim-file sim_broad.csv --obs-column FLUX \
+    --data-dir lightcurves/broad/ --obs-column flux_t --time-column t_raw \
+    --counts-per-bin 100 --sim-file sim_broad.csv \
     --fit --fit-phase-shift --output fit_broad.png --write-model
 ```
 
@@ -133,15 +133,17 @@ Full posterior via MCMC:
 ```bash
 python mcmc_lightcurve_fit.py \
     --band broad --flux-csv flux_vs_nH_broad.csv \
-    --data-dir data/IC_10_X1_LC_CIAO/broad/single/ \
+    --data-dir lightcurves/broad/ \
     --obs-column flux_t --time-column t_raw --n-phase-bins 150 \
     --wind-model smooth_pl --fit-wind-shape --fit-fopacity \
     --reparam --sampler zeus --likelihood jitter \
     --n-walkers 32 --n-steps 5000 --n-burn 500
 ```
 
-See `rkp_run_w_mcmc_cmds.sh` for the full worked sequence, and
-`python <script>.py --help` for every option.
+`lightcurves/broad/` stands for a directory of light-curve files (real CIAO
+products, or the output of `synthetic_data/make_lightcurve.py`); the
+repository ships synthetic data only. See `python <script>.py --help` for
+every option.
 
 Only the **phase shift** is fitted in the x-direction and only an *additive*
 scattered-flux floor in the y-direction. There is deliberately no
@@ -232,10 +234,11 @@ flux conversion averaged over the disk (**not** the conversion of `fl`).
 | `plot_results.py` | Standalone plots from a simulation CSV |
 | `utils/utils.py` | Data loading, phase binning, smoothing, χ² fit |
 | `utils/plot_utils.py` | All plotting routines, shared by both fit scripts |
-| `synthetic_data/` | Synthetic spectrum (PyXspec `fakeit`) and CIAO-layout light curves with a truth record, for injection–recovery tests |
-| `notebooks/` | Exploratory analysis |
-| `legacy_r_code/` | Original R implementation, kept for reference |
+| `synthetic_data/` | Synthetic spectrum (PyXspec `fakeit`) and CIAO-layout light curves with a truth record, for injection–recovery tests; also holds the tracked example flux table and generated synthetic products |
 | `changes_tracked.md` | Development history |
+
+Real Chandra data, fit results, notebooks, the original R code and one-off
+conversion scripts are kept out of the repository (see `.gitignore`).
 
 ---
 

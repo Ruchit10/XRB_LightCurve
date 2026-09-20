@@ -209,8 +209,9 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="data",
-        help="Directory containing observation text files (.txt format with time, rate, error columns).",
+        required=True,
+        help="Directory containing the observation .txt files (CIAO layout with a '# Columns:' header, "
+             "or headerless time, rate[, error] columns).",
     )
     parser.add_argument(
         "--output",

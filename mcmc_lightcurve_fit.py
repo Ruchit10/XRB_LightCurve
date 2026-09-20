@@ -1754,9 +1754,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "beta, H). Override priors via --prior-<name>.")
 
     # Data
-    parser.add_argument("--data-dir", type=str, default="data/IC_10_X1_LC",
+    parser.add_argument("--data-dir", type=str, default=None,
                         help="Light-curve directory: a direct path to .txt files, or a parent "
-                             "with {Band}_with_flux/ or {band}/single/ sub-folders.")
+                             "with {band}/, {band}/single/ or {Band}_with_flux/ sub-folders. "
+                             "Required, except with --replot (restored from the run config).")
     parser.add_argument("--obs-column", type=str, default="FLUX",
                         help="Observable column in the data files (e.g. flux_t, rate, FLUX, NET_RATE)")
     parser.add_argument("--obs-error-column", type=str, default=None,
@@ -2126,7 +2127,7 @@ def main():
         if restored_config is None:
             print(f"\nNo saved run config found in {args.output_dir} (looked for *{RUN_CONFIG_SUFFIX}). "
                   f"Using the command line and argparse defaults.")
-    for dest, flag in (('band', '--band'), ('flux_csv', '--flux-csv')):
+    for dest, flag in (('band', '--band'), ('flux_csv', '--flux-csv'), ('data_dir', '--data-dir')):
         if getattr(args, dest, None) is None:
             parser.error(f"{flag} is required (with --replot it is restored from a saved "
                          f"*{RUN_CONFIG_SUFFIX} in --output-dir, if one exists).")

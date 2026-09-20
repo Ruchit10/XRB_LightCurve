@@ -890,6 +890,28 @@ from a prior that puts half the initial ball at `-inf`; a wrapping window with
 runs against the PyXspec stand-in (response, background, `calcFlux` and
 `fakeit` semantics mirrored from the live audit); pyflakes clean.
 
+### Commit 9 — Release split: real data, notebooks, legacy and helper scripts untracked
+
+- Untracked (kept on disk, now ignored): `data/` (88 Chandra light curves of
+  IC 10 X-1 plus the spectra and responses that were never tracked),
+  `notebooks/` (4), `legacy_r_code/` (4 R files), and the one-off
+  legacy-layout conversion scripts `add_flux_simple.py`,
+  `convert_fits_to_txt.py`, `get_average_count_rates.py` together with the
+  author's command log `rkp_run_w_mcmc_cmds.sh`, moved into `extras/`.
+  `.gitignore` also covers `mcmc_results/`, `temp/`, `paper/`, `*.pdf` and
+  editor state, and negates the blanket `*.csv`/`*.txt`/`*.json` rules under
+  `synthetic_data/` so synthetic products are released.
+- Tracked: `synthetic_data/flux_vs_nH_tbabs_broad.csv`, the TBabs broad-band
+  table (IC 10 X-1 spectral parameters, 1001 points); the regression test
+  defaults to it.
+- No default points at absent data any more: `--data-dir` is required in both
+  fitters (except with `--replot`), `--specdir` in the flux-table script,
+  `--rmf`/`--arf` in the fake-spectrum generator;
+  `load_observed_lightcurves` has no default directory. Docs describe the
+  accepted file layouts and the release policy instead of the local data tree.
+- Earlier commits still carry the real light curves and the notebooks; a
+  public release should start from fresh history (or rewrite it).
+
 ### Commit 8 — Third review round: kernel occultation and quadrature, exposure-weighted bins, inference fixes
 
 Six independent reviewers (kernel numerics against quadrature and Monte

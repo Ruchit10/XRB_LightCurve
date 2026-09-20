@@ -12,9 +12,9 @@ profile that produces non-finite columns or fluxes is caught here.
 Both modes require a flux vs nH CSV produced by compute_flux_vs_nH.py.
 
 Usage:
-    python utils/test_flux_methods.py --csv data_flux_vs_nH.csv
-    python utils/test_flux_methods.py --csv data_flux_vs_nH.csv --mode interpolate
-    python utils/test_flux_methods.py --csv data_flux_vs_nH.csv --wind-model beta_law
+    python utils/test_flux_methods.py            # uses synthetic_data/flux_vs_nH_tbabs_broad.csv
+    python utils/test_flux_methods.py --mode interpolate
+    python utils/test_flux_methods.py --wind-model beta_law
 """
 
 import argparse
@@ -120,7 +120,8 @@ def main():
     )
     parser.add_argument(
         "--csv",
-        default="data_flux_vs_nH.csv",
+        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "synthetic_data", "flux_vs_nH_tbabs_broad.csv"),
         help="Path to flux vs nH CSV file from compute_flux_vs_nH.py",
     )
     parser.add_argument(

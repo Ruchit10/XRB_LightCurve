@@ -11,11 +11,12 @@ reports, for every Chandra band, the model flux, the fake count rate and their
 ratio -- the flux-per-count-rate factor that ``make_lightcurve.py`` needs
 (``--flux-per-rate``) -- and writes them to ``<out-dir>/band_factors.json``.
 
-Requires PyXspec (HEASoft). Responses default to the IC 10 X-1 combined
-ACIS response in ``data/IC10X1_spec``.
+Requires PyXspec (HEASoft) and a response pair (RMF + ARF) of the instrument
+to simulate; the responses are not distributed with the code.
 
 Example:
-  python synthetic_data/make_spectrum.py --out-dir synthetic_data/out/spec \\
+  python synthetic_data/make_spectrum.py --out-dir synthetic_data/spec \\
+      --rmf acis.rmf --arf acis.arf \\
       --model tbabs --nH 0.75 --PhoIndex 1.86 --norm 1e-4 --exposure 100000 --seed 1
   python compute_flux_vs_nH.py --specdir synthetic_data/out/spec --band broad \\
       --out_csv synthetic_data/out/flux_vs_nH_broad.csv
@@ -48,8 +49,6 @@ def _import_xspec() -> None:
     AllData, AllModels, FakeitSettings, Model, Xset = _d, _m, _s, _mo, _x
 
 ABSORPTION_MODELS = ("phabs", "tbabs", "wabs")
-DEFAULT_SPEC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "data", "IC10X1_spec")
 
 
 def band_factors(spectrum, bands) -> dict:
@@ -72,9 +71,10 @@ def main() -> None:
         description="Fake absorbed power-law spectrum via PyXspec fakeit, plus per-band flux-per-rate factors.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--out-dir", required=True, help="directory for the fake PHA (becomes --specdir)")
-    parser.add_argument("--rmf", default=os.path.join(DEFAULT_SPEC_DIR, "X1_spectrum_combined_src.rmf"),
-                        help="redistribution matrix (RMF) the fake spectrum is drawn through")
-    parser.add_argument("--arf", default=os.path.join(DEFAULT_SPEC_DIR, "X1_spectrum_combined_src.arf"),
+    parser.add_argument("--rmf", required=True,
+                        help="redistribution matrix (RMF) the fake spectrum is drawn through (the IC 10 X-1 "
+                             "work used the combined ACIS-S response X1_spectrum_combined_src.rmf, not distributed)")
+    parser.add_argument("--arf", required=True,
                         help="ancillary response (ARF, effective area) matching --rmf")
     parser.add_argument("--bkg", default=None, help="real background PHA to fake a background from (optional)")
     parser.add_argument("--model", choices=ABSORPTION_MODELS, default="tbabs",
