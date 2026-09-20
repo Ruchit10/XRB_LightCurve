@@ -44,9 +44,11 @@ nuisance parameters.
 
 **System working values:** compact-object/disk radius `r ≈ 0.001 R☉`, companion
 radius `R ≈ 2 R☉`, `d1 ≈ 11 R☉`, `d2 ≈ 8 R☉` (separation `a = d1 + d2 ≈ 19 R☉`),
-inclination `i₀ ≈ 64°` (standard convention, from the orbital-plane normal —
-equivalently 26° from the line of sight, which is how the geometry kernels
-measure it), orbital period `P = 125431 s ≈ 1.45 d`.
+inclination `i₀ ≈ 78°` (standard convention, from the orbital-plane normal —
+equivalently 12° from the line of sight, which is how the geometry kernels
+measure it; the simulator's own default is 64°), orbital period
+`P = 125431 s ≈ 1.45 d`. At these values the emitter is never geometrically
+occulted (`min l ≈ 3.9 R☉ > R + r`): the dip is wind absorption.
 
 **Adopted spectral model:** `TBabs × powerlaw` with `nH ≈ 0.75×10²² cm⁻²`,
 `Γ ≈ 1.86`, `χ²_red ≈ 1.52` (preferred over `phabs` by `Δχ² ≈ 8.5`).
@@ -148,14 +150,14 @@ what lets `wind_asymptotic_coefficient()` tie `g` to a physical mass-loss rate.
 `R_STAR_TIED_MODELS = ("beta_law", "confinement")` lists the profiles whose
 `R_star` is auto-filled from the geometry `R`.
 
-One implementation: `_g_profile(r, model_id, p1..p4)` (`@njit(cache=True,
+One implementation: `_g_profile(r, model_id, p1..p3)` (`@njit(cache=True,
 inline="always")`, scalar, used inside the kernel) and the thin array wrapper
 `evaluate_g_profile(r, wind_model, wind_params)` → `_g_profile_array`, which
 loops over the same compiled function, so helpers and notebooks cannot drift
 from the kernel.
 
 `pack_wind_params(wind_model, wind_params)` flattens a dict into
-`(model_id, p1, p2, p3, p4)` at the Python/Numba boundary (validating required
+`(model_id, p1, p2, p3)` at the Python/Numba boundary (validating required
 keys), so nothing dict-shaped enters the hot loop.
 `default_wind_params(wind_model, R)` supplies sensible starting values.
 
@@ -197,10 +199,13 @@ already agreed only to trig round-off (≤ 2e-15, 6e-13 for rays grazing a
 The pre-Phase-33 kernel used `360/d2h + 1` rings, so the θ = 360° ring
 duplicated θ = 0° (sector 0 carried double weight, `ΣA = 61/60` of the area),
 and tested visibility at the sector's leading edge while integrating at its
-centre. Removing both changes fluxes by ≤ 1e-5 for a point-like emitter and
-by a few per cent in partial-eclipse phases of a large emitter; a resolution
-study shows the new kernel is closer to the converged answer at every `d2h`
-and that both converge to the same limit.
+centre. Both are gone. The occultation test is made at the centre of each
+radial segment, the point its impact parameter is evaluated at. Testing both
+bounding radii instead (the Phase-33 rule) dropped every segment straddling
+the limb, which left the visible area and mean column of a partially eclipsed
+extended emitter 40–60 % low at `r ~ R` at every `d2h`; against a Monte Carlo
+of the disc the centre test is within ~1 %. Irrelevant for the default
+`r = 0.001 R☉`, whose partial phases span 0.006° and are never sampled.
 
 **Quadrature — `_los_gl_quadrature`.** The LOS integral
 `∫_{-∞}^{z_start} g(√(b²+z²)) dz` is evaluated by 16-point Gauss-Legendre
@@ -211,10 +216,16 @@ quadrature under the substitution `u = arctan(z/b)`:
 ```
 
 This maps the slowly decaying `r^-2` tail onto a bounded, smooth integrand on a
-finite interval, so 16 fixed nodes give high accuracy for any profile and any
-impact parameter — the full `z`-tail is always integrated, with no cutoff radius
-to choose and no special-casing of `b` vs `Rb`. Nodes and weights are module
-constants (`_GL16_X`, `_GL16_W`).
+finite interval, so 16 fixed nodes give better than 1e-5 for `smooth_pl` and
+`confinement` at any impact parameter — the full `z`-tail is always
+integrated, with no cutoff radius to choose and no special-casing of `b` vs
+`Rb`. The `beta_law` profile diverges at the photosphere, so a ray grazing the
+limb (`b − R⋆ < 0.3 R☉`) has an integrand peaked at closest approach that 16
+nodes over the whole interval under-resolve (−30 % at `b − R⋆ = 0.01`, −90 %
+at 0.001); such rays are integrated piecewise around the peak (`_gl_piece`),
+which brings the error below 1e-7 against adaptive quadrature. Rays that cross
+the photosphere (`b < R⋆`) have a divergent column and are opaque either way.
+Nodes and weights are module constants (`_GL16_X`, `_GL16_W`).
 
 **Numba is a hard requirement.** The module raises `ImportError` at import if it
 is missing. There is no trapezoid fallback: the kernel is also the only path
@@ -225,8 +236,10 @@ understates eclipse-core leakage.
 orientation-level approximation only: fitted with equal weights in log space
 over a table spanning many decades, it misses the low-`nH` plateau by ~2× for
 the broad band; `interpolate` is the quantitative path.) `_cell_flux_loglog` (linear
-interpolation in log–log space with end-segment extrapolation, the column
-clipped to `[1e-6, 1e6] × 1e22`) and `_cell_flux_exp` (`A·e^{-B·N}`) each take
+interpolation in log–log space, extrapolated from the upper end segment and
+held at the first tabulated flux below the table — absorption cannot exceed 1,
+and extrapolating the first segment returned up to 28 % above the plateau for
+tables starting at 0.01 — with the column clipped to `[1e-6, 1e6] × 1e22`) and `_cell_flux_exp` (`A·e^{-B·N}`) each take
 the kernel's per-cell columns and areas and return the area-averaged flux per
 phase in one `prange` pass; the former reproduces the previous
 `scipy.interp1d` path to 5e-15.
@@ -313,9 +326,11 @@ its `flux_{band}_{flux_type}` columns.
 - `interpolate` — **default.** Log-log interpolation of the XSPEC `flux vs nH`
   table.
 - `refit` — `A·e^{-B·nH}` fitted to the table in log space (`fit_exponential`,
-  a plain least-squares line fit, once per table and then cached). Smoother, at
-  the cost of a small systematic error where the true curve departs from a
-  single exponential.
+  a plain least-squares line fit, once per table and then cached). Smoother,
+  but a single exponential cannot follow a table spanning many decades: with
+  equal weights in log space it misses the low-`nH` plateau by ~2× for the
+  broad band (worse for soft). Orientation only; `interpolate` is the
+  quantitative path.
 
 `_FLUX_CACHE` (module-level, keyed by `(abs csv path, flux_type)`) holds the
 cleaned per-band arrays, their log10 grids for the compiled interpolator and the
@@ -398,17 +413,32 @@ observable *is* the rate), and `counts`.
 **`flux_t` error derivation.** CIAO files carry `flux_t` but no `flux_t_err`.
 When no error column matches, `_derive_err_from_rate_err` derives per-row errors
 proportionally, `err = rate_err · (flux_t / rate)`, falling back to a file-level
-`cf = median(flux_t/rate)` for rows where `rate ≤ 0`. Output is normalized to
-`time, rate, error, counts, phase, obs`. `load_data()` concatenates a directory
-of `*.txt`.
+`cf = median(flux_t/rate)` for rows where `rate ≤ 0`. An error column whose
+median is a thousand times the observable's (`--obs-error-column rate_err`
+with `flux_t`) is refused as a unit mismatch. Output is normalized to
+`time, rate, error, counts, exposure, phase, obs`: the exposure per row comes
+from an `EXPOSURE`/`EXPTIME` column when present, else from `counts / rate`
+(zero-count rows take the file's median exposure); an `mjd` time column is
+converted to seconds since `MJDREF_CHANDRA` before the ephemeris.
+`load_data()` concatenates a directory of `*.txt`.
 
 ### Binning
 
 Two mutually exclusive binners, both reducing each bin with the shared
-`weighted_mean(values, errors)` (inverse-variance mean, `error = √(1/Σw)`).
-The binners receive errors that `sanitize_errors` has already repaired (both
-loaders run it before binning) and raise on an invalid one; without any error
-column they fall back to the mean and `std/√n` of each bin, which both fitters
+`bin_estimate(values, errors, exposure)`. With an exposure per row (count
+data) the bin is the **exposure-weighted mean** `Σ(v t)/Σt` with the propagated
+error `√Σ(t e)²/Σt`, which for `v = cN/t`, `e = c√N/t` is `c ΣN/Σt` with error
+`c √ΣN/Σt` — the estimate one long exposure would give. Weighting rows by their
+own Poisson errors instead (`1/e² ∝ t²/N`) made every bin the harmonic mean of
+its counts, low by ~1/λ: −25 % at 3 counts per row, −12 % at 10, −6 % at 20
+(measured −6 % to −27 % on synthetic data, 0.72 in-eclipse on the real broad
+light curve), and it turned a zero-count row into infinite weight or, after
+error repair, into a row weighted like any other. Zero-count rows now
+contribute exposure and no variance; a bin without any counts gets error 0,
+which the fitters' `sanitize_errors` pass turns into the median bin error.
+Without an exposure the binners repair the row errors themselves and take the
+inverse-variance mean (`weighted_mean`); without any error column they fall
+back to the mean and `std/√n` (ddof = 1) of each bin, which both fitters
 report with a warning (the χ² is then computed against scatter-derived errors,
 which only `--no-phase-bin` refuses outright):
 
@@ -421,9 +451,11 @@ which only `--no-phase-bin` refuses outright):
   *constant-counts* bins. Points are sorted by phase and accumulated greedily
   until each bin holds `counts_per_bin` counts, giving every binned point roughly
   equal Poisson weight (100 counts ⇒ SNR ≈ 10) and letting low-signal eclipse
-  troughs merge into wide bins instead of many noisy narrow ones. Same weighted
-  mean; additionally returns counts-weighted `phase` center, `total_counts`,
-  `n_points`, and `phase_lo`/`phase_hi`/`width` for horizontal error bars. A
+  troughs merge into wide bins instead of many noisy narrow ones. Same bin
+  estimate; additionally returns the exposure-weighted `phase` centre (where
+  the telescope looked, not where the counts were), `total_counts`,
+  `n_points`, `exposure`, and `phase_lo`/`phase_hi`/`width` for horizontal
+  error bars. A
   trailing under-target bin is merged into its predecessor. The counts must be
   finite, non-negative and not all zero, otherwise it raises: a NaN or
   all-zero column never reaches the target and used to collapse the whole
@@ -493,7 +525,7 @@ Shared by both the single-model and MCMC plot paths:
   model at the observed phases), which is what lets the MCMC path and the
   tabulated-simulation path share it. Observations get error bars when binned
   and a light scatter when not; adaptive-bin widths become horizontal error
-  bars; an optional Gaussian-smoothed green curve carries its MC band. Becomes a
+  bars; an optional Gaussian-smoothed green curve carries its analytic 1σ band. Becomes a
   2-panel figure (3:1 height ratio, shared x) with a normalized-residual panel
   whenever a model *and* errors are present. The title is only the energy band
   and χ²/dof. An optional `obs_group` splits the data into one series per
@@ -501,11 +533,9 @@ Shared by both the single-model and MCMC plot paths:
 - **`plot_phase(...)`** — the DataFrame/`sim_df` adapter over
   `plot_lightcurve_fit`: it interpolates the model at `shift` and `scatter`, then
   delegates. A coherent, non-zero-centered residual band is the diagnostic
-  signature of a flux-normalization mismatch. Note `scatter` and `shift` must
-  match the `fit_simulation` call — if a `chi2` is passed for display,
-  `plot_phase` recomputes it from the curve it drew and **warns** when the two
-  disagree by >1 %, so a mismatch surfaces immediately instead of printing a
-  plausible number over the wrong curve.
+  signature of a flux-normalization mismatch. `scatter` and `shift` must match
+  the `fit_simulation` call; both fitters pass the values they fitted, so the
+  χ² in the title belongs to the curve drawn.
 - `detect_flux_columns()` lists the `nfl_*` columns of a simulation CSV — the
   CLI uses the single one present unless `--sim-column` names it;
   `band_label_from_column("nfl_soft") -> "SOFT"` supplies the title label.
@@ -533,7 +563,7 @@ wind-shape parameters.
 
 `FitData` bundles the observed arrays the likelihood needs (`phase`, `flux`,
 `err`, `err2`, bin widths) and the precomputed `PhaseShiftSearch` (`None` when
-the shift is held at 0).
+the shift is held fixed at `fixed_shift`).
 
 ### Parameterization: `ParamSpec`
 
@@ -657,8 +687,13 @@ curve exactly. The registries are checked against `xrb_lightcurve` at import
 ### Per-sample phase-shift alignment
 
 On by default. Rather than trusting the ephemeris to align model and data,
-*every* likelihood call searches for the phase shift that minimizes weighted χ²
-with `utils.best_phase_shift`, the same routine `fit_simulation` uses:
+*every* likelihood call searches for the phase shift that maximizes the
+likelihood being sampled, with `utils.best_phase_shift`, the same routine
+`fit_simulation` uses (the objective is the weighted χ² under the `chi2`
+likelihood; under `jitter` it is `Σ[(d−m)²/s² + ln s²]` with `s² = σ² +
+(f·m)²`, so the profiled shift is the jitter likelihood's own — profiling it on
+the classical χ² instead differed by 16 log-units and 0.007 in phase at
+`f = 0.45`):
 
 1. One `np.interp` over the precomputed `(n_grid, n_obs)` matrix of shifted
    observed phases gives χ² at every coarse shift. The coarse step must not
@@ -739,16 +774,24 @@ which resolves the band directory through `resolve_band_directory` (tries, in
 order: `data_dir` itself, `data_dir/{Band}_with_flux/`,
 `data_dir/{band}/single/`, `data_dir/{band}/`), reads via `utils.load_data`,
 remaps to `time, flux, flux_err, obs_id, phase` (plus `counts` only when the
-files carry it: an all-NaN column would pass the constant-counts binner's
-presence check), and drops non-positive / non-finite flux rows (mostly
-zero-exposure GTI gaps, which carry no information and would make
-`σ²_eff ≈ 0` degenerate under the jitter likelihood). `--keep-zero-flux`
-keeps the `flux ≤ 0` rows instead: 15 % of the in-eclipse CIAO bins are
-genuine zero-count 100 s bins, and dropping them raises the eclipse-window
-mean — the `f_scatter` prior centre — by 18 %. Kept rows have zero errors,
-which `sanitize_errors` replaces by the median valid error.
-Both fitters apply the same rule through `drop_invalid_flux_rows`
-(non-finite rows always go; `≤ 0` rows unless `--keep-zero-flux`). The loader
+files carry them: an all-NaN column would pass the constant-counts binner's
+presence check), drops rows with a zero or undefined exposure (nothing was
+observed; only possible when the file states the exposure) and non-finite
+flux rows, and drops `flux ≤ 0` rows unless `--keep-zero-flux`. The zero rows
+of a CIAO-layout file are ambiguous: of the 374 zero-count rows of the broad
+light curves, 235 are GTI gaps with `EXPOSURE = 0` in the legacy layout and 139
+are observed empty bins, and the CIAO layout carries no exposure to tell them
+apart — hence the choice. For Poisson count data whose exposure is known an
+observed empty bin is a measurement the exposure-weighted bin needs (dropping
+zeros biases the faintest bins high, +30 % at one count per row), so the
+synthetic generator writes an `exposure` column and synthetic data are fitted
+with `--keep-zero-flux`; the loader prints a note when it drops observed zero
+bins. On the real broad light curve 15 % of the in-eclipse bins are genuine
+zero-count 100 s bins, and dropping them raises the eclipse-window mean — the
+`f_scatter` prior centre — by 18 %. Row errors are kept as read (a zero error
+is a zero-count row to the exposure-weighted binner); `sanitize_errors` runs
+on whatever enters the χ², after binning. Both fitters apply the same rules
+through `drop_unobserved_rows` and `drop_invalid_flux_rows`. The loader
 then applies the `--phase-window`, bins (constant-counts bins are formed along
 the phase measured from the window's lower bound, so a wrapping window never
 merges the points on either side of its seam), builds the `FitData`, and
@@ -765,9 +808,10 @@ Binning mode is chosen by argument presence, not a mode flag:
 | neither | 50 fixed-width bins (backward-compatible default) |
 
 Supplying both `--n-phase-bins` and `--counts-per-bin` is an error. Errors are
-repaired once, by `sanitize_errors` (median valid error, with a warning),
-before binning; unbinned data without any valid error is rejected, and binned
-data without an error column proceed on `std/√n` bin errors with a warning.
+repaired once, by `sanitize_errors` (median valid error, with a warning), on
+the values that enter the χ² — the bins, or the rows under `--no-phase-bin`;
+unbinned data without any valid error is rejected, and binned data without an
+error column proceed on `std/√n` bin errors with a warning.
 
 ### Argument validation
 
@@ -795,7 +839,8 @@ values restored by `--replot`. The rules, all `parser.error` (exit 2):
   `--smooth-sigma` without `--smooth`; `--csv-chunk-size` with
   `--no-csv-output`; `--numba-threads-per-worker` without a pool; sampling
   options (`--n-walkers`, `--n-steps`, `--n-burn`, `--sampler`, `--n-threads`,
-  `--seed`, …) together with `--replot`; fit-only options (`--sim-file`,
+  …) together with `--replot` (`--seed` is accepted there: the χ² subsample
+  and the wind-profile draws are random); fit-only options (`--sim-file`,
   `--sim-column`, `--fit-phase-shift`, `--phase-shift`, `--scatter`,
   `--write-model`) without `--fit` in the tabulated fitter.
 - **Ranges:** `--n-walkers` even and ≥ 2·n_dim (emcee's requirement, checked
@@ -815,13 +860,18 @@ values restored by `--replot`. The rules, all `parser.error` (exit 2):
   effective independent samples, convergence flag (`n_steps > 50·max τ`).
 - `run_arviz_diagnostics` — ArviZ summary (`r_hat`, `ess_*`, `mcse_*`, HDI),
   written to `*_arviz_summary.csv`. Version-agnostic via `_build_inference_data`.
-- `compute_bic_metrics` — `BIC = k·ln n - 2 ln L̂`, with `k` the sampled
-  dimensions plus the profiled phase shift (the count `degrees_of_freedom`
-  uses), `n = len(obs_flux)` *after* binning/filtering, and `L̂` evaluated by
-  calling the run's actual likelihood at the same point estimate the overlays
-  use (`point_estimate_theta`: MAP, `theta_source = map_log_prob`; medians only
-  when no log-probabilities exist, `median_fallback`). BIC is the model-comparison metric;
-  `ΔBIC` is reported relative to the best model in the run. Enable with
+- `compute_bic_metrics` — `BIC = k·ln n − 2 ln L̂`, with `k` the sampled
+  dimensions (including `log_f` under `jitter`) plus the profiled phase shift
+  (`degrees_of_freedom` also counts the shift but excludes `log_f`),
+  `n = len(obs_flux)` *after* binning/filtering, and `L̂` the **maximum
+  likelihood over the chain**: `log_prob − log_prior` is exactly each sample's
+  log-likelihood, so the best sample is free (`theta_source =
+  max_likelihood_sample`). The MAP sample maximises the posterior and can sit
+  several log-units lower in likelihood (ΔBIC 5.6 in a 30-step test). Without
+  the chain, or on a replot whose priors differ from the sampled ones, the
+  likelihood at the point estimate is used (`map_log_prob`, `median_fallback`
+  when no log-probabilities exist). BIC is the model-comparison metric; `ΔBIC`
+  is reported relative to the best model in the run. Enable with
   `--compute-bic`.
 - `compute_chi2_for_samples` (`--save-chi2`) — per-sample χ² and reduced χ²,
   gzip CSV. With the `chi2` likelihood the table is read from the chain
@@ -832,16 +882,27 @@ values restored by `--replot`. The rules, all `parser.error` (exit 2):
   (`--chi2-n-samples`).
 - `postprocess_fit` — the block shared by a fresh fit and `--replot`: ArviZ,
   BIC, corner/trace/best-fit/geometry figures, the chi2 table.
-  `write_summary` writes `mcmc_summary.txt`. `run_single_fit` writes the
-  samples CSV, the optional compact NPZ and the chain NPZ **immediately after
-  sampling**, before statistics and figures, so a plotting or ArviZ failure (or
-  a Ctrl-C) can no longer discard the chain; `--replot` needs only those files.
+  `write_summary` writes `{band}_{wind_model}_summary.txt` (a second wind
+  model in the same directory no longer overwrites the first's summary; a run
+  does overwrite its own band/model artefacts, after a warning).
+  `run_single_fit` writes the samples CSV and the chain NPZ **immediately
+  after sampling**, before statistics and figures, so a plotting or ArviZ
+  failure (or a Ctrl-C) can no longer discard the chain; `--replot` needs only
+  the chain file. Samples and log-probabilities are flattened in (step,
+  walker) order for both samplers — the order `--replot` reshapes the chain
+  into (zeus's own `flat=True` is walker-major) — and the autocorrelation
+  times and effective-sample count are computed on the post-burn-in chain.
+  Ctrl-C on a pooled run terminates the workers (they ignore SIGINT; the
+  parent handles it) instead of waiting forever on an in-flight task, and the
+  per-worker numba thread count is clamped to numba's own limit, since a Pool
+  initializer that raises makes multiprocessing respawn workers forever.
   χ²/dof values reported by the MCMC count the profiled phase shift as one
   fitted parameter, the same convention as `fit_simulation`.
 
 ### Plots
 
-All three live in `utils/plot_utils.py`.
+`plot_corner`, `plot_trace` and the drawing behind `plot_best_fit` live in
+`utils/plot_utils.py`; `plot_geometry_diagnostics` in `mcmc_lightcurve_fit.py`.
 
 - `plot_corner` — posterior corner plot with 16/50/84 quantiles.
 - `plot_trace` — per-parameter walker traces with the burn-in marker.
@@ -874,7 +935,7 @@ All three live in `utils/plot_utils.py`.
   wind shape, frozen values and the additive `f_scatter` are resolved once),
   finds the best phase shift, then hands the arrays to `plot_lightcurve_fit`.
   Result: a 2-panel (3:1) figure with the MAP overlay over the data, the optional
-  smoothed green curve + MC band, and a normalized-residual panel clipped to
+  smoothed green curve + analytic band, and a normalized-residual panel clipped to
   ±5σ. The title is only the energy band and χ²/dof; the point estimate,
   `phase_shift`, `f`, `chi2_eff/dof` and `f_scatter` are printed to stdout
   (parameter values with their 1σ come from `print_results` and the summary
@@ -943,8 +1004,8 @@ Three rules keep the restore honest (`utils.apply_saved_run_config`):
 (PHA + background + responses) from `--specdir`, fits
 `{phabs,tbabs,wabs}×powerlaw` over `--fit_emin/--fit_emax`, freezes the
 powerlaw, then sweeps `nH` over a log grid and integrates the flux of **one**
-band (`--band`, default `broad`) at each point. Emits a CSV with `nH_1e22`,
-`flux_{band}_ph`, `flux_{band}_erg` — exactly what `--flux_method interpolate`
+band (`--band`, default `broad`) at each point. Emits a CSV with `nH_cm2`,
+`nH_1e22`, `flux_{band}_ph`, `flux_{band}_erg` — exactly what `--flux_method interpolate`
 consumes. Chandra bands: `broad` 0.5–7.0, `soft` 0.5–2.0, `medium` 1.2–2.0,
 `hard` 2.0–7.0 keV. Requires PyXspec in the active environment; the earlier
 XSPEC helper scripts (`.xcm` files, model-comparison and conversion-factor
@@ -1033,11 +1094,20 @@ pipeline unchanged and the bands are `utils.utils.CHANDRA_BANDS`.
   `--n-orbits`, removes random `--gap-fraction`/`--gap-duration` blocks, and
   writes the CIAO layout `# Columns: dt, t_raw, mjd, phase, counts, rate,
   rate_err, flux_t` (`rate_err = √(counts + bkg counts)/dt`, so an empty bin
-  carries a zero error like the real files) plus `<stem>_truth.json` with every
-  injected value, `mid_eclipse_data_phase`, the bin and zero-count counts.
+  carries a zero error like the real files) plus an `exposure` column (`= dt`)
+  so the fitters know every zero-count row was observed, and
+  `<stem>_truth.json` with every injected value, `mid_eclipse_data_phase`, the
+  bin and zero-count counts. Gaps never cross a visit boundary and every visit
+  keeps at least one bin; overlapping `--visits` are refused.
 - The package README gives the spectrum → table → light curve → fit sequence.
-  On the 15803-like synthetic broad light curve the tabulated fit recovered the
-  injected shift to 0.0007 in phase. The exact degeneracies of the model apply
+  With the injected floor passed as `--scatter`, the tabulated fit recovers
+  the injected shift 0.985 as 0.9848 (constant-counts bins), 0.9852 (100
+  bins) and 0.9847 (unbinned) on a synthetic broad light curve with ten times
+  ObsID 15803's count rate (`--flux-per-rate 1e-12`), χ²/dof ≈ 1. At the real
+  count rate (~14 counts per 100 s bin) the recovery is 0.981 / 0.979 for two
+  seeds with χ²/dof ≈ 1.06: the remaining −0.005 is the Neyman bias of a χ²
+  whose weights are the observed Poisson errors (see Known rough edges), not
+  the binning. The exact degeneracies of the model apply
   to synthetic data too (`q`, and the length scale with `f_opacity`), so
   recovery is judged on `a`, `R`, `i0`, `f_opacity` jointly.
 
@@ -1057,7 +1127,7 @@ Per `(band, wind_model)` in `--output-dir`, prefixed `{band}_{wind_model}_`:
 | `*_arviz_summary.csv` | ArviZ convergence table. |
 | `*_model_metrics.csv` | `bic`, `logL_hat`, `k_params`, `n_obs`, `theta_source`. |
 | `*_chi2.csv.gz` | Per-sample χ² (`--save-chi2`). |
-| `mcmc_summary.txt` | Human-readable roll-up: run config, marginal posteriors, MAP block with a `d1+d2 == a` consistency check, reduced χ², BIC/ΔBIC, chain diagnostics. |
+| `*_summary.txt` | Human-readable roll-up per band and wind model: run config, marginal posteriors, MAP block, reduced χ², BIC/ΔBIC, chain diagnostics. |
 
 ---
 
@@ -1137,25 +1207,20 @@ python mcmc_lightcurve_fit.py --band broad --flux-csv flux_vs_nH_tbabs_broad.csv
     --replot --compute-bic --output-dir mcmc_results/broad/smooth_pl/geom
 ```
 
-> When re-plotting, pass the *same* data/binning flags as the original run —
-> `--replot` re-loads and re-bins from `args`, and BIC depends on `n_obs`.
-
 ---
 
 ## Environment
 
-Conda env `henv` (heasoft/XSPEC + Python deps). Beyond
-[requirements.txt](requirements.txt) (`numpy`, `pandas`, `matplotlib`, `scipy`,
-`emcee`, `corner`, `tqdm`), the current code also uses:
-
-- **`numba`** — **required**; `xrb_lightcurve.py` raises `ImportError` without it.
-- **`arviz`** — convergence summaries (optional; degrades gracefully).
-- **`zeus-mcmc`** — `--sampler zeus` (optional).
-- **`astropy`** — FITS conversion utilities.
-- **XSPEC Python (`pyxspec`)** — `compute_flux_vs_nH.py` only.
-
-`xrb_lightcurve.py` itself needs only numpy, pandas and numba (scipy is no
-longer imported there).
+Conda env `henv` (heasoft/XSPEC + Python deps). [requirements.txt](requirements.txt)
+lists everything pip-installable: `numpy`, `pandas`, `numba` (**required**;
+`xrb_lightcurve.py` raises `ImportError` without it), `matplotlib`, `emcee`,
+`corner`, `tqdm`, and the optional `zeus-mcmc` (`--sampler zeus`), `arviz`
+(convergence summaries) and `astropy` (FITS conversion helper). `scipy` is not
+imported directly (emcee and arviz pull it in). XSPEC Python (`pyxspec`) comes
+from HEASoft and is needed by `compute_flux_vs_nH.py` and the fake-spectrum
+generator only. Python ≥ 3.9 (the code compiles under 3.8; the practical floor
+is the numba/numpy wheels). Figures are written with the `Agg` backend by the
+MCMC fitter; the other scripts show a window only when `--output` is omitted.
 
 ---
 
@@ -1233,3 +1298,10 @@ Phases 31–33), `chandra_analysis_combined_flux.py` (see Known rough edges),
 - **`--data-dir` resolves `{band}/single` before `{band}/`**, so a parent
   directory silently selects the single-observation subset. Pass the band
   directory explicitly.
+- **χ² weights are the observed Poisson errors (Neyman's χ²).** Bins with a
+  downward fluctuation get a smaller error and more weight, which biases the
+  tabulated fit's phase shift by ≈ −0.005 at ~14 counts per 100 s bin
+  (0.981/0.979 recovered for 0.985 injected; vanishing at ten times the
+  counts). The MCMC likelihoods weight the same way. Model-based (Pearson)
+  variances or a Poisson likelihood would remove it; use more counts per bin
+  meanwhile.

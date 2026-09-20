@@ -62,9 +62,10 @@ from utils.utils import (  # noqa: E402
     periodic_model,
 )
 
-# Flux per unit count rate of the real IC 10 X-1 broad-band CIAO light curves
-# (flux_t / rate), erg cm^-2 s^-1 per count s^-1. Replace with the value
-# make_spectrum.py reports for your synthetic spectrum and band.
+# Flux per unit count rate (flux_t / rate), erg cm^-2 s^-1 per count s^-1, of
+# the broad-band IC 10 X-1 light curve of ObsID 15803 (other ObsIDs span
+# 0.85-1.49e-11). Replace with the value make_spectrum.py reports for your
+# synthetic spectrum and band.
 DEFAULT_FLUX_PER_RATE = 1.13e-11
 
 
@@ -82,18 +83,22 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
                             ("d2h", "angular cell size of the emitter grid")):
         geo.add_argument(f"--{name}", type=float, default=D[name], help=help_text)
     wind = parser.add_argument_group("Wind")
-    wind.add_argument("--wind-model", type=str, choices=list(WIND_MODEL_IDS), default=D["wind_model"])
+    wind.add_argument("--wind-model", type=str, choices=list(WIND_MODEL_IDS), default=D["wind_model"],
+                      help="wind density profile")
     shape_defaults: Dict[str, float] = {}
     for model in WIND_MODEL_IDS:
         shape_defaults.update({k: v for k, v in default_wind_params(model, D["R"]).items() if k != "R_star"})
     for name, value in shape_defaults.items():
-        wind.add_argument(f"--{name}", type=float, default=value,
-                          help=f"shape parameter of {[m for m, keys in WIND_MODEL_PARAM_KEYS.items() if name in keys]}")
+        owners = ", ".join(m for m, keys in WIND_MODEL_PARAM_KEYS.items() if name in keys)
+        wind.add_argument(f"--{name}", type=float, default=value, help=f"shape parameter of the {owners} profile")
     wind.add_argument("--mdot", type=float, default=D["mdot"], help="mass-loss rate (Msun/yr)")
     wind.add_argument("--v-inf", type=float, default=D["v_inf"], help="terminal velocity (km/s)")
     wind.add_argument("--mu-wind", type=float, default=D["mu_wind"], help="mean mass per H-equivalent nucleus")
     wind.add_argument("--f-opacity", type=float, default=D["f_opacity"], help="effective-opacity factor")
-    parser.add_argument("--flux-method", type=str, choices=["interpolate", "refit"], default=D["flux_method"])
+    parser.add_argument("--flux-method", type=str, choices=["interpolate", "refit"], default=D["flux_method"],
+                        help="nH -> flux conversion: table interpolation or the fitted exponential")
+    parser.add_argument("--flux-type", type=str, choices=["erg", "ph"], default=D["flux_type"],
+                        help="table column to use: energy flux (erg) or photon flux (ph)")
 
 
 def simulation_kwargs(args) -> Dict[str, object]:
@@ -102,7 +107,7 @@ def simulation_kwargs(args) -> Dict[str, object]:
     if "R_star" in WIND_MODEL_PARAM_KEYS[args.wind_model]:
         wind_params["R_star"] = args.R
     return dict(r=args.r, R=args.R, d1=args.d1, d2=args.d2, i0=args.i0, gma0=args.gma0,
-                dth=args.dth, d2h=args.d2h, flux_method=args.flux_method,
+                dth=args.dth, d2h=args.d2h, flux_method=args.flux_method, flux_type=args.flux_type,
                 flux_csv_path=args.flux_csv, band=args.band, wind_model=args.wind_model,
                 wind_params=wind_params, mdot=args.mdot, v_inf=args.v_inf,
                 mu_wind=args.mu_wind, f_opacity=args.f_opacity)
@@ -110,41 +115,60 @@ def simulation_kwargs(args) -> Dict[str, object]:
 
 def parse_visits(spec: str | None, t_start: float, n_orbits: float) -> List[Tuple[float, float]]:
     """``start:duration,start:duration,...`` in seconds after REF_EPOCH, or one
-    visit of *n_orbits* orbits starting at *t_start*."""
+    visit of *n_orbits* orbits starting at *t_start*. Visits must not overlap."""
     if not spec:
+        if n_orbits <= 0:
+            raise ValueError("--n-orbits must be > 0")
         return [(float(t_start), float(n_orbits) * ORBITAL_PERIOD)]
     visits = []
     for item in spec.split(","):
-        start, duration = item.split(":")
-        start, duration = float(start), float(duration)
+        parts = item.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"visit '{item}': expected start:duration (seconds after REF_EPOCH)")
+        try:
+            start, duration = float(parts[0]), float(parts[1])
+        except ValueError:
+            raise ValueError(f"visit '{item}': start and duration must be numbers") from None
         if duration <= 0:
             raise ValueError(f"visit '{item}': duration must be > 0")
         visits.append((start, duration))
-    return sorted(visits)
+    visits.sort()
+    for (s0, d0), (s1, _) in zip(visits, visits[1:]):
+        if s1 < s0 + d0:
+            raise ValueError(f"visits overlap: {s0}:{d0} and {s1}:...; timestamps would repeat")
+    return visits
 
 
-def visit_times(visits: List[Tuple[float, float]], dt: float) -> np.ndarray:
-    """Bin start offsets (s after REF_EPOCH) covering every visit."""
-    blocks = [start + dt * np.arange(int(np.floor(duration / dt))) for start, duration in visits]
-    return np.concatenate(blocks)
+def visit_times(visits: List[Tuple[float, float]], dt: float) -> List[np.ndarray]:
+    """Bin start offsets (s after REF_EPOCH) of every visit, one array per visit."""
+    return [start + dt * np.arange(int(np.floor(duration / dt))) for start, duration in visits]
 
 
-def apply_gaps(t: np.ndarray, dt: float, fraction: float, duration: float, rng: np.random.Generator) -> np.ndarray:
-    """Remove random contiguous blocks of *duration* s until *fraction* of the bins is gone."""
+def apply_gaps(blocks: List[np.ndarray], dt: float, fraction: float, duration: float,
+               rng: np.random.Generator) -> np.ndarray:
+    """Remove random contiguous gaps of *duration* s from each visit until
+    *fraction* of its bins is gone; a gap never crosses a visit boundary and
+    every visit keeps at least one bin."""
     if fraction <= 0.0:
-        return t
-    keep = np.ones(t.size, dtype=bool)
+        return np.concatenate(blocks)
     n_per_gap = max(1, int(round(duration / dt)))
-    target = int(round(fraction * t.size))
-    removed = 0
-    guard = 0
-    while removed < target and guard < 100 * t.size:
-        guard += 1
-        start = int(rng.integers(0, t.size))
-        block = keep[start:start + n_per_gap]
-        removed += int(block.sum())
-        block[:] = False
-    return t[keep]
+    kept = []
+    for t in blocks:
+        keep = np.ones(t.size, dtype=bool)
+        target = int(round(fraction * t.size))
+        n_gap = min(n_per_gap, max(1, t.size - 1))          # leave at least one bin
+        removed, guard = 0, 0
+        while removed < target and guard < 100 * t.size:
+            guard += 1
+            start = int(rng.integers(0, t.size - n_gap + 1))
+            block = keep[start:start + n_gap]
+            new = int(block.sum())
+            if keep.sum() - new < 1:
+                continue
+            removed += new
+            block[:] = False
+        kept.append(t[keep])
+    return np.concatenate(kept)
 
 
 def main() -> None:
@@ -195,14 +219,18 @@ def main() -> None:
     sim = simulation_kwargs(args)
 
     # Time grid and phases exactly as the loaders compute them.
-    offsets = apply_gaps(visit_times(visits, args.dt), args.dt, args.gap_fraction, args.gap_duration, rng)
-    if offsets.size == 0:
-        parser.error("no time bins left after gaps")
+    blocks = visit_times(visits, args.dt)
+    if any(b.size == 0 for b in blocks):
+        parser.error("a visit is shorter than one --dt bin")
+    offsets = apply_gaps(blocks, args.dt, args.gap_fraction, args.gap_duration, rng)
     t_raw = REF_EPOCH + offsets
     phase = frac((t_raw - REF_EPOCH) / ORBITAL_PERIOD)
 
     # Model band flux at the observed phases: native curve, shifted, plus the floor.
-    model_phase, model_flux = simulate_band_flux(**sim)
+    try:
+        model_phase, model_flux = simulate_band_flux(**sim)
+    except (FileNotFoundError, ValueError, KeyError) as e:
+        parser.error(str(e))
     flux_true = eval_periodic(*periodic_model(model_phase, model_flux), phase,
                               shift=args.phase_shift, offset=args.scatter)
 
@@ -222,9 +250,12 @@ def main() -> None:
     header = ("# Synthetic light curve from xrb_lightcurve (synthetic_data/make_lightcurve.py)\n"
               f"# band {args.band}; wind_model {args.wind_model}; phase_shift {args.phase_shift}; "
               f"scatter {args.scatter:g}; flux_per_rate {args.flux_per_rate:g}; seed {args.seed}\n"
-              "# Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t\n# \n")
+              "# Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t, exposure\n# \n")
+    # The CIAO layout plus an explicit exposure column: with it the loaders know
+    # that a zero-count row was observed (a CIAO file cannot tell a GTI gap
+    # from an empty bin) and the binners weight rows by exposure.
     table = np.column_stack([offsets - offsets[0], t_raw, MJDREF_CHANDRA + t_raw / 86400.0, phase,
-                             counts, net_rate, rate_err, flux_t])
+                             counts, net_rate, rate_err, flux_t, np.full(offsets.size, float(args.dt))])
     with open(args.output, "w") as fh:
         fh.write(header)
         np.savetxt(fh, table, fmt="%.18e")

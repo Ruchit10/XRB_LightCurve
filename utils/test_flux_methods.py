@@ -57,7 +57,7 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
     print("=" * 60)
 
     if not os.path.exists(csv_path):
-        print(f"✗ CSV file not found: {csv_path}")
+        print(f"FAIL: CSV file not found: {csv_path}")
         return False
 
     try:
@@ -69,18 +69,18 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
             **BASE_PARAMS,
         )
     except Exception as e:
-        print(f"✗ {flux_method}/{wind_model} failed: {e}")
+        print(f"FAIL: {flux_method}/{wind_model} failed: {e}")
         import traceback
         traceback.print_exc()
         return False
 
-    print(f"✓ {flux_method}/{wind_model} completed successfully")
+    print(f"OK: {flux_method}/{wind_model} completed successfully")
     print(f"  Generated {len(results)} data points")
     print(f"  fl range: {results['fl'].min():.6g} to {results['fl'].max():.6g}"
           f"  (1e22 cm^-2)")
     flux_cols = sorted(c for c in results.columns if c.startswith("nfl_"))
     if not flux_cols:
-        print("✗ No nfl_* flux columns were produced")
+        print("FAIL: No nfl_* flux columns were produced")
         return False
     ok = True
     for col in flux_cols:
@@ -90,10 +90,10 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
         visible = ~results["is_eclipsed"].to_numpy()
         vals = results.loc[visible, col].to_numpy()
         if not (len(vals) and np.isfinite(vals).all() and (vals >= 0).all()):
-            print(f"✗ {col} has negative or non-finite values at visible phases")
+            print(f"FAIL: {col} has negative or non-finite values at visible phases")
             ok = False
     if not results.loc[~results["is_eclipsed"], "fl"].gt(0).all():
-        print("✗ fl is not strictly positive at every visible phase")
+        print("FAIL: fl is not strictly positive at every visible phase")
         ok = False
     # The likelihood path must see exactly the curve the DataFrame reports.
     phase, flux = simulate_band_flux(
@@ -103,7 +103,7 @@ def run_mode(flux_method: str, csv_path: str, wind_model: str) -> bool:
     col = flux_cols[0]
     if not (np.array_equal(phase, results["phase"].to_numpy())
             and np.array_equal(flux, results[col].to_numpy())):
-        print("✗ simulate_band_flux disagrees with the simulate_lightcurve DataFrame")
+        print("FAIL: simulate_band_flux disagrees with the simulate_lightcurve DataFrame")
         ok = False
     return ok
 
@@ -144,7 +144,7 @@ def main():
     print("TEST SUMMARY")
     print("=" * 60)
     for name, passed in results:
-        status = "✓ PASS" if passed else "✗ FAIL"
+        status = "PASS" if passed else "FAIL"
         print(f"{name:24s}: {status}")
 
     total = len(results)

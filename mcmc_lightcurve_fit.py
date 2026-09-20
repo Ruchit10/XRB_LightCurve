@@ -51,6 +51,8 @@ import argparse
 import copy
 import multiprocessing as mp
 import os
+import random
+import signal
 import sys
 import time
 import warnings
@@ -123,6 +125,9 @@ from utils.utils import (
     validate_phase_window_args,
     write_model_blocks,
 )
+import matplotlib
+matplotlib.use("Agg")   # every figure is saved to a file; no display needed (SSH, clusters)
+
 from utils.plot_utils import (
     plot_corner,
     plot_geometry_vs_phase,
@@ -686,8 +691,11 @@ def aligned_model_flux(theta, spec: ParamSpec, model: DirectLightCurveModel,
     if data.shift_search is None:
         return (eval_periodic(phase_ext, flux_ext, data.phase, shift=data.fixed_shift),
                 float(data.fixed_shift))
+    # The shift is profiled on the likelihood being sampled: with the jitter
+    # likelihood its variance term enters the search objective too.
+    jitter = np.exp(theta[spec.index('log_f')]) if spec.likelihood == 'jitter' else None
     model_at_obs, shift, _ = best_phase_shift(phase_ext, flux_ext, data.flux, data.err2,
-                                              data.shift_search)
+                                              data.shift_search, jitter_frac=jitter)
     return model_at_obs, shift
 
 
@@ -790,9 +798,18 @@ _WORKER: Dict[str, object] = {}
 
 
 def _init_worker(max_numba_threads: int, spec, priors, model, data) -> None:
-    """Pool initializer: cap Numba threads per worker and store the fit context."""
+    """Pool initializer: cap Numba threads per worker and store the fit context.
+
+    A Pool initializer must never raise: multiprocessing would respawn the
+    worker forever while the parent blocks in ``map``. Workers ignore SIGINT so
+    that a Ctrl-C reaches only the parent, which terminates the pool.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     import numba
-    numba.set_num_threads(max(1, int(max_numba_threads)))   # raises above NUMBA_NUM_THREADS
+    try:
+        numba.set_num_threads(max(1, min(int(max_numba_threads), int(numba.config.NUMBA_NUM_THREADS))))
+    except ValueError as e:
+        warnings.warn(f"numba.set_num_threads failed in a worker: {e}")
     _WORKER.update(spec=spec, priors=priors, model=model, data=data)
 
 
@@ -902,9 +919,13 @@ def run_mcmc(
     pool = None
     log_prob_fn, args = log_probability, (spec, priors, model, data)
     if n_threads > 1:
+        import numba
         cpus = int(cpu_count() or 1)
         ntb = (max(1, cpus // int(n_threads)) if numba_threads_per_worker is None
                else max(1, int(numba_threads_per_worker)))
+        # numba derives its own limit from the process affinity (a pinned
+        # cluster job may see fewer cores than cpu_count reports).
+        ntb = max(1, min(ntb, int(numba.config.NUMBA_NUM_THREADS)))
         print(f"[info] Pooled MCMC: {n_threads} worker processes, "
               f"numba.set_num_threads({ntb}) per worker (logical CPUs ~ {cpus}).")
         pool = mp.get_context("spawn").Pool(
@@ -935,13 +956,23 @@ def run_mcmc(
                     pass
             else:
                 sampler.run_mcmc(state, n_steps, progress=progress)
-    finally:
+    except BaseException:
         if pool is not None:
-            pool.close()
+            # An interrupted worker leaves its task in flight; close()/join()
+            # would then wait forever (Ctrl-C used to hang the run).
+            pool.terminate()
             pool.join()
+        raise
+    if pool is not None:
+        pool.close()
+        pool.join()
 
     elapsed = time.time() - start
-    samples = sampler.get_chain(discard=n_burn, flat=True)
+    # Flatten in (step, walker) order for both samplers: zeus's own flat=True
+    # is walker-major, which would put a fresh run's samples CSV in a different
+    # order than the chain NPZ a --replot reshapes.
+    chain_post = sampler.get_chain(discard=n_burn)
+    samples = chain_post.reshape(-1, chain_post.shape[2])
     print(f"\nMCMC completed in {elapsed:.1f} seconds ({elapsed / 60:.1f} minutes)")
     print(f"Time per step: {elapsed / n_steps * 1000:.1f} ms")
     print(f"Final chain shape: {samples.shape}")
@@ -1002,7 +1033,7 @@ def print_results(stats: Dict, spec: ParamSpec, band: str) -> None:
     print(f"\n{'=' * 60}")
     print(f"MCMC Results for {band.upper()} band - {WIND_MODELS[spec.wind_model]}")
     print('=' * 60)
-    print(f"{'Parameter':<15} {'Median':<12} {'Lower σ':<12} {'Upper σ':<12}")
+    print(f"{'Parameter':<15} {'Median':<12} {'-1 sigma':<12} {'+1 sigma':<12}")
     print('-' * 60)
     for name in spec.active_names:
         s = stats[name]
@@ -1019,8 +1050,12 @@ def print_results(stats: Dict, spec: ParamSpec, band: str) -> None:
     print('=' * 60)
 
 
-def print_diagnostics(sampler, sampler_type: str, names: List[str]) -> Dict[str, object]:
-    """Acceptance fraction, autocorrelation times and a convergence verdict."""
+def print_diagnostics(sampler, sampler_type: str, names: List[str], n_burn: int = 0) -> Dict[str, object]:
+    """Acceptance fraction, autocorrelation times and a convergence verdict.
+
+    Autocorrelation times and the effective-sample count are computed on the
+    post-burn-in chain, the part that is reported and saved.
+    """
     diag: Dict[str, object] = {}
     print("\n" + "=" * 60)
     print(f"MCMC Diagnostics  ({sampler_type})")
@@ -1033,9 +1068,9 @@ def print_diagnostics(sampler, sampler_type: str, names: List[str]) -> Dict[str,
                    "OK: acceptance in the optimal range (0.2-0.5)")
         print(f"Mean acceptance fraction: {acc:.3f}\n  {verdict}")
     try:
-        chain = sampler.get_chain()
+        chain = sampler.get_chain(discard=n_burn)
         if sampler_type == 'emcee' and hasattr(sampler, 'get_autocorr_time'):
-            tau = sampler.get_autocorr_time(quiet=True)
+            tau = sampler.get_autocorr_time(discard=n_burn, quiet=True)
         else:
             tau = np.array([emcee.autocorr.integrated_time(chain[:, :, i].mean(axis=1), quiet=True)[0]
                             for i in range(chain.shape[2])])
@@ -1048,10 +1083,10 @@ def print_diagnostics(sampler, sampler_type: str, names: List[str]) -> Dict[str,
         n_steps, n_walkers = chain.shape[0], chain.shape[1]
         n_indep = n_steps / np.max(tau)
         diag['effective_independent_samples'] = int(n_indep * n_walkers)
-        print(f"\nEffective independent samples: ~{int(n_indep * n_walkers)}")
+        print(f"\nEffective independent samples (post burn-in, {n_steps} steps): ~{int(n_indep * n_walkers)}")
         diag['converged'] = bool(n_steps >= 50 * np.max(tau))
         print("  OK: chain appears well-converged" if diag['converged']
-              else "  WARNING: chain may not be converged (fewer than 50 tau). Run longer.")
+              else "  WARNING: chain may not be converged (fewer than 50 tau post burn-in). Run longer.")
     except Exception:
         diag.update({'autocorr_time': None, 'effective_independent_samples': None, 'converged': None})
         print("\nAutocorrelation time: could not compute (chain too short)")
@@ -1085,7 +1120,7 @@ def compute_chi2_for_samples(model, spec: ParamSpec, samples: np.ndarray, data: 
               f"{' from the stored log-probabilities' if from_chain else ''}...")
     dof = degrees_of_freedom(spec, len(data.flux), data.fit_phase_shift)
     use_eff = spec.likelihood == 'jitter'
-    iterator = (tqdm(indices, desc="Computing χ²")
+    iterator = (tqdm(indices, desc="Computing chi2")
                 if (HAS_TQDM and verbose and not from_chain) else indices)
 
     rows = []
@@ -1119,12 +1154,28 @@ def compute_chi2_for_samples(model, spec: ParamSpec, samples: np.ndarray, data: 
         print(f"Chi-square data saved to: {output_path} ({os.path.getsize(output_path) / 1024:.1f} KB)")
 
 
-def compute_bic_metrics(stats: Dict, spec: ParamSpec, model, data: FitData) -> Dict[str, object]:
-    """BIC = k ln n - 2 ln L_hat at the point estimate of *stats* (MAP when
-    available, else the medians), the same point the overlays and dumps use."""
+def compute_bic_metrics(stats: Dict, spec: ParamSpec, model, data: FitData,
+                        samples: Optional[np.ndarray] = None, log_prob: Optional[np.ndarray] = None,
+                        priors: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, object]:
+    """BIC = k ln n - 2 ln L_hat.
+
+    L_hat is the maximum likelihood over the chain: ``log_prob - log_prior``
+    is exactly the log-likelihood of every sample, so the best one is free
+    (*samples*, *log_prob* and the *priors* the chain was sampled under). The
+    MAP sample maximises the posterior instead and can sit 5 log-units lower
+    in likelihood. Without the chain (or with priors that differ from the
+    sampled ones) the likelihood at the point estimate of *stats* is used."""
     theta_hat, key = point_estimate_theta(stats, spec)
     source = "map_log_prob" if key == 'map' else "median_fallback"
     logL_hat = log_likelihood(theta_hat, spec, model, data)
+    if samples is not None and log_prob is not None and priors is not None and len(samples):
+        log_prior_vals = np.fromiter((log_prior(theta, priors, spec) for theta in samples),
+                                     dtype=float, count=len(samples))
+        logL = np.asarray(log_prob, dtype=float) - log_prior_vals
+        logL = np.where(np.isfinite(logL), logL, -np.inf)
+        i_best = int(np.argmax(logL))
+        if np.isfinite(logL[i_best]) and logL[i_best] > logL_hat:
+            logL_hat, source = float(logL[i_best]), "max_likelihood_sample"
     n = int(len(data.flux))
     if n <= 0 or not np.isfinite(logL_hat):
         return {}
@@ -1392,7 +1443,14 @@ def postprocess_fit(args, spec: ParamSpec, priors: Dict, model, data: FitData,
     if chain is not None:
         run_arviz_diagnostics(chain, spec, args.output_dir, suffix)
     if args.compute_bic:
-        bic_info = compute_bic_metrics(stats, spec, model, data)
+        # log_prob - log_prior is the likelihood only under the sampled priors
+        # (same guard as the chi2 table below).
+        chain_ok = not (sampler is None and (getattr(args, '_prior_typed', False)
+                                             or any(n not in priors for n in spec.active_names)))
+        bic_info = compute_bic_metrics(stats, spec, model, data,
+                                       samples=samples if chain_ok else None,
+                                       log_prob=log_prob_flat if chain_ok else None,
+                                       priors=priors if chain_ok else None)
         if bic_info:
             stats.update(bic_info)
             print("\nBIC: {bic:.3f}  (logL_hat={logL_hat:.3f}, k={k_params:.0f}, "
@@ -1446,8 +1504,8 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
         sampler_type=args.sampler, progress=not args.quiet, n_threads=args.n_threads,
         numba_threads_per_worker=args.numba_threads_per_worker)
     fit_elapsed = float(time.time() - fit_start)
-    log_prob_flat = sampler.get_log_prob(discard=args.n_burn, flat=True)
     chain = sampler.get_chain(discard=args.n_burn)
+    log_prob_flat = sampler.get_log_prob(discard=args.n_burn).reshape(-1)   # same order as samples
 
     # Persist the sampling result first: everything below (statistics, ArviZ,
     # figures, the chi2 table) can fail or be interrupted, and --replot needs
@@ -1474,7 +1532,7 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
 
     stats = compute_statistics(samples, spec, log_prob=log_prob_flat)
     print_results(stats, spec, band)
-    stats['_diagnostics'] = print_diagnostics(sampler, args.sampler, spec.active_names)
+    stats['_diagnostics'] = print_diagnostics(sampler, args.sampler, spec.active_names, n_burn=args.n_burn)
     stats['_run_meta'] = {
         'sampler': args.sampler, 'likelihood': spec.likelihood,
         'n_walkers': int(args.n_walkers), 'n_steps': int(args.n_steps),
@@ -1512,7 +1570,7 @@ def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
         print(f"Chain file not found: {chain_path} (every fit since Phase 34 writes it; older "
               f"results were sampled under a different model and must be refitted).")
         return None
-    meta = np.load(chain_path, allow_pickle=True)
+    meta = np.load(chain_path, allow_pickle=False)   # numeric and string arrays only
     if str(meta.get('wind_normalization', 'missing')) != WIND_NORMALIZATION:
         print(f"Error: {chain_path} was sampled under a different wind normalization "
               f"(stamp: {meta.get('wind_normalization', 'missing')!s}, current: "
@@ -1566,7 +1624,7 @@ def replot_from_existing(band: str, args, spec: ParamSpec, model, data: FitData,
 
 
 def write_summary(path: str, band: str, spec: ParamSpec, stats: Dict) -> None:
-    """Human-readable summary of one fit (mcmc_summary.txt)."""
+    """Human-readable summary of one fit (``{band}_{wind_model}_summary.txt``)."""
     with open(path, 'w') as f:
         f.write("MCMC Light Curve Fitting Results\n" + "=" * 60 + "\n\n")
         f.write(f"{band.upper()} Band - {WIND_MODELS[spec.wind_model]}\n" + "-" * 40 + "\n")
@@ -1700,7 +1758,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Light-curve directory: a direct path to .txt files, or a parent "
                              "with {Band}_with_flux/ or {band}/single/ sub-folders.")
     parser.add_argument("--obs-column", type=str, default="FLUX",
-                        help="Observable column in the data files (e.g. FLUX, flux_t, rate, ECF)")
+                        help="Observable column in the data files (e.g. flux_t, rate, FLUX, NET_RATE)")
     parser.add_argument("--obs-error-column", type=str, default=None,
                         help="Error column. If omitted, auto-detected from --obs-column; for "
                              "proportional columns such as flux_t it is derived from rate_err.")
@@ -1715,9 +1773,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-phase-bin", action="store_true",
                         help="Fit the raw 100 s points; pair with --likelihood jitter.")
     parser.add_argument("--keep-zero-flux", action="store_true",
-                        help="Keep rows with flux <= 0 (zero-count bins) instead of dropping them on "
-                             "load. Their zero errors are replaced by the median valid error; keeping "
-                             "them lowers the mid-eclipse mean that centres the f_scatter prior.")
+                        help="Keep rows with flux <= 0 (observed zero-count bins) instead of dropping them "
+                             "on load. For Poisson count data whose exposure is known (an exposure column, "
+                             "or counts and rate) they belong in the exposure-weighted bins; a CIAO-layout "
+                             "file cannot tell an observed empty bin from an unobserved GTI gap, which is "
+                             "why dropping is the default. Keeping them lowers the mid-eclipse mean that "
+                             "centres the f_scatter prior.")
     parser.add_argument("--phase-window", nargs=2, type=float, default=(0.0, 1.0), metavar=("LO", "HI"),
                         help="Fit only the data with phase in [LO, HI) (LO > HI wraps through 0); the "
                              "model is still evaluated over the full orbit. A partial window needs a "
@@ -1789,7 +1850,10 @@ def build_parser() -> argparse.ArgumentParser:
     execution = parser.add_argument_group(
         'Execution', 'How this invocation runs; not part of the fit definition.')
     execution.add_argument("--n-threads", type=int, default=1,
-                           help="Worker processes for parallel likelihood evaluation (1 = serial)")
+                           help="Worker processes for parallel likelihood evaluation (1 = serial). The "
+                                "kernel already uses every core through numba, so pooling only pays off "
+                                "on many-core nodes together with --numba-threads-per-worker 1; on a "
+                                "laptop it is slower than serial.")
     execution.add_argument("--numba-threads-per-worker", type=int, default=None, metavar="N",
                            help="Numba threads inside each worker when --n-threads > 1 "
                                 "(default: cpu_count // n_threads)")
@@ -2048,6 +2112,8 @@ def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen
 
 
 def main():
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)   # keep stdout and stderr in order in log files
     parser = build_parser()
     args = parser.parse_args()
     explicit = explicit_cli_dests(parser)
@@ -2076,9 +2142,11 @@ def main():
     validate_args(parser, args, spec, frozen, explicit)
     args._prior_typed = any(d.startswith('prior_') for d in explicit)
     if args.seed is not None:
-        # Covers initial_positions, zeus, the chi2 subsample and the wind-profile
-        # draws; run_mcmc hands the same state to emcee.
+        # Covers initial_positions, the chi2 subsample and the wind-profile
+        # draws; run_mcmc hands the same state to emcee. zeus draws its walker
+        # pairs with the stdlib random module, hence the second seed.
         np.random.seed(args.seed)
+        random.seed(args.seed)
 
     geometry_priors = default_geometry_priors(mode)
     geometry_priors.update(_parse_prior_overrides(parser, args, geometry_names(mode)))
@@ -2122,16 +2190,26 @@ def main():
             if restored_config is None and not os.path.exists(run_config_path(args.output_dir, band, args.wind_model)):
                 save_run_config(args.output_dir, band, args.wind_model, args)
         else:
+            previous = os.path.join(args.output_dir, f"{band}_{args.wind_model}_chain.npz")
+            if os.path.exists(previous):
+                print(f"Warning: {previous} exists; this run overwrites the previous "
+                      f"{band}/{args.wind_model} results in {args.output_dir}.")
             # Written before sampling so the configuration survives a crash.
             save_run_config(args.output_dir, band, args.wind_model, args)
             stats = run_single_fit(band, args, spec, priors_for(spec), model, data, smoothed)
+    except (FileNotFoundError, ValueError, KeyError, RuntimeError, pd.errors.EmptyDataError) as e:
+        # Expected user-facing failures: one line, no traceback.
+        print(f"ERROR {'replotting' if args.replot else 'fitting'} {band} band ({args.wind_model}): {e}",
+              file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"ERROR {'replotting' if args.replot else 'fitting'} {band} band ({args.wind_model}): {e}")
+        print(f"ERROR {'replotting' if args.replot else 'fitting'} {band} band ({args.wind_model}): {e}",
+              file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
-    write_summary(os.path.join(args.output_dir, "mcmc_summary.txt"), band, spec, stats)
+    write_summary(os.path.join(args.output_dir, f"{band}_{spec.wind_model}_summary.txt"), band, spec, stats)
     print("\nReplotting complete!" if args.replot else "\nMCMC fitting complete!")
 
 

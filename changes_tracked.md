@@ -554,7 +554,7 @@ jitter) the new prior, likelihood and statistics agree with the previous file to
 ## Phase 34 — Release Review: Performance, Correctness, Trimming (2026-09-19)
 
 A second review round before release (ten review angles plus benchmarks on the
-real 150-bin CIAO broad light curve), delivered as four commits in the order
+real 150-bin CIAO broad light curve), delivered as the commits in the order
 below. All numbers: `henv`, 8 threads unless stated.
 
 ### Commit 1 — Halve the kernel by phase reflection, trim pow(), one exact shift search
@@ -890,6 +890,80 @@ from a prior that puts half the initial ball at `-inf`; a wrapping window with
 runs against the PyXspec stand-in (response, background, `calcFlux` and
 `fakeit` semantics mirrored from the live audit); pyflakes clean.
 
+### Commit 8 — Third review round: kernel occultation and quadrature, exposure-weighted bins, inference fixes
+
+Six independent reviewers (kernel numerics against quadrature and Monte
+Carlo references, statistics, data pipeline, runtime/portability, docs/CLI
+drift, release inventory). Confirmed defects fixed:
+
+- **Kernel.** The occultation mask is evaluated at each radial segment's
+  centre (the point its impact parameter uses); requiring both bounding radii
+  to be visible dropped every segment straddling the limb and left the visible
+  area of a partially eclipsed extended emitter 40–60 % low at `r ~ R`
+  (within ~1 % of a Monte Carlo now; no effect at the default `r = 0.001`).
+  `beta_law` rays grazing the photosphere (`b − R⋆ < 0.3`) are integrated
+  piecewise around the closest-approach peak (`_gl_piece`): 16 nodes over the
+  whole interval were −30 % at `b − R⋆ = 0.01` and −90 % at 0.001, now < 1e-7.
+  Below the table's first `nH` the flux is held at the first tabulated value
+  (the log-log end-segment extrapolation returned up to 28 % above the
+  unabsorbed plateau). `i0` must lie in [0, 180] (a negative `i0` inverted the
+  "behind the companion" test), `mdot > 0`, `f_opacity ≥ 0`, `dth`/`d2h ≤ 180`.
+  A model file without a `phase` column is refused (`deg / 360` put mid-eclipse
+  at 0.25).
+- **Binning.** Both binners weighted rows by their own Poisson errors, making
+  every bin the harmonic mean of its counts: −25 % at 3 counts per row, −12 %
+  at 10 (0.72 in-eclipse on the real broad light curve, χ²/n 2.3–33 on
+  synthetic data). Bins are now exposure-weighted (`bin_estimate`), with the
+  exposure from an `EXPOSURE` column or `counts / rate`; the error is the
+  propagated Poisson error; zero-count rows contribute exposure and no
+  variance; bin centres are exposure-weighted. Unbiased at every count level
+  in simulation, χ²/n ≈ 1. Rows with zero exposure are dropped as unobserved;
+  the loaders keep row errors as read and the fitters repair the errors that
+  enter the χ² (after binning). An `mjd` time column is converted to seconds
+  (it was fed to the ephemeris as seconds); an error column a thousand times
+  the observable is refused as a unit mismatch; empty data files are named in
+  the error. The synthetic generator writes an `exposure` column, applies gaps
+  per visit (never across a boundary, never emptying a visit), refuses
+  overlapping visits, and gained `--flux-type`.
+- **Inference.** `--seed` now also seeds Python's `random` (zeus draws walker
+  pairs with it; two zeus runs are byte-identical). BIC uses the maximum
+  likelihood over the chain (`log_prob − log_prior`), not the MAP sample's
+  likelihood (ΔBIC 5.6 in a 30-step test). Under the jitter likelihood the
+  phase shift is profiled on that likelihood (variance term included) instead
+  of the classical χ² (16 log-units apart at `f = 0.45`). Autocorrelation
+  times and effective samples are computed on the post-burn-in chain. Samples
+  and log-probabilities are flattened in (step, walker) order for both
+  samplers, matching `--replot`. The summary file is
+  `{band}_{wind}_summary.txt` (a second wind model overwrote
+  `mcmc_summary.txt`); an existing chain is overwritten with a warning.
+- **Runtime.** Ctrl-C on a pooled fit hung forever (`pool.join()` on an
+  in-flight task); the pool is terminated and workers ignore SIGINT. The
+  per-worker numba thread count is clamped to numba's limit and the
+  initializer never raises (a raising initializer made `Pool` respawn workers
+  forever). Console output is ASCII (`σ`/`χ²` crashed under a non-UTF-8
+  stdout); stdout is line-buffered so logs interleave correctly; expected
+  user errors (missing files, bad columns, empty data, bad bands) exit with one
+  line instead of a traceback in every CLI; `plot_results.py` shows the
+  geometry figures when no `--output` is given; the chain is loaded with
+  `allow_pickle=False`; `matplotlib.use("Agg")` in the MCMC fitter.
+- **XSPEC/synthetic.** The flux-table script prefers the source's own
+  `<stem>_bkg.*` background; a fake-spectrum `--name` containing "bkg" is
+  refused. Documentation brought in line with the code (refit error ~2×, BIC
+  and shift definitions, `nH_cm2` column, `--seed` on replot, plot locations,
+  parameter counts, CIAO column examples, recovery numbers with the count rate
+  they were obtained at, requirements list) and a Known rough edge added for
+  the Neyman bias of observed-error χ² weights (−0.005 in the shift at ~14
+  counts per bin).
+
+Verified in `henv`: unit tests 6/6; the kernel reviewer's reference scripts
+(limb quadrature ≤ 2.7e-8, partial-eclipse area within 1–5 % of Monte Carlo,
+mirror symmetry, flag checks); the data reviewer's bias script (both binners
+unbiased, χ²/n 1.06–1.21); the earlier group-3 and group-5 check scripts;
+synthetic light curve → both fitters (shift 0.9848 / 0.9852 / 0.9847 at ten
+times the real count rate; χ²/dof 1.05 / 0.92); MCMC chi2 and jitter runs
+with BIC and χ² tables; replot; zeus seed reproducibility; Ctrl-C on a pooled
+run exits in 0.5 s with no orphans; pyflakes clean.
+
 ### Commit 7 — `synthetic_data/`: fake spectra and synthetic light curves
 
 - `make_spectrum.py`: PyXspec `fakeit` of an absorbed power law through the IC
@@ -957,8 +1031,8 @@ requirement.
 
 **Forward model:** three profiles (`smooth_pl` default with `Rb=5, p=4,
 Delta=2`; `confinement`; `beta_law`), physical `Ṁ/v_inf` normalization with
-`f_opacity`, per-cell flux conversion, ≈ 30 ms per light curve, one band per
-run. **MCMC:** `phys` / `--reparam` / `--kepler` / `--kepler-mtot`, `chi2` or
+`f_opacity`, per-cell flux conversion, ≈ 11 ms per light curve at `dth = 1`
+(5.5 ms at the MCMC default `dth = 2`), one band per run. **MCMC:** `phys` / `--reparam` / `--kepler` / `--kepler-mtot`, `chi2` or
 `jitter`, emcee or zeus, per-sample phase-shift alignment on, adaptive
 constant-counts binning recommended, `--fit-fopacity` strongly recommended.
 

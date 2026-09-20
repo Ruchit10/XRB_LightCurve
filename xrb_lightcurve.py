@@ -226,38 +226,70 @@ _GL16_W = np.array([
 
 
 @njit(cache=True, inline="always")
-def _los_gl_quadrature(b, z_start, model_id, p1, p2, p3, gl_x, gl_w):
-    """
-    LOS integral ∫_{-∞}^{z_start} g(r=sqrt(b²+z²)) dz via Gauss-Legendre
-    quadrature in u = arctan(z/b).
-
-    The substitution gives:
-        ∫ g(r) dz = b · ∫_{-π/2}^{u_start} g(b/cos u) · sec²(u) du
-    The integrand is bounded and smooth on the finite interval [-π/2, u_start]
-    for any profile that falls at least as fast as r^{-1} at infinity.
-    """
-    if b < 1e-8:
-        b = 1e-8
-    u_start = math.atan(z_start / b)
-    u_lo = -1.5707963267948966  # -pi/2
-    u_hi = u_start
+def _gl_piece(b, u_lo, u_hi, model_id, p1, p2, p3, gl_x, gl_w):
+    """Gauss-Legendre estimate of b * int_{u_lo}^{u_hi} g(b / cos u) sec^2(u) du."""
     half_range = 0.5 * (u_hi - u_lo)
-    mid = 0.5 * (u_hi + u_lo)
     if half_range <= 0.0:
         return 0.0
-    n_gl = gl_x.shape[0]
+    mid = 0.5 * (u_hi + u_lo)
     integral = 0.0
-    for k in range(n_gl):
+    for k in range(gl_x.shape[0]):
         u_k = mid + half_range * gl_x[k]
         cos_uk = math.cos(u_k)
         if cos_uk <= 1e-15:
             continue
-        r_at_u = b / cos_uk
-        g_val = _g_profile(r_at_u, model_id, p1, p2, p3)
-        # integrand = g(r) * sec²(u) * b ; jacobian for [-1,1] -> [u_lo, u_hi] is half_range
-        sec2 = 1.0 / (cos_uk * cos_uk)
-        integral += gl_w[k] * g_val * sec2
+        g_val = _g_profile(b / cos_uk, model_id, p1, p2, p3)
+        # integrand = g(r) * sec^2(u) * b ; jacobian for [-1,1] -> [u_lo, u_hi] is half_range
+        integral += gl_w[k] * g_val / (cos_uk * cos_uk)
     return integral * b * half_range
+
+
+# beta_law rays closer than this to the photosphere get the split quadrature.
+_LIMB_SPLIT_EXCESS = 0.3
+
+
+@njit(cache=True, inline="always")
+def _los_gl_quadrature(b, z_start, model_id, p1, p2, p3, gl_x, gl_w):
+    """
+    LOS integral int_{-inf}^{z_start} g(r=sqrt(b^2+z^2)) dz via Gauss-Legendre
+    quadrature in u = arctan(z/b).
+
+    The substitution gives:
+        int g(r) dz = b * int_{-pi/2}^{u_start} g(b/cos u) * sec^2(u) du
+    The integrand is bounded and smooth on the finite interval [-pi/2, u_start]
+    for any profile that falls at least as fast as r^{-1} at infinity, and 16
+    nodes resolve it to <1e-5 for smooth_pl and confinement at any impact
+    parameter. The beta_law profile diverges at the photosphere, so a ray
+    grazing the limb (b - R_star small) has an integrand peaked at closest
+    approach (u = 0) with a width ~ sqrt(2 (b - R_star) / b) that 16 nodes over
+    the whole interval under-resolve (-30 % at b - R_star = 0.01, -90 % at
+    0.001). Such rays are integrated piecewise: [-pi/2, -w], [-w, 0], [0, w],
+    [w, u_start] with the two central pieces halved again, which brings the
+    error below 1e-7 everywhere (checked against adaptive quadrature).
+    """
+    if b < 1e-8:
+        b = 1e-8
+    u_hi = math.atan(z_start / b)
+    u_lo = -1.5707963267948966  # -pi/2
+    if u_hi <= u_lo:
+        return 0.0
+    if model_id == 2 and u_hi > 0.0 and 0.0 < b - p1 < _LIMB_SPLIT_EXCESS:
+        w = 4.0 * math.sqrt(2.0 * (b - p1) / b)
+        if w > 0.6:
+            w = 0.6
+        total = 0.0
+        # Outer pieces: one GL rule each (empty when the interval is short).
+        a = -w if -w > u_lo else u_lo
+        total += _gl_piece(b, u_lo, a, model_id, p1, p2, p3, gl_x, gl_w)
+        c = w if w < u_hi else u_hi
+        total += _gl_piece(b, c, u_hi, model_id, p1, p2, p3, gl_x, gl_w)
+        # Central pieces around the peak: two GL rules per side.
+        total += _gl_piece(b, a, 0.5 * a, model_id, p1, p2, p3, gl_x, gl_w)
+        total += _gl_piece(b, 0.5 * a, 0.0, model_id, p1, p2, p3, gl_x, gl_w)
+        total += _gl_piece(b, 0.0, 0.5 * c, model_id, p1, p2, p3, gl_x, gl_w)
+        total += _gl_piece(b, 0.5 * c, c, model_id, p1, p2, p3, gl_x, gl_w)
+        return total
+    return _gl_piece(b, u_lo, u_hi, model_id, p1, p2, p3, gl_x, gl_w)
 
 
 @njit(cache=True, parallel=True)
@@ -281,11 +313,16 @@ def _simulate_phases_numba(
         and the LOS offset z_start of the emitter behind the companion.
       - If the emitter disk lies entirely behind the companion disk, flag the
         phase as eclipsed and skip the grid.
-      - Otherwise walk the polar emitter grid. A radial segment between two
-        consecutive unmasked radii in the same angular sector gets one column
-        integral (`_los_gl_quadrature`) at its centre and its annular-sector
-        area. Sectors mirrored about the star-star line are geometrically
-        identical, so each integral is computed once and recorded twice.
+      - Otherwise walk the polar emitter grid. Each radial segment of an
+        angular sector is tested for occultation at its centre (the point its
+        impact parameter is evaluated at): a visible segment gets one column
+        integral (`_los_gl_quadrature`) there and its annular-sector area.
+        Testing the centre rather than both bounding radii keeps the visible
+        area and mean column of a partially eclipsed extended emitter within
+        ~1 % of a Monte Carlo of the disk (dropping every segment that
+        straddles the limb was 40-60 % low at r ~ R). Sectors mirrored about
+        the star-star line are geometrically identical, so each integral is
+        computed once and recorded twice.
       - Reduce to the area-weighted mean column and total visible area, and
         return the per-cell columns/areas the nonlinear nH -> flux conversion
         needs (<F(N)> != F(<N>) wherever the column varies across the disk).
@@ -379,32 +416,25 @@ def _simulate_phases_numba(
         for i_th in range(n_half):
             cos_th = cos_c[i_th]
             reps = 2 if (n_th - 1 - i_th) != i_th else 1
-            prev_ok = False
-            for i_r in range(n_r):
-                r_val = r_vals[i_r]
-
-                # Occultation mask: cell hidden behind the companion disk.
-                if sin_g > 0.0:
-                    nn2 = r_val * r_val + l * l - 2.0 * r_val * l * cos_th
-                    if nn2 < R2:
-                        prev_ok = False
-                        continue
-
-                if prev_ok:
-                    av_x = av_x_tab[i_r]
-                    bv2 = av_x * av_x + l * l - 2.0 * av_x * l * cos_th
-                    bv = math.sqrt(bv2) if bv2 > 0.0 else 0.0
-                    A_seg = A_seg_tab[i_r]
-                    los_val = _los_gl_quadrature(
-                        bv, z_start, model_id, p1, p2, p3, gl_x, gl_w
-                    )
-                    for _rep in range(reps):
-                        sum_lw += los_val * A_seg
-                        sum_A += A_seg
-                        cell_col_out[ip, k_cell] = los_val
-                        cell_area_out[ip, k_cell] = A_seg
-                        k_cell += 1
-                prev_ok = True
+            for i_r in range(1, n_r):
+                # Impact parameter of the segment centre; the same point decides
+                # whether the segment is hidden behind the companion disk (only
+                # possible when the emitter is behind it: sin_g > 0).
+                av_x = av_x_tab[i_r]
+                bv2 = av_x * av_x + l * l - 2.0 * av_x * l * cos_th
+                if sin_g > 0.0 and bv2 < R2:
+                    continue
+                bv = math.sqrt(bv2) if bv2 > 0.0 else 0.0
+                A_seg = A_seg_tab[i_r]
+                los_val = _los_gl_quadrature(
+                    bv, z_start, model_id, p1, p2, p3, gl_x, gl_w
+                )
+                for _rep in range(reps):
+                    sum_lw += los_val * A_seg
+                    sum_A += A_seg
+                    cell_col_out[ip, k_cell] = los_val
+                    cell_area_out[ip, k_cell] = A_seg
+                    k_cell += 1
 
         cell_count_out[ip] = k_cell
         if sum_A > 0.0:
@@ -433,8 +463,11 @@ def _cell_flux_loglog(cell_col, cell_area, cell_count, col_scale, log_nh, log_fl
 
     Reproduces ``scipy.interpolate.interp1d(kind='linear',
     fill_value='extrapolate')`` on ``(log10 nH, log10 flux)``: linear
-    extrapolation from the end segments, with the column clipped to
-    [1e-6, 1e6] x 1e22 cm^-2 first.
+    extrapolation from the upper end segment, with the column clipped to
+    [1e-6, 1e6] x 1e22 cm^-2 first. Below the table the flux is held at the
+    first tabulated value: absorption cannot exceed 1, and extrapolating the
+    first segment in log-log returned up to 28 % more than the table's own
+    low-nH plateau for tables starting at 0.01 x 1e22 cm^-2.
     """
     n_phases = cell_col.shape[0]
     n = log_nh.shape[0]
@@ -450,21 +483,22 @@ def _cell_flux_loglog(cell_col, cell_area, cell_count, col_scale, log_nh, log_fl
                 N = 1e6
             lx = math.log10(N)
             if lx <= log_nh[0]:
-                j = 0
-            elif lx >= log_nh[n - 1]:
-                j = n - 2
+                F = 10.0 ** log_flux[0]
             else:
-                lo = 0
-                hi = n - 1
-                while hi - lo > 1:
-                    mid = (lo + hi) >> 1
-                    if log_nh[mid] <= lx:
-                        lo = mid
-                    else:
-                        hi = mid
-                j = lo
-            t = (lx - log_nh[j]) / (log_nh[j + 1] - log_nh[j])
-            F = 10.0 ** (log_flux[j] + t * (log_flux[j + 1] - log_flux[j]))
+                if lx >= log_nh[n - 1]:
+                    j = n - 2
+                else:
+                    lo = 0
+                    hi = n - 1
+                    while hi - lo > 1:
+                        mid = (lo + hi) >> 1
+                        if log_nh[mid] <= lx:
+                            lo = mid
+                        else:
+                            hi = mid
+                    j = lo
+                t = (lx - log_nh[j]) / (log_nh[j + 1] - log_nh[j])
+                F = 10.0 ** (log_flux[j] + t * (log_flux[j + 1] - log_flux[j]))
             A = cell_area[ip, k]
             num += F * A
             den += A
@@ -718,12 +752,19 @@ def _simulate_core(
             f"is smaller than the companion.")
     if d1 + d2 <= 0.0:
         raise ValueError(f"Need d1 + d2 > 0 (got d1={d1}, d2={d2}).")
+    if not (0.0 <= i0 <= 180.0):
+        # The kernel decides "emitter behind the companion" from sin(gma) alone,
+        # which assumes cos(incl) >= 0; a negative i0 would invert that test.
+        raise ValueError(f"i0 must lie in [0, 180] degrees (got {i0}).")
+    if mdot <= 0.0 or v_inf <= 0.0 or f_opacity < 0.0:
+        raise ValueError(f"Need mdot > 0, v_inf > 0 and f_opacity >= 0 "
+                         f"(got mdot={mdot}, v_inf={v_inf}, f_opacity={f_opacity}).")
     for name, step in (("dth", dth), ("d2h", d2h)):
         # The phase grid and the sector grid must close: int(360 / step) rings
         # would otherwise leave a gap, and the phase reflection assumes a
-        # closed grid.
-        if step <= 0.0 or abs(360.0 / step - round(360.0 / step)) > 1e-9:
-            raise ValueError(f"{name} must be positive and divide 360 evenly (got {step}).")
+        # closed grid. At most two phases / two sectors (step 180).
+        if not (0.0 < step <= 180.0) or abs(360.0 / step - round(360.0 / step)) > 1e-9:
+            raise ValueError(f"{name} must lie in (0, 180] and divide 360 evenly (got {step}).")
 
     # Only the input convention changes here: `incl` is the internal angle from
     # the line of sight that the kernel's geometry assumes.
@@ -1032,15 +1073,18 @@ def main():
     print(f"  wind_params: {wind_params}")
     print(f"  output: {args.output}\n")
 
-    results = simulate_lightcurve(
-        r=args.r, R=args.R, d1=args.d1, d2=args.d2, gma0=args.gma0, i0=args.i0,
-        dth=args.dth, d2h=args.d2h, verbose=args.verbose,
-        flux_method=args.flux_method, flux_csv_path=args.flux_csv,
-        flux_type=args.flux_type, band=args.band,
-        wind_model=args.wind_model, wind_params=wind_params,
-        mdot=args.mdot, v_inf=args.v_inf, mu_wind=args.mu_wind,
-        f_opacity=args.f_opacity,
-    )
+    try:
+        results = simulate_lightcurve(
+            r=args.r, R=args.R, d1=args.d1, d2=args.d2, gma0=args.gma0, i0=args.i0,
+            dth=args.dth, d2h=args.d2h, verbose=args.verbose,
+            flux_method=args.flux_method, flux_csv_path=args.flux_csv,
+            flux_type=args.flux_type, band=args.band,
+            wind_model=args.wind_model, wind_params=wind_params,
+            mdot=args.mdot, v_inf=args.v_inf, mu_wind=args.mu_wind,
+            f_opacity=args.f_opacity,
+        )
+    except (FileNotFoundError, ValueError, KeyError) as e:
+        raise SystemExit(f"ERROR: {e}")
     results.to_csv(args.output, index=False)
     print(f"Simulation completed: {len(results)} phases written to {args.output}")
     return results

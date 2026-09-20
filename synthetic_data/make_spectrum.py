@@ -72,10 +72,13 @@ def main() -> None:
         description="Fake absorbed power-law spectrum via PyXspec fakeit, plus per-band flux-per-rate factors.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--out-dir", required=True, help="directory for the fake PHA (becomes --specdir)")
-    parser.add_argument("--rmf", default=os.path.join(DEFAULT_SPEC_DIR, "X1_spectrum_combined_src.rmf"))
-    parser.add_argument("--arf", default=os.path.join(DEFAULT_SPEC_DIR, "X1_spectrum_combined_src.arf"))
+    parser.add_argument("--rmf", default=os.path.join(DEFAULT_SPEC_DIR, "X1_spectrum_combined_src.rmf"),
+                        help="redistribution matrix (RMF) the fake spectrum is drawn through")
+    parser.add_argument("--arf", default=os.path.join(DEFAULT_SPEC_DIR, "X1_spectrum_combined_src.arf"),
+                        help="ancillary response (ARF, effective area) matching --rmf")
     parser.add_argument("--bkg", default=None, help="real background PHA to fake a background from (optional)")
-    parser.add_argument("--model", choices=ABSORPTION_MODELS, default="tbabs")
+    parser.add_argument("--model", choices=ABSORPTION_MODELS, default="tbabs",
+                        help="absorption component multiplying the power law")
     parser.add_argument("--nH", type=float, default=0.75, help="column density (10^22 cm^-2)")
     parser.add_argument("--PhoIndex", type=float, default=1.86, help="power-law photon index")
     parser.add_argument("--norm", type=float, default=1e-4, help="power-law normalization at 1 keV")
@@ -88,6 +91,9 @@ def main() -> None:
     for path in (args.rmf, args.arf) + ((args.bkg,) if args.bkg else ()):
         if not os.path.exists(path):
             parser.error(f"file not found: {path}")
+    if any(key in args.name.lower() for key in ("bkg", "background")):
+        parser.error("--name must not contain 'bkg' or 'background': compute_flux_vs_nH.py identifies "
+                     "the background spectrum by those words in the file name.")
     if args.exposure <= 0 or args.norm <= 0 or args.nH < 0:
         parser.error("--exposure and --norm must be > 0 and --nH >= 0")
     _import_xspec()

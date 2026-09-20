@@ -82,22 +82,31 @@ def main() -> None:
         print(f"Error: File {args.data_file} not found!")
         sys.exit(1)
 
-    if args.orbit:
-        missing = [n for n in ("R", "d1", "d2", "i0") if getattr(args, n) is None]
-        if missing:
-            parser.error(f"--orbit requires {', '.join('--' + m for m in missing)}")
-        plot_orbit_geometry(
-            df, R=args.R, r=args.r, d1=args.d1, d2=args.d2, i0=args.i0,
-            output_path=args.output, band=args.band,
-        )
-    elif args.geometric:
-        if args.R is None:
-            parser.error("--geometric requires --R (the eclipse thresholds need it)")
-        plot_geometry_vs_phase(
-            df, R=args.R, r=args.r, band=args.band, output_path=args.output,
-        )
-    else:
-        plot_simulation_bands(df, output_path=args.output)
+    try:
+        if args.orbit:
+            missing = [n for n in ("R", "d1", "d2", "i0") if getattr(args, n) is None]
+            if missing:
+                parser.error(f"--orbit requires {', '.join('--' + m for m in missing)}")
+            fig = plot_orbit_geometry(
+                df, R=args.R, r=args.r, d1=args.d1, d2=args.d2, i0=args.i0,
+                output_path=args.output, band=args.band,
+            )
+        elif args.geometric:
+            if args.R is None:
+                parser.error("--geometric requires --R (the eclipse thresholds need it)")
+            fig = plot_geometry_vs_phase(
+                df, R=args.R, r=args.r, band=args.band, output_path=args.output,
+            )
+        else:
+            fig = plot_simulation_bands(df, output_path=args.output)
+    except KeyError as e:
+        print(f"Error: {args.data_file} lacks the column {e} the requested figure needs; "
+              f"use a CSV written by the simulator (xrb_lightcurve.py).", file=sys.stderr)
+        sys.exit(1)
+    if args.output is None and fig is not None:
+        # The plotting routines return the figure when no path is given.
+        import matplotlib.pyplot as plt
+        plt.show()
 
 
 if __name__ == "__main__":

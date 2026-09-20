@@ -98,8 +98,8 @@ python compute_flux_vs_nH.py \
     --nH_min 1e20 --nH_max 1e24 --nH_points 60
 ```
 
-Requires XSPEC (PyXspec) in the environment. Each CSV carries `nH_1e22` plus
-`flux_{band}_ph` / `flux_{band}_erg` for **one** band; make one table per band
+Requires XSPEC (PyXspec) in the environment. Each CSV carries `nH_cm2`,
+`nH_1e22` plus `flux_{band}_ph` / `flux_{band}_erg` for **one** band; make one table per band
 you intend to fit. (A table holding several bands is still accepted, but the
 simulator then needs `--band` / `band=` to pick one.)
 
@@ -149,8 +149,10 @@ multiplicative flux scale: the absolute normalization is already set by Ṁ and
 the XSPEC table, so a free y-scale would silently absorb an error in that
 normalization instead of exposing it. Both fitters find the shift with the
 same search: a scan over the full period with a step no larger than the data
-or model spacing, then two dense passes to a resolution of ~2e-5 in phase.
-The MCMC evaluates the model at `--dth 2` (180 phases) by default.
+or model spacing (capped at 400 trial shifts for unbinned data), then two
+dense passes to a resolution of ~2e-5 in phase. Under the jitter likelihood the
+MCMC profiles the shift on that likelihood itself, variance term included. The
+MCMC evaluates the model at `--dth 2` (180 phases) by default.
 
 To fit ingress and egress separately, restrict the data with
 `--phase-window LO HI` (both fitters). The model is symmetric about
@@ -258,9 +260,22 @@ sampling `(M_X, M_RH)` lays that flat direction diagonally across both axes.
 **Reproducing a run** — pass `--seed N`; the walker initialisation, the
 sampler and every random subset then follow that seed.
 
+**Binned values** — a phase bin of count data is the exposure-weighted mean
+`Σ(flux·t)/Σt` with the Poisson error `√(ΣN)·c/Σt`, the estimate a single long
+exposure would give. The exposure comes from an `exposure` column when the
+file has one (the synthetic generator writes it) or from `counts / rate`.
+Weighting rows by their own `√N` errors instead biases low-count bins low by
+roughly one count per row (25 % at 3 counts, 12 % at 10), so that is no longer
+done; files without counts fall back to the inverse-variance mean.
+
 **Zero-count bins** — rows with flux ≤ 0 are dropped on load by default;
-`--keep-zero-flux` (both fitters, same rule) keeps them, with their zero errors
-replaced by the median valid error before binning.
+`--keep-zero-flux` (both fitters, same rule) keeps them. For Poisson data whose
+exposure is known, keep them: an observed empty bin is a measurement and the
+exposure-weighted mean needs it (dropping zeros biases the faintest bins high,
+by 30 % at one count per row). CIAO-layout files cannot distinguish an observed
+empty bin from an unobserved GTI gap (both are zero rows), which is why
+dropping remains the default there; rows with an explicit zero exposure are
+always dropped.
 
 **Replotting a `--no-csv-output` fit** works: `--replot` reads the chain file,
 which every fit writes right after sampling; the samples CSV is only an export.

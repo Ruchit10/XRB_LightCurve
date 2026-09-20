@@ -100,10 +100,15 @@ def find_spectrum_files(specdir: str) -> Tuple[str, Optional[str], Optional[str]
     spectra = files("*.pha", "*.pha.gz", "*.pi", "*.pi.gz")
     if not spectra:
         raise FileNotFoundError(f"No PHA/PI files found in {specdir}")
-    bkg = _pick(spectra, ("bkg", "background"))
     src = source_first(spectra)
     if src is None:
         raise FileNotFoundError(f"Only a background spectrum found in {specdir}")
+    # The source's own background first (<stem>_bkg.*, as fakeit and CIAO name
+    # it), then any background-named file.
+    stem = os.path.basename(src).split(".")[0].lower().replace("_src", "").replace("src", "")
+    own = [p for p in spectra if os.path.basename(p).lower().startswith(stem) and
+           _pick([p], ("bkg", "background")) is not None]
+    bkg = (own[0] if own else None) or _pick(spectra, ("bkg", "background"))
     rmf = source_first(files("*.rmf", "*.rmf.gz"))
     arf = source_first(files("*.arf", "*.arf.gz"))
     return src, bkg, rmf, arf

@@ -413,7 +413,10 @@ def read_observation(
     """
     header = _header_columns(file_path)
     if header is None:
-        df = pd.read_csv(file_path, sep=r"\s+", comment="#", header=None)
+        try:
+            df = pd.read_csv(file_path, sep=r"\s+", comment="#", header=None)
+        except pd.errors.EmptyDataError:
+            raise ValueError(f"{file_path}: no data rows") from None
         # With `names=` pandas would silently promote surplus leading columns
         # to the index, shifting time/rate/error by one column.
         if df.shape[1] not in (2, 3):
@@ -426,7 +429,10 @@ def read_observation(
         df["obs"] = label
         return df
 
-    df = pd.read_csv(file_path, sep=r"\s+", comment="#", header=None)
+    try:
+        df = pd.read_csv(file_path, sep=r"\s+", comment="#", header=None)
+    except pd.errors.EmptyDataError:
+        raise ValueError(f"{file_path}: header but no data rows") from None
     if len(header) != len(df.columns):
         raise ValueError(
             f"{file_path}: header names {header} do not match the "
@@ -448,7 +454,14 @@ def read_observation(
         raise ValueError(f"Column '{obs_column}' not found in {file_path}. "
                          f"Available columns: {list(df.columns)}")
 
-    out = pd.DataFrame({"rate": df[obs_col], "time": df[time_col]})
+    time = pd.to_numeric(df[time_col], errors="coerce").astype(float)
+    if str(time_col).upper() == "MJD":
+        # The ephemeris is in seconds since Chandra's MJDREF; an MJD column is
+        # converted rather than fed to it as if it were seconds.
+        time = (time - MJDREF_CHANDRA) * 86400.0
+        print(f"  {os.path.basename(file_path)}: time column '{time_col}' is MJD; "
+              f"converted to seconds since MJDREF = {MJDREF_CHANDRA}")
+    out = pd.DataFrame({"rate": df[obs_col], "time": time})
     err_col = _detect_error_column(df, obs_col, obs_error_column)
     if err_col is not None:
         out["error"] = df[err_col]
@@ -456,14 +469,84 @@ def read_observation(
         derived = _derive_err_from_rate_err(df, obs_col)
         if derived is not None:
             out["error"] = derived
+    if "error" in out.columns:
+        _check_error_units(out["rate"], out["error"], obs_col, err_col, file_path)
     counts_col = find_column(df, counts_column) if counts_column else None
     if counts_col is not None:
         out["counts"] = pd.to_numeric(df[counts_col], errors="coerce")
+    exposure = _row_exposure(df, counts_col)
+    if exposure is not None:
+        out["exposure"] = exposure
 
     # Phase is always recomputed from the timestamps and the current ephemeris.
     out["phase"] = frac((out["time"] - REF_EPOCH) / ORBITAL_PERIOD)
     out["obs"] = label
     return out
+
+
+def _check_error_units(obs, err, obs_col, err_col, file_path: str) -> None:
+    """Refuse an error column whose scale cannot belong to the observable.
+
+    ``--obs-column flux_t --obs-error-column rate_err`` used to be accepted
+    silently, with errors 1e10 times the values; the fit then ran on garbage
+    weights. A light-curve error is never a thousand times its value.
+    """
+    obs = pd.to_numeric(obs, errors="coerce").to_numpy(dtype=float)
+    err = pd.to_numeric(err, errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(obs) & np.isfinite(err) & (obs > 0) & (err > 0)
+    if np.count_nonzero(ok) < 3:
+        return
+    ratio = float(np.median(err[ok]) / np.median(obs[ok]))
+    if ratio > 1e3:
+        raise ValueError(
+            f"{os.path.basename(file_path)}: errors from column '{err_col}' are {ratio:.0e} times "
+            f"the '{obs_col}' values; the error column is in different units than the observable "
+            f"(e.g. rate_err with flux_t). Omit --obs-error-column to derive it, or name the right one.")
+
+
+def _row_exposure(df: pd.DataFrame, counts_col: Optional[str]) -> Optional[pd.Series]:
+    """Per-row exposure (s), or None when the file gives no way to know it.
+
+    An explicit ``EXPOSURE``/``EXPTIME`` column wins. Otherwise, for count data
+    with a count-rate column, ``counts / rate`` recovers the exposure of every
+    row with counts (dead-time corrected, GTI clipped); rows with zero counts
+    take the file's median exposure, since ``0 / 0`` says nothing. The binners
+    weight rows by this exposure instead of by their own Poisson error, which
+    would bias low-count bins (see :func:`bin_estimate`).
+    """
+    exp_col = _first_column(df, ("EXPOSURE", "EXPTIME"))
+    if exp_col is not None:
+        return pd.to_numeric(df[exp_col], errors="coerce").astype(float)
+    rate_col = find_column(df, "RATE")
+    if counts_col is None or rate_col is None:
+        return None
+    counts = pd.to_numeric(df[counts_col], errors="coerce").to_numpy(dtype=float)
+    rate = pd.to_numeric(df[rate_col], errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(counts) & np.isfinite(rate) & (counts > 0) & (rate > 0)
+    if not np.any(ok):
+        return None
+    exposure = np.full(len(df), np.nan)
+    exposure[ok] = counts[ok] / rate[ok]
+    exposure[~ok] = float(np.median(exposure[ok]))
+    return pd.Series(exposure, index=df.index, dtype=float)
+
+
+def drop_unobserved_rows(df: pd.DataFrame, exposure_column: str = "exposure",
+                         verbose: bool = True) -> pd.DataFrame:
+    """Drop rows whose exposure is not finite and positive: nothing was observed.
+
+    Only possible when the file states the exposure; CIAO-layout files do not,
+    and there a zero-count row from a GTI gap is indistinguishable from an
+    observed empty bin (which is why ``--keep-zero-flux`` is a choice).
+    """
+    if exposure_column not in df.columns:
+        return df
+    exposure = pd.to_numeric(df[exposure_column], errors="coerce").to_numpy(dtype=float)
+    keep = np.isfinite(exposure) & (exposure > 0)
+    n_drop = int(np.count_nonzero(~keep))
+    if n_drop and verbose:
+        print(f"Dropped {n_drop} row(s) with zero or undefined exposure (not observed).")
+    return df.loc[keep].reset_index(drop=True) if n_drop else df
 
 
 # -----------------------------------------------------------------------------
@@ -484,7 +567,7 @@ def load_data(
     data_dir : str
         Directory containing observation text files
     obs_column : str, default "rate"
-        Name of column to use for the observable (e.g., "NET_RATE", "FLUX", "COUNT_RATE", "ECF", "flux_t")
+        Name of column to use for the observable (e.g., "flux_t", "rate", "FLUX", "NET_RATE", "COUNT_RATE")
     obs_error_column : str, optional
         Name of column to use for errors. If None, will auto-detect based on obs_column.
     time_column : str, optional
@@ -553,15 +636,17 @@ def load_observed_lightcurves(
 
     Wraps :func:`load_data` (via :func:`resolve_band_directory`) and remaps the
     columns to the fitting convention ``flux`` / ``flux_err`` / ``obs_id``.
-    Non-finite fluxes are always dropped. Rows with ``flux <= 0`` (zero-count
-    bins, whose error is also 0) are dropped unless *drop_nonpositive_flux* is
-    False, in which case :func:`sanitize_errors` gives them the median valid
-    error.
+    Rows with a non-finite flux or a zero exposure are always dropped. Rows
+    with ``flux <= 0`` (zero-count bins, whose Poisson error is also 0) are
+    dropped unless *drop_nonpositive_flux* is False. Errors are returned as
+    read: the binners weight count data by exposure (a zero error is then
+    simply a zero-count row) and the fitters run :func:`sanitize_errors` on
+    whatever enters the chi2.
 
     Returns
     -------
-    DataFrame with columns: time, flux, flux_err, obs_id, phase, and counts
-    when the files carry it.
+    DataFrame with columns: time, flux, flux_err, obs_id, phase, plus counts
+    and exposure when the files provide them.
     """
     band_dir = resolve_band_directory(band, data_dir)
     print(f"Loading {band} band data from: {band_dir}")
@@ -581,19 +666,40 @@ def load_observed_lightcurves(
         'obs_id': raw['obs'],
         'phase': raw['phase'].astype(float),
     })
-    if 'counts' in raw.columns:
-        # Only when the files carry counts: an all-NaN column would pass the
-        # presence check of the constant-counts binner.
-        combined['counts'] = raw['counts'].astype(float)
+    for col in ('counts', 'exposure'):
+        if col in raw.columns:
+            # Only when the files carry them: an all-NaN column would pass the
+            # presence checks of the binners.
+            combined[col] = raw[col].astype(float)
 
     combined = combined.loc[np.isfinite(combined['time'])].reset_index(drop=True)
+    combined = drop_unobserved_rows(combined)
+    note_dropped_zero_count_rows(combined, 'flux', drop_nonpositive_flux)
     combined = drop_invalid_flux_rows(combined, 'flux', drop_nonpositive=drop_nonpositive_flux)
-    if 'error' in raw.columns:
-        combined['flux_err'] = sanitize_errors(combined['flux_err'], context=f"{band} band light curves: ")
+    if combined.empty:
+        raise ValueError(f"No usable data points for the {band} band in {band_dir}: every row "
+                         f"has a non-finite, zero or negative '{flux_column}' or no exposure.")
 
     n_files = len(glob.glob(os.path.join(band_dir, "*.txt")))
     print(f"Loaded {len(combined)} data points from {n_files} file(s) for {band} band")
     return combined
+
+
+def note_dropped_zero_count_rows(df: pd.DataFrame, column: str, dropping: bool) -> None:
+    """Say when observed zero-count bins are about to be dropped.
+
+    With the exposure known (explicit column, or counts/rate), a zero-count row
+    is a real measurement that the exposure-weighted binner needs for an
+    unbiased mean; dropping such rows biases low-count bins high.
+    """
+    if not dropping or 'exposure' not in df.columns:
+        return
+    values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+    exposure = pd.to_numeric(df['exposure'], errors="coerce").to_numpy(dtype=float)
+    n = int(np.count_nonzero(np.isfinite(values) & (values <= 0) & np.isfinite(exposure) & (exposure > 0)))
+    if n:
+        print(f"Note: {n} observed zero-count bin(s) will be dropped (rows with flux <= 0); for Poisson "
+              f"count data they belong in the exposure-weighted bins: keep them with --keep-zero-flux.")
 
 
 # -----------------------------------------------------------------------------
@@ -603,17 +709,17 @@ def load_observed_lightcurves(
 def weighted_mean(values: np.ndarray, errors: Optional[np.ndarray]) -> Tuple[float, float]:
     """Inverse-variance weighted mean of *values* and its error ``sqrt(1/Σw)``.
 
-    Errors must already be valid (finite and > 0): the loaders repair them
-    once with :func:`sanitize_errors` before binning, so a bad error here is a
+    For measurements with independent error estimates only. Errors must be
+    valid (finite and > 0): the binners repair them with
+    :func:`sanitize_errors` before calling, so a bad error here is a
     programming error and raises. Without errors (no error column at all) the
-    plain mean and the standard error of the mean are returned. Shared by both
-    phase binners so they weight points identically.
+    plain mean and the standard error of the mean (ddof = 1) are returned.
     """
     values = np.asarray(values, dtype=float)
     n = values.size
     if errors is None or not np.any(np.isfinite(errors)):
         if n > 1:
-            return float(np.mean(values)), float(np.std(values) / np.sqrt(n))
+            return float(np.mean(values)), float(np.std(values, ddof=1) / np.sqrt(n))
         return float(values[0]), 0.0
     errors = np.asarray(errors, dtype=float)
     if np.any(~np.isfinite(errors) | (errors <= 0)):
@@ -622,20 +728,65 @@ def weighted_mean(values: np.ndarray, errors: Optional[np.ndarray]) -> Tuple[flo
     return float(np.average(values, weights=weights)), float(np.sqrt(1.0 / np.sum(weights)))
 
 
+def bin_estimate(values: np.ndarray, errors: Optional[np.ndarray],
+                 exposure: Optional[np.ndarray] = None) -> Tuple[float, float]:
+    """Value and error of one phase bin.
+
+    With *exposure* the bin value is the exposure-weighted mean
+    ``sum(v t) / sum(t)`` and its error the propagated ``sqrt(sum (t e)^2) / sum t``.
+    For count data (``v = c N / t``, ``e = c sqrt(N) / t``) that is
+    ``c sum(N) / sum(t)`` with error ``c sqrt(sum N) / sum t``: the estimator a
+    single long exposure would give. Weighting rows by their own Poisson error
+    instead (``1/e^2 = t^2 / (c^2 N)``) makes the bin the harmonic mean of the
+    counts, low by ~1/lambda: -25 % at 3 counts per row, -12 % at 10, and it
+    turns a zero-count row into infinite weight or, after error repair, a row
+    weighted like any other. Zero-count rows contribute exposure but no
+    variance here; a bin with no counts at all gets error 0 and the caller's
+    :func:`sanitize_errors` pass gives it the median bin error.
+
+    Without *exposure* the inverse-variance mean of :func:`weighted_mean` is
+    used (errors must already be > 0), or the plain mean without errors.
+    """
+    values = np.asarray(values, dtype=float)
+    if exposure is None:
+        return weighted_mean(values, errors)
+    t = np.asarray(exposure, dtype=float)
+    total = float(np.sum(t))
+    value = float(np.sum(values * t) / total)
+    if errors is None or not np.any(np.isfinite(errors)):
+        n = values.size
+        err = float(np.sqrt(np.sum((t * (values - value)) ** 2) / (n - 1)) / total) if n > 1 else 0.0
+        return value, err
+    e = np.asarray(errors, dtype=float)
+    return value, float(np.sqrt(np.sum((t * e) ** 2)) / total)
+
+
+def _usable_exposure(df: pd.DataFrame, exposure_column: str) -> Optional[np.ndarray]:
+    """The exposure column as an array when every row has a finite, positive value."""
+    if exposure_column not in df.columns:
+        return None
+    exposure = pd.to_numeric(df[exposure_column], errors="coerce").to_numpy(dtype=float)
+    if not np.all(np.isfinite(exposure)) or np.any(exposure <= 0):
+        return None
+    return exposure
+
+
 def phase_bin_data(
     df: pd.DataFrame,
     n_bins: int = 50,
     min_points_per_bin: int = 3,
     rate_column: str = 'rate',
     error_column: str = 'error',
-    verbose: bool = True
+    verbose: bool = True,
+    exposure_column: str = 'exposure',
 ) -> pd.DataFrame:
     """
     Bin observed data into orbital phase bins.
 
-    This function groups data points by orbital phase and computes weighted
-    averages within each bin. Useful for reducing scatter in light curves
-    and for comparing with phase-folded models.
+    This function groups data points by orbital phase and computes the
+    exposure-weighted average within each bin when *exposure_column* is
+    present (count data; see :func:`bin_estimate`), else the inverse-variance
+    average of the rows' own errors, else the plain mean.
 
     Parameters
     ----------
@@ -660,9 +811,9 @@ def phase_bin_data(
 
     Notes
     -----
-    - Uses weighted mean if errors are available, otherwise simple mean
     - Bins with fewer than min_points_per_bin are excluded
-    - Error on weighted mean is computed as sqrt(1/sum(weights))
+    - Without an exposure column the rows' errors are repaired with
+      :func:`sanitize_errors` before the inverse-variance average
     """
     # Create bin edges
     bin_edges = np.linspace(0, 1, n_bins + 1)
@@ -673,25 +824,32 @@ def phase_bin_data(
     df = df[np.isfinite(df['phase']) & np.isfinite(df[rate_column])].copy()
     df['_bin'] = np.digitize(df['phase'], bin_edges) - 1
     df['_bin'] = df['_bin'].clip(0, n_bins - 1)  # Handle edge case at phase=1
+    exposure = _usable_exposure(df, exposure_column)
+    has_err = error_column in df.columns and df[error_column].notna().any()
+    if has_err and exposure is None:
+        df[error_column] = sanitize_errors(df[error_column], context="phase_bin_data: ")
 
     binned_data = []
 
     for i in range(n_bins):
-        bin_mask = df['_bin'] == i
+        bin_mask = (df['_bin'] == i).to_numpy()
         bin_df = df[bin_mask]
 
         if len(bin_df) >= min_points_per_bin:
             rate_vals = bin_df[rate_column].to_numpy(dtype=float)
-            err_vals = (bin_df[error_column].to_numpy(dtype=float)
-                        if error_column in bin_df.columns else None)
-            mean_rate, mean_err = weighted_mean(rate_vals, err_vals)
+            err_vals = bin_df[error_column].to_numpy(dtype=float) if has_err else None
+            exp_vals = exposure[bin_mask] if exposure is not None else None
+            mean_rate, mean_err = bin_estimate(rate_vals, err_vals, exp_vals)
 
-            binned_data.append({
+            row = {
                 'phase': bin_centers[i],
                 rate_column: mean_rate,
                 error_column: mean_err,
-                'n_points': len(bin_df)
-            })
+                'n_points': len(bin_df),
+            }
+            if exp_vals is not None:
+                row['exposure'] = float(np.sum(exp_vals))
+            binned_data.append(row)
 
     if not binned_data:
         raise ValueError(
@@ -704,8 +862,9 @@ def phase_bin_data(
         result['obs'] = 'binned'
 
     if verbose:
+        how = "exposure-weighted" if exposure is not None else ("inverse-variance" if has_err else "plain mean")
         print(f"Phase binning: {len(df)} points -> {len(result)} bins "
-              f"(avg {len(df)/n_bins:.1f} points/bin)")
+              f"(avg {len(df)/n_bins:.1f} points/bin, {how})")
 
     return result
 
@@ -718,6 +877,7 @@ def phase_bin_data_snr(
     error_column: str = 'error',
     verbose: bool = True,
     phase_origin: float = 0.0,
+    exposure_column: str = 'exposure',
 ) -> pd.DataFrame:
     """
     Adaptive phase binning with approximately constant counts per bin.
@@ -748,7 +908,10 @@ def phase_bin_data_snr(
     -------
     DataFrame
         Columns: phase, *rate_column*, *error_column*, n_points, total_counts,
-        phase_lo, phase_hi, width. The value columns keep the caller's names.
+        phase_lo, phase_hi, width (and exposure when the rows carry it). The
+        value columns keep the caller's names. Bin values follow
+        :func:`bin_estimate`: exposure-weighted when *exposure_column* is
+        present, else inverse-variance with repaired errors.
     """
     if counts_per_bin <= 0:
         raise ValueError("counts_per_bin must be > 0")
@@ -773,6 +936,10 @@ def phase_bin_data_snr(
     origin = float(phase_origin) % 1.0
     work['_u'] = np.mod(work['phase'].to_numpy(dtype=float) - origin, 1.0)
     work = work.sort_values('_u').reset_index(drop=True)
+    exposure = _usable_exposure(work, exposure_column)
+    has_err = error_column in work.columns and work[error_column].notna().any()
+    if has_err and exposure is None:
+        work[error_column] = sanitize_errors(work[error_column], context="phase_bin_data_snr: ")
 
     target = float(counts_per_bin)
     bins: List[List[int]] = []
@@ -801,32 +968,35 @@ def phase_bin_data_snr(
     for indices in bins:
         bin_df = work.iloc[indices]
         rate_vals = bin_df[rate_column].to_numpy(dtype=float)
-        err_vals = (bin_df[error_column].to_numpy(dtype=float)
-                    if error_column in bin_df.columns else None)
-        mean_rate, mean_err = weighted_mean(rate_vals, err_vals)
+        err_vals = bin_df[error_column].to_numpy(dtype=float) if has_err else None
+        exp_vals = exposure[indices] if exposure is not None else None
+        mean_rate, mean_err = bin_estimate(rate_vals, err_vals, exp_vals)
 
+        # Bin centre: where the exposure was, not where the counts were (a
+        # counts-weighted centre leans towards the brighter side of a bin).
         u_vals = bin_df['_u'].to_numpy(dtype=float)
         bin_counts = bin_df[counts_column].to_numpy(dtype=float)
         total_counts = float(np.sum(bin_counts))
-        u_center = float(np.average(u_vals, weights=bin_counts)) if total_counts > 0 else float(np.mean(u_vals))
+        u_center = float(np.average(u_vals, weights=exp_vals)) if exp_vals is not None else float(np.mean(u_vals))
         u_lo, u_hi = float(np.min(u_vals)), float(np.max(u_vals))
         phase_center = (u_center + origin) % 1.0
         phase_lo = (u_lo + origin) % 1.0
         phase_hi = (u_hi + origin) % 1.0
         width = float(max(u_hi - u_lo, 0.0))
 
-        binned_data.append(
-            {
-                'phase': phase_center,
-                rate_column: mean_rate,
-                error_column: mean_err,
-                'n_points': int(len(bin_df)),
-                'total_counts': total_counts,
-                'phase_lo': phase_lo,
-                'phase_hi': phase_hi,
-                'width': width,
-            }
-        )
+        row = {
+            'phase': phase_center,
+            rate_column: mean_rate,
+            error_column: mean_err,
+            'n_points': int(len(bin_df)),
+            'total_counts': total_counts,
+            'phase_lo': phase_lo,
+            'phase_hi': phase_hi,
+            'width': width,
+        }
+        if exp_vals is not None:
+            row['exposure'] = float(np.sum(exp_vals))
+        binned_data.append(row)
 
     result = pd.DataFrame(binned_data)
     if 'obs' in work.columns:
@@ -834,9 +1004,10 @@ def phase_bin_data_snr(
 
     if verbose:
         avg_counts = float(np.mean(result['total_counts'])) if len(result) > 0 else 0.0
+        how = "exposure-weighted" if exposure is not None else ("inverse-variance" if has_err else "plain mean")
         print(
             f"Adaptive phase binning: {len(work)} points -> {len(result)} bins "
-            f"(target {counts_per_bin} counts/bin, avg {avg_counts:.1f})"
+            f"(target {counts_per_bin} counts/bin, avg {avg_counts:.1f}, {how})"
         )
     return result
 
@@ -993,13 +1164,16 @@ def eval_periodic(
 def prepare_model_interpolator(
     sim_df: pd.DataFrame, sim_column: str
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """:func:`periodic_model` of a simulation CSV column (``phase`` or ``deg`` x-axis)."""
-    if "phase" in sim_df.columns:
-        sim_phase = sim_df["phase"].to_numpy(dtype=float)
-    elif "deg" in sim_df.columns:
-        sim_phase = sim_df["deg"].to_numpy(dtype=float) / 360.0
-    else:
-        raise ValueError("Simulation file must contain 'phase' or 'deg' column.")
+    """:func:`periodic_model` of a simulation CSV column on its ``phase`` axis.
+
+    The simulator always writes ``phase = (deg - gma0) / 360``; a file with only
+    ``deg`` is refused rather than guessed at (``deg / 360`` would put
+    mid-eclipse at 0.25 for the default ``gma0 = -90``).
+    """
+    if "phase" not in sim_df.columns:
+        raise ValueError("Simulation file must contain a 'phase' column (the simulator writes one; "
+                         "'deg' alone does not fix the phase origin).")
+    sim_phase = sim_df["phase"].to_numpy(dtype=float)
     if sim_column not in sim_df.columns:
         raise KeyError(f"Column '{sim_column}' not found in simulation DataFrame.")
     return periodic_model(sim_phase, sim_df[sim_column].to_numpy(dtype=float))
@@ -1127,7 +1301,7 @@ def fit_simulation(
             f"(no flux rescaling):\n"
             f"  Phase shift = {best_shift:.5f}{'' if fit_phase_shift else ' (held fixed)'}\n"
             f"  Scattered flux = {float(scatter):.6g} (fixed, additive)\n"
-            f"  Reduced χ² = {reduced_chi2:.3f}  (dof = {dof})"
+            f"  Reduced chi2 = {reduced_chi2:.3f}  (dof = {dof})"
         )
     return float(best_shift), float(reduced_chi2)
 
@@ -1312,24 +1486,36 @@ def best_phase_shift(
     obs_flux: np.ndarray,
     obs_err2: np.ndarray,
     search: PhaseShiftSearch,
+    jitter_frac: Optional[float] = None,
 ) -> Tuple[np.ndarray, float, float]:
-    """Shift of a periodic model that minimizes χ² against the observations.
+    """Shift of a periodic model that best matches the observations.
 
     One ``np.interp`` over the precomputed ``(n_grid, n_obs)`` trial-phase
-    matrix gives χ² at every coarse shift; ``search.n_levels`` dense passes of
-    ``search.n_fine`` points, each spanning ±1 previous step around the best
-    shift, then bring the resolution to ``search.resolution``. The model is
-    ``(phase_ext, flux_ext)`` from :func:`periodic_model`, with any additive
-    floor already included in ``flux_ext``.
+    matrix gives the objective at every coarse shift; ``search.n_levels``
+    dense passes of ``search.n_fine`` points, each spanning +-1 previous step
+    around the best shift, then bring the resolution to ``search.resolution``.
+    The model is ``(phase_ext, flux_ext)`` from :func:`periodic_model`, with
+    any additive floor already included in ``flux_ext``.
 
-    Returns ``(model_at_obs_phases, shift, chi2)``.
+    The objective is the chi2 ``sum((d - m)^2 / err2)``; with *jitter_frac*
+    (the fractional model jitter ``f`` of the jitter likelihood) it is the
+    jitter likelihood's ``-2 ln L`` up to a constant,
+    ``sum((d - m)^2 / s2 + ln s2)`` with ``s2 = err2 + (f m)^2``, so the shift
+    is profiled on the likelihood actually being sampled (profiling it on the
+    classical chi2 instead differed by 16 log-units at f = 0.45).
+
+    Returns ``(model_at_obs_phases, shift, objective)``.
     """
     obs_flux = np.asarray(obs_flux, dtype=float)
     obs_err2 = np.asarray(obs_err2, dtype=float)
 
     def scan(shifted):
         model = np.interp(shifted.ravel(), phase_ext, flux_ext).reshape(shifted.shape)
-        chi2 = np.sum((obs_flux - model) ** 2 / obs_err2, axis=1)
+        if jitter_frac is None:
+            chi2 = np.sum((obs_flux - model) ** 2 / obs_err2, axis=1)
+        else:
+            s2 = obs_err2 + (float(jitter_frac) * model) ** 2
+            chi2 = np.sum((obs_flux - model) ** 2 / s2 + np.log(s2), axis=1)
         j = int(np.argmin(chi2))
         return float(chi2[j]), j, model[j]
 
@@ -1661,7 +1847,7 @@ def apply_saved_run_config(
         for dest, value in sorted(restored):
             print(f"    {flag_of.get(dest, '--' + dest)} = {value!r}")
     else:
-        print("    (nothing to restore — command line already matches)")
+        print("    (nothing to restore - command line already matches)")
     overridden = sorted(
         flag_of.get(d, '--' + d) for d in explicit
         if d not in never and d in saved_args

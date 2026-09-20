@@ -10,14 +10,17 @@ Features:
 2.  Converts observation times to orbital phase using the reference epoch and
     orbital period
 3.  Produces scatter plots of count-rate versus orbital phase
-4.  Fits simulation models to observations via chi-square minimization
-5.  Supports multiple energy bands and automatically detects available flux columns
+4.  Fits one simulated model light curve (one ``nfl_*`` column, auto-detected
+    when the file holds exactly one) to the observations by chi-square
+    minimization over the phase shift
 
 File Format:
-  Whitespace-delimited text files with three columns:
-    1. time (seconds)
-    2. count rate / flux
-    3. error (optional)
+  Whitespace-delimited text files, either with a ``# Columns: a, b, ...``
+  header naming the columns (the CIAO layout ``dt, t_raw, mjd, phase, counts,
+  rate, rate_err, flux_t`` and the synthetic layout with an extra ``exposure``
+  column), or headerless with two or three columns: time (s), rate/flux,
+  error (optional). Phase is always recomputed from the time column and the
+  ephemeris; an ``mjd`` time column is converted to seconds first.
 
 Examples
 ~~~~~~~~
@@ -58,13 +61,13 @@ $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
 $ python chandra_phase_analysis.py --data-dir data --fit --sim-file sim.csv \\
     --sim-column nfl_broad --fit-phase-shift --write-model broad_model.txt
 
-# Load CIAO format data (time in second column, flux as ECF):
+# Load CIAO-layout data (flux_t column, t_raw as the time):
 $ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
-    --obs-column ECF --output ciao_plot.png
+    --obs-column flux_t --time-column t_raw --output ciao_plot.png
 
-# Fit CIAO data to simulation:
+# Fit CIAO-layout data to a simulation:
 $ python chandra_phase_analysis.py --data-dir data/IC_10_X1_LC_CIAO/broad \\
-    --obs-column ECF --fit --sim-file sim.csv --output ciao_fit.png
+    --obs-column flux_t --time-column t_raw --fit --sim-file sim.csv --output ciao_fit.png
 
 Implementation note
 ~~~~~~~~~~~~~~~~~~~
@@ -82,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 import numpy as np
 import pandas as pd
@@ -98,6 +102,8 @@ from utils.utils import (
     dest_to_flag,
     detect_flux_columns,
     drop_invalid_flux_rows,
+    drop_unobserved_rows,
+    note_dropped_zero_count_rows,
     estimate_scattered_flux,
     eval_periodic,
     explicit_cli_dests,
@@ -251,12 +257,12 @@ def main() -> None:
     parser.add_argument(
         "--fit",
         action="store_true",
-        help="Perform χ² minimization to fit simulation to observations.",
+        help="Perform a chi2 minimization to fit the simulation to the observations.",
     )
     parser.add_argument(
         "--fit-phase-shift",
         action="store_true",
-        help="Optimize the model phase shift to minimize χ². By default the "
+        help="Optimize the model phase shift to minimize chi2. By default the "
              "shift is held at 0. Flux is never rescaled: the model's absolute "
              "normalization is fixed by the wind mass-loss rate and the XSPEC "
              "flux-vs-nH table, and the only y-direction freedom is the "
@@ -291,9 +297,12 @@ def main() -> None:
     parser.add_argument(
         "--keep-zero-flux",
         action="store_true",
-        help="Keep rows with rate/flux <= 0 (zero-count bins, negative background-subtracted "
-             "rates) instead of dropping them; their zero errors are replaced by the median "
-             "valid error. Same rule as mcmc_lightcurve_fit.py.",
+        help="Keep rows with rate/flux <= 0 (observed zero-count bins, negative background-"
+             "subtracted rates) instead of dropping them on load. For Poisson count data whose "
+             "exposure is known (an exposure column, or counts and rate) they belong in the "
+             "exposure-weighted bins; a CIAO-layout file cannot tell an observed empty bin from an "
+             "unobserved GTI gap, which is why dropping is the default. Same rule as "
+             "mcmc_lightcurve_fit.py.",
     )
     parser.add_argument(
         "--phase-window",
@@ -372,28 +381,33 @@ def main() -> None:
         print("Error column will be auto-detected")
     if args.time_column:
         print(f"Using time column: {args.time_column}")
-    df = load_data(
-        args.data_dir,
-        obs_column=obs_column,
-        obs_error_column=args.obs_error_column,
-        time_column=args.time_column,
-    )
+    try:
+        df = load_data(
+            args.data_dir,
+            obs_column=obs_column,
+            obs_error_column=args.obs_error_column,
+            time_column=args.time_column,
+        )
+    except (FileNotFoundError, ValueError, pd.errors.EmptyDataError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"Loaded {len(df)} data point(s) from {df['obs'].nunique()} observation(s).")
-    
-    # Same row rules as the MCMC loader: non-finite rows always go, rows with
-    # rate/flux <= 0 (zero-count bins, zero-exposure gaps) unless --keep-zero-flux.
+
+    # Same row rules as the MCMC loader: rows with no exposure and non-finite
+    # rows always go, rows with rate/flux <= 0 (zero-count bins) unless
+    # --keep-zero-flux.
+    df = drop_unobserved_rows(df)
+    note_dropped_zero_count_rows(df, 'rate', not args.keep_zero_flux)
     df = drop_invalid_flux_rows(df, 'rate', drop_nonpositive=not args.keep_zero_flux)
+    if df.empty:
+        print("ERROR: no usable data points after dropping non-finite / non-positive rows.", file=sys.stderr)
+        sys.exit(1)
     try:
         df = apply_phase_window(df, *args.phase_window)
     except ValueError as e:
         parser.error(str(e))
-    # One error repair, before binning (the MCMC loader does the same).
-    if 'error' in df.columns and df['error'].notna().any():
-        try:
-            df['error'] = sanitize_errors(df['error'], context=f"{args.data_dir}: ")
-        except ValueError as e:
-            parser.error(str(e))
-    else:
+    has_errors = 'error' in df.columns and df['error'].notna().any()
+    if not has_errors:
         df = df.drop(columns=['error'], errors='ignore')
         if args.no_phase_bin or args.fit:
             print("Warning: the observations carry no measurement errors; binned errors come "
@@ -430,6 +444,14 @@ def main() -> None:
             )
         is_binned = True
 
+    # One error repair on whatever enters the fit: binned errors (a bin of
+    # zero-count rows has error 0 under exposure weighting) or the rows'.
+    if has_errors:
+        try:
+            df['error'] = sanitize_errors(df['error'], context=f"{args.data_dir}: ")
+        except ValueError as e:
+            parser.error(str(e))
+
     smooth_df = None
     if args.smooth:
         grid = np.linspace(0.0, 1.0, 300, endpoint=False)
@@ -455,7 +477,12 @@ def main() -> None:
             print(f"Estimated scattered flux from eclipse window: {scatter_value:.6g}")
 
         print(f"Loading simulation file: {args.sim_file}")
-        sim_df = pd.read_csv(args.sim_file)
+        if not os.path.isfile(args.sim_file):
+            parser.error(f"--sim-file not found: {args.sim_file}")
+        try:
+            sim_df = pd.read_csv(args.sim_file)
+        except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+            parser.error(f"--sim-file {args.sim_file}: {e}")
 
         # One model column per fit: the simulation is run one band at a time.
         available = detect_flux_columns(sim_df)
