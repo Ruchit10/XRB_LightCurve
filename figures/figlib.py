@@ -104,9 +104,51 @@ def load_json(name: str):
         return json.load(fh)
 
 
-def label_panels(axes, x: float = -0.12, y: float = 1.02) -> None:
-    for letter, ax in zip("abcdefgh", np.ravel(axes)):
-        ax.text(x, y, f"({letter})", transform=ax.transAxes, fontweight="bold", va="bottom", ha="right")
+def label_panels(axes, letters: str = "abcdefgh") -> None:
+    """Panel letters as left-aligned titles: above the axes, never over a label or the data."""
+    for letter, ax in zip(letters, np.ravel(axes)):
+        ax.set_title(f"({letter})", loc="left", fontweight="bold", fontsize=9)
+
+
+LEGEND_ROW_IN = 0.17      # height of one legend row at 7 pt, inches
+
+
+def panels(n: int, height: float, legend_rows: int, width: float = WIDTH, width_ratios=None, span_legend: bool = False):
+    """*n* side-by-side panels with a legend strip beneath them, laid out by the constrained-layout engine.
+
+    Returns ``(fig, axes, legend_axes)``; the legend axes are invisible frames of the strip (one per
+    panel, or a single one spanning the width when *span_legend*). Legends drawn into them never
+    overlap data, tick labels or each other."""
+    lh = LEGEND_ROW_IN * max(1, legend_rows) + 0.12
+    fig = plt.figure(figsize=(width, height + lh), constrained_layout=True)
+    gs = fig.add_gridspec(2, n, height_ratios=[height, lh], width_ratios=width_ratios)
+    axes = [fig.add_subplot(gs[0, i]) for i in range(n)]
+    if span_legend:
+        laxes = [fig.add_subplot(gs[1, :])]
+    else:
+        laxes = [fig.add_subplot(gs[1, i]) for i in range(n)]
+    for la in laxes:
+        la.axis("off")
+    return fig, axes, laxes
+
+
+def put_legend(lax, src_ax=None, ncol: int = 1, fontsize: float = 7, handles=None, labels=None):
+    """Draw the legend of *src_ax* (or the given handles) into the legend strip *lax*."""
+    if handles is None:
+        handles, labels = src_ax.get_legend_handles_labels()
+    if not handles:
+        return None
+    return lax.legend(handles, labels, loc="upper center", ncol=ncol, fontsize=fontsize, frameon=False,
+                      borderaxespad=0.0, columnspacing=1.0, handlelength=1.6, handletextpad=0.5)
+
+
+def merged_handles(axes):
+    handles, labels = [], []
+    for ax in axes:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            if l not in labels:
+                handles.append(h); labels.append(l)
+    return handles, labels
 
 
 def fmt(x: float, digits: int = 3) -> str:
@@ -222,7 +264,7 @@ def fig_wind_profiles(R: float = 2.5) -> plt.Figure:
     """(a) g(r) of the three profiles at their defaults (R_star = R), with the r^-2 asymptote;
     (b) the dimensionless column of a ray behind the star versus impact parameter."""
     r = np.logspace(np.log10(R * 1.001), np.log10(60.0), 600)
-    fig, (ax, bx) = plt.subplots(1, 2, figsize=(WIDTH, WIDTH * 0.42))
+    fig, (ax, bx), (la, lb) = panels(2, WIDTH * 0.4, legend_rows=2)
     for model in K.WIND_MODEL_IDS:
         params = K.default_wind_params(model, R)
         g = K.evaluate_g_profile(r, model, params)
@@ -236,9 +278,10 @@ def fig_wind_profiles(R: float = 2.5) -> plt.Figure:
     ax.loglog(r, r ** -2.0, "k:", lw=0.8, label=r"$r^{-2}$")
     ax.set(xlabel=r"$r$ ($R_\odot$)", ylabel=r"$g(r)\,/\,C$")
     ax.axvline(R, color="0.6", lw=0.7); ax.text(R * 1.05, ax.get_ylim()[0] * 3, r"$R_\star$", color="0.4")
-    bx.set(xlabel=r"impact parameter $b$ ($R_\odot$)", ylabel=r"$\int g\,{\rm d}z\,/\,C$  (emitter behind the star)")
-    ax.legend(); label_panels([ax, bx])
-    fig.tight_layout()
+    bx.set(xlabel=r"impact parameter $b$ ($R_\odot$)", ylabel=r"$\int g\,{\rm d}z\,/\,C$")
+    bx.set_title("emitter behind the star", loc="right", fontsize=7, color="0.35")
+    label_panels([ax, bx])
+    put_legend(la, ax, ncol=2); put_legend(lb, bx, ncol=2)
     return fig
 
 
@@ -295,27 +338,31 @@ def kernel_column(b: float, z_start: float, model: str, params: Dict[str, float]
 
 def fig_quadrature(R: float = 2.0, z_start: float = 17.0) -> Tuple[plt.Figure, dict]:
     params = {m: K.default_wind_params(m, R) for m in K.WIND_MODEL_IDS}
-    b_sets = {"smooth_pl": [0.5, 2.0, 5.0, 20.0], "confinement": [2.1, 3.0, 5.0, 20.0], "beta_law": [2.1, 3.0, 5.0, 20.0]}
-    fig, axes = plt.subplots(1, 2, figsize=(WIDTH, WIDTH * 0.45))
-    ax, bx = axes
-    u = np.linspace(-0.5 * math.pi + 1e-4, math.atan(z_start / 0.5), 800)
+    b_list = [2.1, 3.0, 5.0, 20.0]                       # all beyond R_star = 2, so every profile is defined
+    b_sets = {m: b_list for m in K.WIND_MODEL_IDS}
+    fig, (ax, bx), (la, lb) = panels(2, WIDTH * 0.42, legend_rows=4)
+    axes = [ax, bx]
+    u = np.linspace(-0.5 * math.pi + 1e-4, math.atan(z_start / b_list[0]), 800)
     styles = {"smooth_pl": "-", "confinement": "--", "beta_law": ":"}
+    short = {"smooth_pl": "broken PL", "confinement": "confinement", "beta_law": r"$\beta$-law"}
     for model, bs in b_sets.items():
         for j, b in enumerate(bs):
             uu = u[u < math.atan(z_start / b)]
-            ax.plot(uu, integrand_u(uu, b, model, params[model]), styles[model], color=f"C{j}", lw=1.0,
-                    label=f"{PROFILE_LABELS[model]}, $b={b:g}$" if model == "smooth_pl" or j == 0 else None)
+            ax.plot(uu, integrand_u(uu, b, model, params[model]), styles[model], color=f"C{j}", lw=1.0)
     ax.set(xlabel=r"$u = \arctan(z/b)$", ylabel=r"$b\,g(b/\cos u)\,\sec^2 u$", yscale="log")
     ax.set_xlim(-0.5 * math.pi, 1.6)
-    ax.legend(fontsize=6.5, ncol=1)
+    from matplotlib.lines import Line2D
+    handles_a = [Line2D([], [], color=f"C{j}", label=f"$b = {b:g}\\,R_\\odot$") for j, b in enumerate(b_list)]
+    handles_a += [Line2D([], [], color="0.3", ls=styles[m], label=short[m]) for m in K.WIND_MODEL_IDS]
+    put_legend(la, handles=handles_a, labels=[h.get_label() for h in handles_a], ncol=2, fontsize=6.5)
 
-    cases = [("smooth_pl", 0.5), ("smooth_pl", 5.0), ("confinement", 2.1), ("beta_law", 2.5), ("beta_law", 2.1), ("beta_law", 2.02)]
+    cases = [("smooth_pl", 2.1), ("smooth_pl", 5.0), ("confinement", 2.1), ("beta_law", 2.5), ("beta_law", 2.1), ("beta_law", 2.02)]
     ns = np.arange(4, 34, 2)
     summary = {}
     for model, b in cases:
         ref = reference_column(b, z_start, model, params[model])
         err = np.array([abs(gl_column(b, z_start, model, params[model], int(n)) / ref - 1.0) for n in ns])
-        lab = f"{PROFILE_LABELS[model]}, $b={b:g}$" + (f" ($b-R_\\star={b - R:g}$)" if model == "beta_law" else "")
+        lab = f"{short[model]}, $b={b:g}$" + (f" ($b-R_\\star={b - R:g}$)" if model == "beta_law" else "")
         line, = bx.semilogy(ns, np.maximum(err, 1e-17), marker="o", ms=3, lw=0.9, label=lab)
         kern = abs(kernel_column(b, z_start, model, params[model]) / ref - 1.0)
         bx.plot([16], [max(kern, 1e-17)], marker="*", ms=9, color=line.get_color(), ls="none")
@@ -323,9 +370,8 @@ def fig_quadrature(R: float = 2.0, z_start: float = 17.0) -> Tuple[plt.Figure, d
     bx.axvline(16, color="0.5", lw=0.8)
     bx.set(xlabel=r"nodes $n$", ylabel="relative error", ylim=(1e-17, 3))
     bx.plot([], [], "k*", ms=8, ls="none", label="kernel at $n=16$ (limb split)")
-    bx.legend(fontsize=6.2)
     label_panels(axes)
-    fig.tight_layout()
+    put_legend(lb, bx, ncol=2, fontsize=6.5)
     save_json("quadrature", summary)
     return fig, summary
 
@@ -390,34 +436,35 @@ def _step_axis(ax, values):
 
 
 def fig_convergence(study: dict) -> plt.Figure:
-    fig, axes = plt.subplots(1, 2, figsize=(WIDTH, WIDTH * 0.45))
-    ax, bx = axes
+    fig, (ax, bx), (la, lb) = panels(2, WIDTH * 0.42, legend_rows=3)
+    axes = [ax, bx]
     dths = [v for v in study["dths"]]
     for k, (name, rows) in enumerate(study["dth"].items()):
         x = [r["value"] for r in rows][:-1]
         mean = [max(r["mean_rel_change"], 1e-16) for r in rows][:-1]
         mx = [max(r["max_rel_change"], 1e-16) for r in rows][:-1]
-        ax.plot(x, mean, marker="o", color=f"C{k}", label=f"System {name}: mean over phase")
-        ax.plot(x, mx, ls="--", marker="o", mfc="none", color=f"C{k}", lw=0.8, label=f"System {name}: maximum (contact points)")
+        ax.plot(x, mean, marker="o", color=f"C{k}", label=f"{name}: mean over phase")
+        ax.plot(x, mx, ls="--", marker="o", mfc="none", color=f"C{k}", lw=0.8, label=f"{name}: maximum (contacts)")
     ax.set_yscale("log"); _step_axis(ax, dths)
     ax.axvline(2.0, color="0.5", lw=0.8); ax.axhline(1e-3, color="0.7", lw=0.7, ls=":")
     ax.set(xlabel=r"phase step $\Delta\gamma$ (deg)", ylabel=r"$|\Delta F_b|\,/\,F_{b,\rm out}$ vs $\Delta\gamma=%g^\circ$" % dths[-1])
     tx = ax.twinx()
     rows_a = study["dth"]["A"]
     tx.plot([r["value"] for r in rows_a], [r["wall_ms"] for r in rows_a], color="0.45", ls=":", marker=".", lw=0.9)
-    tx.set_ylabel("wall time per light curve, System A (ms)", color="0.45", fontsize=7)
+    tx.set_ylabel("wall time, System A (ms)", color="0.45", fontsize=7)
     tx.tick_params(axis="y", colors="0.45", labelsize=7); tx.set_yscale("log")
-    ax.legend(fontsize=5.8, loc="lower left")
-    labels = {"A": "System A", "B": "System B", "A_extended": f"System A, extended emitter ($r={study['extended_r']:g}\\,R_\\odot$)"}
+    h, l = ax.get_legend_handles_labels()
+    h.append(tx.get_lines()[0]); l.append("wall time (right axis)")
+    put_legend(la, handles=h, labels=l, ncol=2, fontsize=6.3)
+    labels = {"A": "System A", "B": "System B", "A_extended": f"System A, $r={study['extended_r']:g}\\,R_\\odot$ emitter"}
     for name, rows in study["d2h"].items():
         x = [r["value"] for r in rows][:-1]; y = [max(r["max_rel_change"], 1e-16) for r in rows][:-1]
         bx.plot(x, y, marker="s", label=labels.get(name, name))
     bx.set_yscale("log"); _step_axis(bx, [v for v in study["d2hs"]])
     bx.axvline(6.0, color="0.5", lw=0.8); bx.axhline(1e-3, color="0.7", lw=0.7, ls=":")
     bx.set(xlabel=r"sector size $\Delta\theta$ (deg)", ylabel=r"max $|\Delta F_b|\,/\,F_{b,\rm out}$ vs $\Delta\theta=%g^\circ$" % study["d2hs"][-1])
-    bx.legend(fontsize=6.2, loc="center left")
     label_panels(axes)
-    fig.tight_layout()
+    put_legend(lb, bx, ncol=2, fontsize=6.5)
     return fig
 
 
@@ -450,8 +497,8 @@ def fig_percell(band: str = "broad", r: float = 6.0, name: str = "B") -> Tuple[p
     for target in (0.6, 0.15):
         picks.append(int(partial[np.argmin(np.abs(vis_frac[partial] - target))]) if partial.size else picks[0])
 
-    fig = plt.figure(figsize=(WIDTH, WIDTH * 0.95), constrained_layout=True)
-    gs = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.25])
+    fig = plt.figure(figsize=(WIDTH, WIDTH * 1.0), constrained_layout=True)
+    gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.25, 0.16])
     geo = {k: kw[k] for k in ("r", "R", "d1", "d2", "i0")}
     cells_kw = dict(geo, d2h=kw["d2h"], wind_model=kw["wind_model"], wind_params=kw["wind_params"], mdot=kw["mdot"],
                     v_inf=kw["v_inf"], mu_wind=kw["mu_wind"], f_opacity=kw["f_opacity"])
@@ -469,7 +516,7 @@ def fig_percell(band: str = "broad", r: float = 6.0, name: str = "B") -> Tuple[p
                         cmap="viridis", vmin=vmin, vmax=vmax, lw=0)
         ax.scatter(cells["theta"][~vis], cells["rho"][~vis], c="0.8", s=4, lw=0)
         ax.set_yticks([]); ax.set_xticks([]); ax.set_ylim(0, r)
-        ax.set_title(f"$\\phi={phase[k]:.3f}$, visible {vis_frac[k]:.0%}", fontsize=8, pad=4)
+        ax.set_title(("(a)  " if i == 0 else "") + f"$\\phi={phase[k]:.3f}$\n{vis_frac[k]:.0%} visible", fontsize=7.5, pad=3)
     cbar = fig.colorbar(sc, ax=fig.axes[:3], orientation="horizontal", fraction=0.05, pad=0.08)
     cbar.set_label(r"$\log_{10} N_{\rm H}$ (10$^{22}$ cm$^{-2}$)")
     bx = fig.add_subplot(gs[1, :2])
@@ -479,7 +526,7 @@ def fig_percell(band: str = "broad", r: float = 6.0, name: str = "B") -> Tuple[p
         bx.axvline(phase[k], color="0.7", lw=0.7)
     bx.set(xlabel="orbital phase", ylabel=r"$F_b$ (erg cm$^{-2}$ s$^{-1}$)", yscale="log", xlim=(0.25, 0.75),
            ylim=(1e-4 * F_cell.max(), 1.6 * F_cell.max()))
-    bx.legend(loc="lower left")
+    lax = fig.add_subplot(gs[2, :2]); lax.axis("off"); put_legend(lax, bx, ncol=2)
     cx = fig.add_subplot(gs[1, 2])
     # The ratio is only meaningful where the mean-column flux is not itself
     # negligible: below 1e-3 of the out-of-eclipse flux it diverges as the mean
@@ -489,8 +536,8 @@ def fig_percell(band: str = "broad", r: float = 6.0, name: str = "B") -> Tuple[p
     ratio = np.full(phase.size, np.nan); ratio[ok] = F_cell[ok] / F_mean[ok]
     cx.semilogy(phase, ratio)
     cx.set(xlabel="orbital phase", ylabel=r"$\langle F(N_k)\rangle / F(\langle N\rangle)$", xlim=(0.25, 0.75))
-    cx.text(0.02, 0.97, r"where $F(\langle N\rangle) > 10^{-3} F_{\rm out}$", transform=cx.transAxes, fontsize=6, va="top")
-    label_panels([fig.axes[0], bx, cx], x=-0.05)
+    cx.set_title(r"where $F(\langle N\rangle) > 10^{-3} F_{\rm out}$", loc="right", fontsize=6, color="0.35")
+    label_panels([bx, cx], letters="bc")
     summary = {"system": name, "max_ratio": float(np.nanmax(ratio)), "phase_of_max": float(phase[int(np.nanargmax(ratio))]),
                "r": r, "d2h": kw["d2h"], "phases_shown": [float(phase[k]) for k in picks],
                "note": "ratio evaluated where F(<N>) > 1e-3 F_out"}
@@ -517,8 +564,8 @@ def eclipse_width_half_depth(phase: np.ndarray, flux: np.ndarray) -> Tuple[float
 def fig_energy_dependence(dth: float = 1.0) -> Tuple[plt.Figure, dict]:
     tables = available_tables()
     bands = [b for b in ("soft", "medium", "hard", "broad") if b in tables]
-    fig, axes = plt.subplots(1, 2, figsize=(WIDTH, WIDTH * 0.42))
-    ax, bx = axes
+    fig, (ax, bx), (la, lb) = panels(2, WIDTH * 0.4, legend_rows=2)
+    axes = [ax, bx]
     summary = {}
     for name, marker in (("A", "o"), ("B", "s")):
         for band in bands:
@@ -531,13 +578,12 @@ def fig_energy_dependence(dth: float = 1.0) -> Tuple[plt.Figure, dict]:
             bx.plot([math.sqrt(lo * hi)], [width], marker=marker, color=f"C{bands.index(band)}", ls="none")
     for name, marker in (("A", "o"), ("B", "s")):
         bx.plot([], [], marker=marker, color="k", ls="none", label=f"System {name}")
-    ax.set(xlabel="orbital phase", ylabel=r"$F_b / F_{b,\rm out}$", xlim=(0.3, 0.7)); ax.legend()
-    bx.set(xlabel=r"band energy $\sqrt{E_{\min}E_{\max}}$ (keV)", ylabel="eclipse width at half depth (phase)", xscale="log")
-    bx.legend()
+    ax.set(xlabel="orbital phase", ylabel=r"$F_b / F_{b,\rm out}$", xlim=(0.3, 0.7))
+    bx.set(xlabel=r"band energy $\sqrt{E_{\min}E_{\max}}$ (keV)", ylabel="half-depth eclipse width (phase)", xscale="log")
     label_panels(axes)
-    fig.tight_layout()
+    put_legend(la, ax, ncol=2); put_legend(lb, bx, ncol=2)
     if len(bands) < 2:
-        fig.text(0.5, 0.5, "only one band table available", ha="center", color="crimson")
+        bx.set_title("only one band table available", loc="right", fontsize=7, color="crimson")
     save_json("energy_dependence", summary)
     return fig, summary
 
@@ -604,18 +650,23 @@ def invariance_table(study: dict, lams=(0.8, 2.0)) -> str:
 def fig_invariance(study: dict, model: str = "smooth_pl", lams=(0.8, 2.0)) -> plt.Figure:
     c = study[f"curves_{model}"]
     ph, ref = np.array(c["phase"]), np.array(c["ref"])
-    fig, axes = plt.subplots(2, 1, figsize=(WIDTH * 0.6, WIDTH * 0.62), sharex=True, height_ratios=[2, 1])
-    ax, rx = axes
+    lh = LEGEND_ROW_IN * 3 + 0.12
+    fig = plt.figure(figsize=(WIDTH * 0.75, WIDTH * 0.62 + lh), constrained_layout=True)
+    gs = fig.add_gridspec(3, 1, height_ratios=[2.0, 1.0, lh / (WIDTH * 0.62) * 3.0])
+    ax = fig.add_subplot(gs[0]); rx = fig.add_subplot(gs[1], sharex=ax); lax = fig.add_subplot(gs[2]); lax.axis("off")
+    axes = [ax, rx]
+    plt.setp(ax.get_xticklabels(), visible=False)
     ax.plot(ph, ref, "k", lw=1.6, label=r"$\lambda=1$")
-    for lam in lams:
+    for j, lam in enumerate(lams):
         t = np.array(c[f"T_{lam:g}"]); ctrl = np.array(c[f"control_{lam:g}"])
-        ax.plot(ph, t, "--", label=rf"$T_\lambda$, $\lambda={lam:g}$ (lengths and $f_{{\rm opa}}$ scaled)")
-        ax.plot(ph, ctrl, ":", label=rf"lengths $\times{lam:g}$, $f_{{\rm opa}}$ fixed (control)")
+        ax.plot(ph, t, "--", color=f"C{j}", label=rf"$T_\lambda$ ($\lambda={lam:g}$): lengths and $f_{{\rm opa}}$ scaled")
+        ax.plot(ph, ctrl, ":", color=f"C{j}", label=rf"control: lengths $\times{lam:g}$, $f_{{\rm opa}}$ fixed")
         ok = ref > 1e-3 * ref.max()
-        rx.plot(ph[ok], (t[ok] / ref[ok] - 1.0) * 1e15, label=rf"$\lambda={lam:g}$")
-    ax.set(ylabel=r"$F_b$ (erg cm$^{-2}$ s$^{-1}$)", yscale="log"); ax.legend(fontsize=6.3)
-    rx.set(xlabel="orbital phase", ylabel=r"$T_\lambda$ residual ($\times 10^{15}$)"); rx.legend(fontsize=6.5)
-    fig.tight_layout()
+        rx.plot(ph[ok], (t[ok] / ref[ok] - 1.0) * 1e15, color=f"C{j}", lw=0.9)
+    ax.set(ylabel=r"$F_b$ (erg cm$^{-2}$ s$^{-1}$)", yscale="log")
+    rx.set(xlabel="orbital phase", ylabel=r"$T_\lambda$ residual ($\times 10^{15}$)")
+    label_panels(axes)
+    put_legend(lax, ax, ncol=2, fontsize=6.5)
     return fig
 
 
@@ -746,16 +797,19 @@ def truth_for_names(names: Sequence[str], system: str = "A", band: str = "broad"
 
 def fig_injection(fit: dict, pred: dict) -> Tuple[plt.Figure, dict]:
     data, binned = fit["data"], fit["binned"]
-    fig = plt.figure(figsize=(WIDTH, WIDTH * 0.62))
-    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
-    ax = fig.add_subplot(gs[0]); rx = fig.add_subplot(gs[1], sharex=ax)
+    lh = LEGEND_ROW_IN + 0.12
+    fig = plt.figure(figsize=(WIDTH, WIDTH * 0.62 + lh), constrained_layout=True)
+    gs = fig.add_gridspec(3, 1, height_ratios=[3.0, 1.0, 4.0 * lh / (WIDTH * 0.62)])
+    ax = fig.add_subplot(gs[0]); rx = fig.add_subplot(gs[1], sharex=ax); lax = fig.add_subplot(gs[2]); lax.axis("off")
     chi2 = float(np.sum((data.flux - pred["map_at_obs"]) ** 2 / data.err2))
     dof = M.degrees_of_freedom(fit["spec"], data.flux.size, True)
     plot_lightcurve_fit(data.phase, data.flux, data.err, model_phase=pred["grid"], model_flux=pred["map"],
                         obs_model=pred["map_at_obs"], obs_phase_width=binned["width"].to_numpy(), band=fit["cfg"]["band"],
                         red_chi2=chi2 / dof, ax=ax, ax_res=rx, model_label="MAP model", obs_label="synthetic bins")
     ax.fill_between(pred["grid"], pred["lo"], pred["hi"], color="C1", alpha=0.25, lw=0, label="68% posterior predictive")
-    ax.legend(fontsize=7)
+    if ax.get_legend() is not None:
+        ax.get_legend().remove()
+    put_legend(lax, ax, ncol=3)
     summary = {"chi2": chi2, "dof": int(dof), "shift_map": pred["shift"], "n_bins": int(data.flux.size)}
     return fig, summary
 
@@ -842,7 +896,9 @@ def fig_ridge(fits: Dict[str, dict], truths: Dict[str, float]) -> plt.Figure:
     import corner
     titles = {"ridge_broad": r"(a) broad priors on $R$ and $f_{\rm opa}$", "ridge_tightR": r"(b) tight prior on $R$",
               "ridge_fopa_frozen": r"(c) $f_{\rm opa}$ frozen"}
-    fig, axes = plt.subplots(1, 3, figsize=(WIDTH, WIDTH * 0.36), sharey=True)
+    fig, axes, (lax,) = panels(3, WIDTH * 0.34, legend_rows=1, span_legend=True)
+    for ax in axes[1:]:
+        ax.sharey(axes[0]); plt.setp(ax.get_yticklabels(), visible=False)
     m_true, f_true = truths["M_tot"], truths["log_fopa"]
     for ax, name in zip(axes, ("ridge_broad", "ridge_tightR", "ridge_fopa_frozen")):
         fit = fits.get(name)
@@ -860,15 +916,14 @@ def fig_ridge(fits: Dict[str, dict], truths: Dict[str, float]) -> plt.Figure:
             f0 = fit["frozen"]["log_fopa"]
             lo68, hi68 = np.percentile(m, [16, 84]); lo95, hi95 = np.percentile(m, [2.5, 97.5])
             ax.plot([lo95, hi95], [f0, f0], color="C0", lw=2, alpha=0.5)
-            ax.plot([lo68, hi68], [f0, f0], color="C0", lw=5, label=r"$M_{\rm tot}$ 68 % / 95 % interval")
-            ax.legend(fontsize=6.5, loc="lower right")
+            ax.plot([lo68, hi68], [f0, f0], color="C0", lw=5, label=r"$M_{\rm tot}$ 68 % (thick) / 95 % (thin)")
         mm = np.linspace(max(1.0, 0.3 * m_true), 3.5 * m_true, 200)
-        ax.plot(mm, f_true + (1.0 / 3.0) * np.log10(mm / m_true), "k--", lw=1.0, label=r"$f_{\rm opa}\propto M_{\rm tot}^{1/3}$")
+        ax.plot(mm, f_true + (1.0 / 3.0) * np.log10(mm / m_true), "k--", lw=1.0, label=r"flat direction $f_{\rm opa}\propto M_{\rm tot}^{1/3}$")
         ax.plot([m_true], [f_true], marker="*", ms=10, color="crimson", ls="none", label="injected")
         ax.set_xlabel(r"$M_{\rm tot}$ ($M_\odot$)")
     axes[0].set_ylabel(r"$\log_{10} f_{\rm opa}$")
-    axes[0].legend(fontsize=6.5, loc="upper left")
-    fig.tight_layout()
+    handles, labels = merged_handles(axes)
+    put_legend(lax, handles=handles, labels=labels, ncol=3, fontsize=6.5)
     return fig
 
 
@@ -901,11 +956,11 @@ def fig_shift_profile(fit: Optional[dict] = None, seed: int = 3) -> Tuple[plt.Fi
     grid = np.linspace(0, 1, 20001)[:-1]
     chi2 = np.array([np.sum((obs_flux - U.eval_periodic(pe, fe, obs_phase, shift=s)) ** 2 / err2) for s in grid])
     coarse = np.array([np.sum((obs_flux - U.eval_periodic(pe, fe, obs_phase, shift=s)) ** 2 / err2) for s in search.shift_grid])
-    fig, (ax, bx) = plt.subplots(1, 2, figsize=(WIDTH, WIDTH * 0.4))
+    fig, (ax, bx), (la, lb) = panels(2, WIDTH * 0.38, legend_rows=2)
     ax.plot(grid, chi2, color="0.3", lw=0.8, label="brute force (20 000 shifts)")
     ax.plot(search.shift_grid, coarse, "o", ms=2.5, color="C0", label=f"coarse grid ({search.shift_grid.size})")
     ax.plot([best_shift], [best_chi2], "*", ms=10, color="crimson", label="search result")
-    ax.set(xlabel="trial phase shift", ylabel=r"$\chi^2$", yscale="log"); ax.legend(fontsize=6.5)
+    ax.set(xlabel="trial phase shift", ylabel=r"$\chi^2$", yscale="log")
     j = int(np.argmin(chi2)); half = 1.0 / search.shift_grid.size
     sel = np.abs(((grid - grid[j] + 0.5) % 1.0) - 0.5) < 1.5 * half
     bx.plot(grid[sel], chi2[sel], color="0.3", lw=0.8)
@@ -915,7 +970,7 @@ def fig_shift_profile(fit: Optional[dict] = None, seed: int = 3) -> Tuple[plt.Fi
     bx.axvline(grid[j], color="0.6", lw=0.7)
     bx.set(xlabel="trial phase shift (zoom)", ylabel=r"$\chi^2$")
     label_panels([ax, bx])
-    fig.tight_layout()
+    put_legend(la, ax, ncol=2, fontsize=6.5)
     summary = {"search_shift": best_shift, "search_chi2": best_chi2, "brute_shift": float(grid[j]),
                "brute_chi2": float(chi2[j]), "search_minus_brute_chi2": float(best_chi2 - chi2[j]),
                "brute_grid_step": float(grid[1] - grid[0]), "search_resolution": search.resolution,
@@ -955,18 +1010,23 @@ def binning_bias_study(lams=(0.5, 1, 2, 3, 5, 10, 20, 50), n_rows: int = 45, tri
 
 def fig_binning_bias(study: dict) -> plt.Figure:
     lam = np.array(study["lam"])
-    fig, (ax, bx) = plt.subplots(1, 2, figsize=(WIDTH, WIDTH * 0.4))
+    fig, (ax, bx), (la, lb) = panels(2, WIDTH * 0.38, legend_rows=3)
     ax.semilogx(lam, 100 * np.array(study["inv_var"]), "o-", label=r"inverse-variance, $\sigma_n = \sqrt{N_n}$")
     ax.semilogx(lam, 100 * np.array(study["drop_zero_mean"]), "s-", label="plain mean, zero-count rows dropped")
     ax.semilogx(lam, 100 * np.array(study["exposure"]), "^-", label="exposure-weighted (adopted)")
     ax.axhline(0, color="k", lw=0.6)
-    ax.set(xlabel=r"mean counts per row $\lambda$", ylabel="bias of the bin mean (%)", ylim=(-35, 60)); ax.legend(fontsize=6.5)
+    ax.set(xlabel=r"mean counts per row $\lambda$", ylabel="bias of the bin mean (%)", ylim=(-35, 60))
+    dz = 100 * np.array(study["drop_zero_mean"])
+    off = dz > 60
+    if off.any():
+        ax.annotate(f"+{dz[off].max():.0f} % at $\\lambda={lam[off][0]:g}$ (off scale)", xy=(lam[off][-1], 58),
+                    xytext=(lam[off][-1] * 1.8, 48), fontsize=6, arrowprops=dict(arrowstyle="-", lw=0.6, color="0.4"))
     bx.semilogx(lam, study["inv_var_err_ratio"], "o-", label="inverse-variance")
     bx.semilogx(lam, study["exposure_err_ratio"], "^-", label="exposure-weighted")
     bx.axhline(1, color="k", lw=0.6)
-    bx.set(xlabel=r"mean counts per row $\lambda$", ylabel="reported error / actual scatter"); bx.legend(fontsize=6.5)
+    bx.set(xlabel=r"mean counts per row $\lambda$", ylabel="reported error / actual scatter")
     label_panels([ax, bx])
-    fig.tight_layout()
+    put_legend(la, ax, ncol=1, fontsize=6.5); put_legend(lb, bx, ncol=1, fontsize=6.5)
     return fig
 
 
@@ -978,12 +1038,14 @@ def fig_crossband(fit: dict, bands: Sequence[str] = ("soft", "hard"), n_draws: i
     """Predict the other bands' light curves from the broad-band posterior; overlay their synthetic bins."""
     tables = available_tables()
     bands = [b for b in bands if b in tables and os.path.isdir(data_dir("A", b))]
-    fig, axes = plt.subplots(1, max(1, len(bands)), figsize=(WIDTH, WIDTH * 0.42), squeeze=False)
+    fig, axes_list, laxes = panels(max(1, len(bands)), WIDTH * 0.4, legend_rows=2)
+    axes = np.array([axes_list])
     summary = {}
     if not bands:
         axes[0, 0].text(0.5, 0.5, "no other-band tables / synthetic data available", ha="center", va="center")
+        axes[0, 0].axis("off")
         return fig, summary
-    for ax, band in zip(axes[0], bands):
+    for ax, lax, band in zip(axes[0], laxes, bands):
         pred = predictive_curves(fit, n_draws=n_draws, band=band)
         obs = U.load_observed_lightcurves(band, data_dir("A", band), flux_column="flux_t", time_column="t_raw",
                                           drop_nonpositive_flux=False, period=fit["cfg"]["period_s"])
@@ -996,10 +1058,10 @@ def fig_crossband(fit: dict, bands: Sequence[str] = ("soft", "hard"), n_draws: i
         model_at = U.eval_periodic(pred["grid"], pred["map"], binned["phase"].to_numpy())
         chi2 = float(np.sum((binned["flux"].to_numpy() - model_at) ** 2 / err ** 2))
         summary[band] = {"chi2": chi2, "n_bins": int(binned.shape[0])}
-        ax.set(xlabel="orbital phase", ylabel=r"$F_b$ (erg cm$^{-2}$ s$^{-1}$)", title=f"{band} band, $\\chi^2/n = {chi2 / binned.shape[0]:.2f}$")
-        ax.legend(fontsize=6.5)
+        ax.set(xlabel="orbital phase", ylabel=r"$F_b$ (erg cm$^{-2}$ s$^{-1}$)")
+        ax.set_title(f"{band} band, $\\chi^2/n = {chi2 / binned.shape[0]:.2f}$", loc="right", fontsize=7, color="0.35")
+        put_legend(lax, ax, ncol=1, fontsize=6.5)
     label_panels(axes[0])
-    fig.tight_layout()
     save_json("crossband", summary)
     return fig, summary
 
