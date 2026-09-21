@@ -44,8 +44,7 @@ SYSTEMS: Dict[str, Dict] = {
             "scatter_fraction": 0.03,       # floor as a fraction of the out-of-eclipse flux
             "target_rate": 0.5,             # out-of-eclipse count rate (cts/s) -> flux_per_rate
             "dt": 100.0,
-            "visits": [(0.0, 40e3), (3.3 * 138240.0, 40e3), (7.6 * 138240.0, 40e3),
-                       (12.9 * 138240.0, 40e3), (19.2 * 138240.0, 40e3)],
+            "visit_starts_orbits": [0.0, 3.3, 7.6, 12.9, 19.2], "visit_duration_s": 40e3,
             "gap_fraction": 0.10, "gap_duration": 3000.0,
             "phase_shift": 0.02, "intrinsic_scatter": 0.10, "seed": 11,
         },
@@ -61,13 +60,24 @@ SYSTEMS: Dict[str, Dict] = {
             "scatter_fraction": 0.03,
             "target_rate": 2.0,
             "dt": 100.0,
-            "visits": [(0.0, 60e3), (2.4 * 777600.0, 60e3), (5.1 * 777600.0, 60e3),
-                       (8.7 * 777600.0, 60e3), (13.3 * 777600.0, 60e3), (17.6 * 777600.0, 60e3)],
+            "visit_starts_orbits": [0.0, 2.4, 5.1, 8.7, 13.3, 17.6], "visit_duration_s": 60e3,
             "gap_fraction": 0.10, "gap_duration": 3000.0,
             "phase_shift": 0.0, "intrinsic_scatter": 0.0, "seed": 22,
         },
     },
 }
+
+
+def visits(system: Dict):
+    """Observing visits as (start, duration) in seconds after the reference epoch: the starts are
+    given in orbits so they follow the system's period."""
+    obs = system["observation"]
+    return [(float(n) * float(system["period_s"]), float(obs["visit_duration_s"])) for n in obs["visit_starts_orbits"]]
+
+
+def visits_arg(system: Dict) -> str:
+    """The same visits as the generator's ``--visits start:duration,...`` argument."""
+    return ",".join(f"{s:.0f}:{d:.0f}" for s, d in visits(system))
 
 
 def geometry(system: Dict) -> Dict[str, float]:

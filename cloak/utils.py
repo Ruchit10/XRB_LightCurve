@@ -153,8 +153,8 @@ def drop_invalid_flux_rows(df: pd.DataFrame, column: str, drop_nonpositive: bool
         if not drop_nonpositive:
             n_zero = int(np.sum(values[keep] <= 0))
             if n_zero:
-                print(f"Kept {n_zero} rows with {column} <= 0 (zero-count bins); their errors are "
-                      f"repaired by sanitize_errors")
+                print(f"Kept {n_zero} rows with {column} <= 0 (zero-count bins): they enter the exposure-weighted "
+                      f"bins as observed empty bins, or get the median valid error when fitted unbinned")
     return out
 
 

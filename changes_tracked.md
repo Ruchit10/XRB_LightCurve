@@ -890,6 +890,41 @@ from a prior that puts half the initial ball at `-inf`; a wrapping window with
 runs against the PyXspec stand-in (response, background, `calcFlux` and
 `fakeit` semantics mirrored from the live audit); pyflakes clean.
 
+### Commit 13 — Figure pipeline review: no reduced mode, input-keyed fit caches, cross-band floor
+
+- The quick/smoke mode is gone (`CLOAK_QUICK`, `--quick`): the notebook and
+  both scripts always produce the paper's numbers. Smoke tests of the
+  calibration script use explicit small `--n-walkers/--n-steps/--n-burn/--thin`.
+- Fit caches are keyed by a digest of the flux table, the light-curve files and
+  every fit option (`figures/cache/<name>_<digest>/`), so a regenerated table
+  or data set can never reuse a stale chain; `run_fits.py` and the notebook
+  share `figlib.FIT_NAMES`.
+- Cross-band prediction rescales the fitted scattered floor (a flux of the
+  fitted band) by the ratio of the bands' out-of-eclipse fluxes; the broad
+  floor added unscaled to the soft band was 3.6 times too high.
+- `eclipse_width_half_depth` measures the contiguous run around the minimum on
+  the curve rolled to phase 0.5 (a dip through phase 0 returned ~1).
+- The injection figure uses the jitter likelihood's effective variance at the
+  MAP for bars, residuals and the quoted chi2 (System A carries 10 % intrinsic
+  variability by construction, so the classical chi2 misrepresented the fit);
+  the band is labelled as posterior model curves; the corner plot notes that
+  the `ln f` reference is the injected amplitude only approximately.
+- Priors table: the floor prior is truncated at the brightest bin as well as
+  at zero. Tables from two spectra are never mixed: the generic tables are
+  used exclusively once any exists. PDF only (no PNG previews).
+  `fiducial.visits()` derives the visits from the period. Notebooks carry the
+  `henv` kernel and say so. The SBC batch generates at 1 degree and fits at the
+  paper's 2 degrees. Stale loader message about repaired zero-count errors fixed.
+- Verified: both notebooks execute at full size with the four cached fits
+  (25.8 + 17.5 + 17.1 + 16.1 min); tests 13/13; pyflakes clean.
+
+### Commit 12 — Paper figures: legends in a strip below the panels
+
+Every legend sat inside the axes and covered data; each figure now gets a
+legend strip beneath its panels from the layout engine (`figlib.panels` /
+`put_legend`), panel letters are left-aligned titles, labels were shortened,
+and the quadrature, invariance, per-cell and convergence figures were tidied.
+
 ### Commit 11 — Paper figures: fiducial systems, two notebooks, calibration batch
 
 - `cloak/synthetic/fiducial.py`: the paper's two generic systems (A WR-like,

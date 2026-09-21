@@ -1,0 +1,12 @@
+% Table: priors (the fitter's defaults, from cloak/mcmc_fit.py)
+$M_{\rm tot}$ ($M_\odot$) & $\mathcal{N}(45,\,15)$ on $[5,\,120]$ & broad; see Identifiability \\
+$q_m$ & $\mathcal{N}(0.6,\,0.2)$ on $[0.02,\,0.98]$ & posterior $\equiv$ prior (Prop.~1) \\
+$R$ ($R_\odot$) & $\mathcal{N}(2,\,0.5)$ on $[1,\,5]$ & external anchor of the scale \\
+$r$ ($R_\odot$) & $\mathcal{N}(0.001,\,0.001)$ on $[0.0001,\,0.1]$ &  \\
+$i$ (deg) & $\mathcal{N}(78,\,8)$ on $[40,\,89.9]$ &  \\
+$R_{\rm b}$ ($R_\odot$), $p$ & $\mathcal{N}(5,\,3)$ on $[0.5,\,30]$; $\mathcal{N}(4,\,1)$ on $[2,\,8]$ & $R_{\rm b}\ge R$ enforced \\
+$f_{\rm c}$, $\ell$ & $\mathcal{N}(5,\,5)$ on $[0,\,50]$; $\mathcal{N}(1,\,0.7)$ on $[0.1,\,10]$ & confinement profile \\
+$\beta$, $H$ & $\mathcal{N}(0.8,\,0.3)$ on $[0.3,\,2]$; $\mathcal{N}(1,\,0.7)$ on $[0.1,\,10]$ & $\beta$-law profile \\
+$\log_{10} f_{\rm opa}$ & $\mathcal{N}(-1.5,\,1)$ on $[-4,\,0.5]$ &  \\
+$f_{\rm sc}$ & $\mathcal{N}(\bar F_{0.4\text{--}0.6}, \bar F_{0.4\text{--}0.6})$ on $[0, F_{\max}]$ & data-driven: $\bar F$ the mean flux in phase 0.4--0.6, $F_{\max}$ the brightest bin \\
+$\ln f$ & $\mathcal{N}(-3,\,2)$ on $[-10,\,0]$ & jitter likelihood only \\

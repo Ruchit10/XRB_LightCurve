@@ -14,15 +14,15 @@ Design choices (state them in the paper):
   scattered floor ``f_scatter`` is frozen at the injected value because the
   fitter's floor prior is data-driven, which SBC cannot use.
 - Sampled: M_tot, R, r, i0, Rb, p, log10 f_opa. Likelihood chi2 (no intrinsic
-  variability is injected). Data are generated and fitted at the same model
-  step (``--dth``), so the test isolates the sampler, the profiled phase
-  shift and the priors from the model-resolution question of Figure 4.
+  variability is injected). Data are generated at the data notebook's model
+  step (1 degree) and fitted at the paper's default (2 degrees), so the test
+  covers what a real fit does, including the interpolation error of Figure 4.
 
 Resumable: draws already in the ranks file are skipped. Each draw's fit lives
 in ``figures/cache/sbc/draw_<k>/`` (chains are not tracked).
 
-    python figures/run_sbc.py --n-draws 100                 # ~10 min per draw
-    python figures/run_sbc.py --n-draws 3 --quick           # smoke test
+    python figures/run_sbc.py --n-draws 100                 # ~15 min per draw on a laptop
+    python figures/run_sbc.py --n-draws 1 --n-walkers 20 --n-steps 40 --n-burn 10 --thin 2   # smoke test
 """
 from __future__ import annotations
 
@@ -94,16 +94,14 @@ def main() -> None:
     parser.add_argument("--start", type=int, default=0, help="first draw index (seeds are the draw index)")
     parser.add_argument("--flux-csv", default=os.path.join(ROOT, "synthetic_data", "flux_vs_nH_tbabs_broad.csv"))
     parser.add_argument("--band", default="broad")
-    parser.add_argument("--dth", type=float, default=4.0)
+    parser.add_argument("--dth", type=float, default=2.0, help="model step of the fit (the paper's default)")
+    parser.add_argument("--gen-dth", type=float, default=1.0, help="model step used to generate the data")
     parser.add_argument("--n-walkers", type=int, default=32)
     parser.add_argument("--n-steps", type=int, default=2500)
     parser.add_argument("--n-burn", type=int, default=500)
     parser.add_argument("--thin", type=int, default=20, help="keep every thin-th post-burn step for the ranks")
     parser.add_argument("--n-threads", type=int, default=1)
-    parser.add_argument("--quick", action="store_true", help="tiny chains and short visits (smoke test only)")
     args = parser.parse_args()
-    if args.quick:
-        args.n_walkers, args.n_steps, args.n_burn, args.thin, args.dth = 16, 40, 10, 2, 5.0
 
     os.makedirs(CACHE, exist_ok=True)
     os.makedirs(RESULTS, exist_ok=True)
@@ -129,7 +127,7 @@ def main() -> None:
         # Out-of-eclipse flux of this system sets the floor and the count rate,
         # exactly as the data notebook does for the fiducial systems.
         from cloak.kernel import simulate_band_flux
-        sim = dict(r=truth["r"], R=truth["R"], d1=d1, d2=d2, i0=truth["i0"], dth=args.dth,
+        sim = dict(r=truth["r"], R=truth["R"], d1=d1, d2=d2, i0=truth["i0"], dth=args.gen_dth,
                    wind_model="smooth_pl", wind_params={"Rb": truth["Rb"], "p": truth["p"], "Delta": 2.0},
                    mdot=SYSTEM["mdot"], v_inf=SYSTEM["v_inf"], mu_wind=SYSTEM["mu_wind"],
                    f_opacity=10.0 ** truth["log_fopa"], flux_csv_path=args.flux_csv, band=args.band)
@@ -137,9 +135,7 @@ def main() -> None:
         f_out = float(np.max(flux))
         floor = obs["scatter_fraction"] * f_out
         flux_per_rate = f_out / obs["target_rate"]
-        visits = ",".join(f"{s:g}:{d:g}" for s, d in obs["visits"])
-        if args.quick:
-            visits = ",".join(f"{s:g}:{d:g}" for s, d in obs["visits"][:2])
+        visits = fiducial.visits_arg(SYSTEM)
 
         if not os.path.exists(lc_file):
             gen = [PY, "-m", "cloak.synthetic.lightcurve", "--flux-csv", args.flux_csv, "--band", args.band,
@@ -147,7 +143,7 @@ def main() -> None:
                    "--i0", f"{truth['i0']:.8g}", "--wind-model", "smooth_pl", "--Rb", f"{truth['Rb']:.8g}",
                    "--p", f"{truth['p']:.8g}", "--Delta", "2.0", "--mdot", f"{SYSTEM['mdot']:g}",
                    "--v-inf", f"{SYSTEM['v_inf']:g}", "--f-opacity", f"{10.0 ** truth['log_fopa']:.8g}",
-                   "--dth", f"{args.dth:g}", "--orbital-period", f"{period:g}",
+                   "--dth", f"{args.gen_dth:g}", "--orbital-period", f"{period:g}",
                    "--phase-shift", f"{obs['phase_shift']:g}", "--scatter", f"{floor:.8g}",
                    "--flux-per-rate", f"{flux_per_rate:.8g}", "--dt", f"{obs['dt']:g}", "--visits", visits,
                    "--gap-fraction", f"{obs['gap_fraction']:g}", "--gap-duration", f"{obs['gap_duration']:g}",

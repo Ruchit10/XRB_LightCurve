@@ -1,0 +1,10 @@
+{
+  "search_shift": 0.019482421875,
+  "search_chi2": 832.2077641315059,
+  "brute_shift": 0.0195,
+  "brute_chi2": 832.221497804278,
+  "search_minus_brute_chi2": -0.01373367277210491,
+  "brute_grid_step": 5e-05,
+  "search_resolution": 9.765625e-06,
+  "note": "a negative difference means the search's finer final step found a lower chi2 than the brute-force grid"
+}

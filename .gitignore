@@ -59,7 +59,6 @@ paper/
 # summaries are tracked; chains and other bulky intermediates are not.
 figures/cache/
 !figures/**/*.pdf
-!figures/**/*.png
 !figures/results/**/*.csv
 !figures/results/**/*.json
 !figures/results/**/*.txt

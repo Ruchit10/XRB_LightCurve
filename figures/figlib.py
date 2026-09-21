@@ -6,11 +6,15 @@ paper. Everything runs on synthetic data from ``cloak.synthetic.fiducial``.
 The notebook is the user interface; this module keeps it short. Expensive
 steps (MCMC fits, the SBC batch) run as ``python -m cloak.mcmc_fit`` /
 ``figures/run_sbc.py`` subprocesses and are skipped when their outputs exist
-under ``figures/cache/`` (not tracked). Small summaries the figures need go to
+under ``figures/cache/`` (not tracked); a fit's cache directory is keyed by a
+digest of its inputs (flux table, light-curve files, fit options), so a
+regenerated table or data set never reuses a stale chain. Small summaries the figures need go to
 ``figures/results/`` (tracked) and the figures themselves to ``figures/``.
 """
 from __future__ import annotations
 
+import glob
+import hashlib
 import json
 import math
 import os
@@ -63,10 +67,9 @@ def style() -> None:
 
 
 def save_fig(fig: plt.Figure, name: str) -> str:
-    """Write ``figures/<name>.pdf`` (vector, for the paper) and a PNG preview."""
+    """Write ``figures/<name>.pdf`` (vector, for the paper)."""
     path = os.path.join(FIG_DIR, f"{name}.pdf")
     fig.savefig(path, bbox_inches="tight")
-    fig.savefig(os.path.join(FIG_DIR, f"{name}.png"), bbox_inches="tight", dpi=150)
     print(f"saved {os.path.relpath(path, ROOT)}")
     return path
 
@@ -165,16 +168,17 @@ def fmt(x: float, digits: int = 3) -> str:
 # ----------------------------------------------------------------------------
 
 def available_tables() -> Dict[str, str]:
-    """Band -> flux-vs-nH CSV: ``synthetic_data/tables/flux_vs_nH_<band>.csv`` written by the
-    data notebook, else the tracked example table(s) ``synthetic_data/flux_vs_nH_tbabs_<band>.csv``."""
-    found = {}
-    for band in BANDS:
-        for cand in (os.path.join(TABLES, f"flux_vs_nH_{band}.csv"),
-                     os.path.join(DATA, f"flux_vs_nH_tbabs_{band}.csv")):
-            if os.path.exists(cand):
-                found[band] = cand
-                break
-    return found
+    """Band -> flux-vs-nH CSV. The generic tables written by the data notebook
+    (``synthetic_data/tables/flux_vs_nH_<band>.csv``) are used exclusively as soon as any exists;
+    only without them do the tracked example table(s) ``synthetic_data/flux_vs_nH_tbabs_<band>.csv``
+    serve, so tables from two different spectra are never mixed in one figure."""
+    generic = {os.path.basename(p)[len("flux_vs_nH_"):-4]: p
+               for p in sorted(glob.glob(os.path.join(TABLES, "flux_vs_nH_*.csv")))}
+    generic = {b: p for b, p in generic.items() if b in BANDS}
+    if generic:
+        return generic
+    return {b: os.path.join(DATA, f"flux_vs_nH_tbabs_{b}.csv") for b in BANDS
+            if os.path.exists(os.path.join(DATA, f"flux_vs_nH_tbabs_{b}.csv"))}
 
 
 def require_table(band: str) -> str:
@@ -250,7 +254,8 @@ def priors_table() -> str:
         ["$f_{\\rm c}$, $\\ell$", cell(M.WIND_SHAPE_PRIORS["fconf"]) + "; " + cell(M.WIND_SHAPE_PRIORS["ell"]), "confinement profile"],
         ["$\\beta$, $H$", cell(M.WIND_SHAPE_PRIORS["beta"]) + "; " + cell(M.WIND_SHAPE_PRIORS["H"]), "$\\beta$-law profile"],
         ["$\\log_{10} f_{\\rm opa}$", cell(M.FOPACITY_PRIOR), ""],
-        ["$f_{\\rm sc}$", "$\\mathcal{N}(\\bar F_{0.4\\text{--}0.6}, \\bar F_{0.4\\text{--}0.6})$, $\\ge 0$", "data-driven centre (mean flux in phase 0.4--0.6)"],
+        ["$f_{\\rm sc}$", "$\\mathcal{N}(\\bar F_{0.4\\text{--}0.6}, \\bar F_{0.4\\text{--}0.6})$ on $[0, F_{\\max}]$",
+         "data-driven: $\\bar F$ the mean flux in phase 0.4--0.6, $F_{\\max}$ the brightest bin"],
         ["$\\ln f$", cell(M.JITTER_PRIOR), "jitter likelihood only"],
     ]
     return write_table("tab_priors", rows, caption_note="Table: priors (the fitter's defaults, from cloak/mcmc_fit.py)")
@@ -550,15 +555,25 @@ def fig_percell(band: str = "broad", r: float = 6.0, name: str = "B") -> Tuple[p
 # ----------------------------------------------------------------------------
 
 def eclipse_width_half_depth(phase: np.ndarray, flux: np.ndarray) -> Tuple[float, float]:
-    """(width in phase, depth) of the dip around phase 0.5 at half its depth."""
+    """(width in phase, depth) of the dip at half its depth: the contiguous run of points below
+    the half-depth level that contains the minimum, measured on the curve rolled so that the
+    minimum sits at phase 0.5 (a dip through phase 0 is therefore handled)."""
+    phase = np.asarray(phase, dtype=float); flux = np.asarray(flux, dtype=float)
     f_out = float(np.max(flux)); f_min = float(np.min(flux))
     depth = 1.0 - f_min / f_out
     level = 0.5 * (f_out + f_min)
-    below = flux < level
-    if not below.any():
-        return 0.0, depth
-    idx = np.where(below)[0]
-    return float(phase[idx[-1]] - phase[idx[0]]), depth
+    k = int(np.argmin(flux))
+    u = np.mod(phase - phase[k] + 0.5, 1.0)
+    order = np.argsort(u); u, fl = u[order], flux[order]
+    below = fl < level
+    kk = int(np.argmin(fl))
+    lo = kk
+    while lo > 0 and below[lo - 1]:
+        lo -= 1
+    hi = kk
+    while hi < fl.size - 1 and below[hi + 1]:
+        hi += 1
+    return float(u[hi] - u[lo]), depth
 
 
 def fig_energy_dependence(dth: float = 1.0) -> Tuple[plt.Figure, dict]:
@@ -674,49 +689,69 @@ def fig_invariance(study: dict, model: str = "smooth_pl", lams=(0.8, 2.0)) -> pl
 # MCMC fits: launching, loading, predictive curves
 # ----------------------------------------------------------------------------
 
-def fit_config(name: str, quick: bool = False) -> dict:
-    """Command line and output directory of a named fit of System A's broad light curve."""
+FIT_NAMES = ("A_fiducial", "ridge_broad", "ridge_tightR", "ridge_fopa_frozen")
+
+
+def _inputs_digest(files: Sequence[str], settings: Sequence[str]) -> str:
+    """Short digest of the input files' contents and the fit settings (paths made relative)."""
+    h = hashlib.sha1()
+    for path in files:
+        h.update(os.path.basename(path).encode())
+        with open(path, "rb") as fh:
+            h.update(fh.read())
+    for item in settings:
+        h.update((os.path.relpath(item, ROOT) if os.path.exists(item) else item).encode())
+        h.update(b"\0")
+    return h.hexdigest()[:10]
+
+
+def fit_config(name: str) -> dict:
+    """Command line and cache directory of a named fit of System A's broad light curve.
+
+    The cache directory name carries a digest of the flux table, the light-curve files and every
+    fit option, so a regenerated table or data set, or a changed option, gets a fresh fit."""
+    if name not in FIT_NAMES:
+        raise ValueError(f"unknown fit {name!r}; choose from {FIT_NAMES}")
     sysA = F.SYSTEMS["A"]
     band = "broad"
-    out_dir = os.path.join(CACHE, name + ("_quick" if quick else ""))
-    dth = 5.0 if quick else 2.0
-    steps = ("24", "60", "20") if quick else ("32", "5000", "1000")   # >= 2 x n_dim (10 sampled) walkers
-    cmd = [PY, "-m", "cloak.mcmc_fit", "--band", band, "--flux-csv", require_table(band),
-           "--data-dir", data_dir("A", band), "--obs-column", "flux_t", "--time-column", "t_raw",
-           "--counts-per-bin", "100", "--keep-zero-flux", "--kepler-mtot",
-           "--orbital-period", f"{sysA['period_s']:g}", "--mdot", f"{sysA['mdot']:g}",
-           "--v-inf", f"{sysA['v_inf']:g}", "--mu-wind", f"{sysA['mu_wind']:g}",
-           "--fit-wind-shape", "--fit-scatter", "--likelihood", "jitter", "--dth", f"{dth:g}",
-           "--n-walkers", steps[0], "--n-steps", steps[1], "--n-burn", steps[2], "--seed", "1",
-           "--compute-bic", "--save-chi2", "--quiet", "--no-geometry-plots", "--output-dir", out_dir]
+    dth = 2.0
+    table = require_table(band)
+    ddir = data_dir("A", band)
+    steps = ("32", "3000", "1000") if name.startswith("ridge") else ("32", "5000", "1000")
+    opts = ["--band", band, "--flux-csv", table, "--data-dir", ddir, "--obs-column", "flux_t",
+            "--time-column", "t_raw", "--counts-per-bin", "100", "--keep-zero-flux", "--kepler-mtot",
+            "--orbital-period", f"{sysA['period_s']:g}", "--mdot", f"{sysA['mdot']:g}",
+            "--v-inf", f"{sysA['v_inf']:g}", "--mu-wind", f"{sysA['mu_wind']:g}",
+            "--fit-wind-shape", "--fit-scatter", "--likelihood", "jitter", "--dth", f"{dth:g}",
+            "--n-walkers", steps[0], "--n-steps", steps[1], "--n-burn", steps[2], "--seed", "1",
+            "--compute-bic", "--save-chi2", "--quiet", "--no-geometry-plots"]
     truth_fopa = math.log10(sysA["f_opacity"])
     if name == "A_fiducial":
-        cmd += ["--fit-fopacity"]
+        opts += ["--fit-fopacity"]
     elif name == "ridge_broad":
-        cmd += ["--fit-fopacity", "--prior-R", "2.5,2.0,1.0,8.0", f"--prior-fopa={truth_fopa:.4f},1.5,-4.0,0.5"]
+        opts += ["--fit-fopacity", "--prior-R", "2.5,2.0,1.0,8.0", f"--prior-fopa={truth_fopa:.4f},1.5,-4.0,0.5"]
     elif name == "ridge_tightR":
-        cmd += ["--fit-fopacity", "--prior-R", "2.5,0.1,1.0,8.0", f"--prior-fopa={truth_fopa:.4f},1.5,-4.0,0.5"]
+        opts += ["--fit-fopacity", "--prior-R", "2.5,0.1,1.0,8.0", f"--prior-fopa={truth_fopa:.4f},1.5,-4.0,0.5"]
     elif name == "ridge_fopa_frozen":
-        cmd += ["--prior-R", "2.5,2.0,1.0,8.0", "--freeze", f"log_fopa={truth_fopa:.6f}"]
-    else:
-        raise ValueError(name)
-    if not quick and name.startswith("ridge"):
-        cmd[cmd.index("--n-steps") + 1] = "3000"
+        opts += ["--prior-R", "2.5,2.0,1.0,8.0", "--freeze", f"log_fopa={truth_fopa:.6f}"]
+    files = [table] + sorted(glob.glob(os.path.join(ddir, "*.txt"))) + sorted(glob.glob(os.path.join(ddir, "*.json")))
+    out_dir = os.path.join(CACHE, f"{name}_{_inputs_digest(files, opts)}")
+    cmd = [PY, "-m", "cloak.mcmc_fit"] + opts + ["--output-dir", out_dir]
     return {"name": name, "cmd": cmd, "out_dir": out_dir, "band": band, "wind_model": sysA["wind_model"],
             "dth": dth, "sim_params": {"mdot": sysA["mdot"], "v_inf": sysA["v_inf"], "mu_wind": sysA["mu_wind"]},
             "period_s": sysA["period_s"], "chain": os.path.join(out_dir, f"{band}_{sysA['wind_model']}_chain.npz")}
 
 
-def ensure_fit(name: str, quick: bool = False, verbose: bool = True) -> dict:
-    """Run the named fit unless its chain exists; returns its config."""
-    cfg = fit_config(name, quick)
+def ensure_fit(name: str, verbose: bool = True) -> dict:
+    """Run the named fit unless a chain for exactly these inputs exists; returns its config."""
+    cfg = fit_config(name)
     if os.path.exists(cfg["chain"]):
         if verbose:
             print(f"{name}: using cached {os.path.relpath(cfg['chain'], ROOT)}")
         return cfg
     os.makedirs(cfg["out_dir"], exist_ok=True)
     log = os.path.join(cfg["out_dir"], "fit.log")
-    print(f"{name}: running ({'quick' if quick else 'full'}); log {os.path.relpath(log, ROOT)}")
+    print(f"{name}: running; log {os.path.relpath(log, ROOT)} (about 20-30 min)")
     with open(log, "w") as fh:
         res = subprocess.run(cfg["cmd"], cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT, text=True)
     if res.returncode != 0:
@@ -755,25 +790,42 @@ def load_fit(cfg: dict) -> dict:
 
 def predictive_curves(fit: dict, n_draws: int = 200, seed: int = 0, band: Optional[str] = None,
                       table: Optional[str] = None) -> dict:
-    """MAP curve and 16/84 % posterior-predictive band on a fine phase grid, in the data's phase
-    (each draw is shifted by the MAP's profiled phase offset). *band*/*table* switch the model
-    to another energy band for cross-band prediction."""
+    """MAP curve and the 16/84 % band of posterior model curves on a fine phase grid, in the data's
+    phase (each draw is shifted by the MAP's profiled phase offset). *band*/*table* switch the model
+    to another energy band for cross-band prediction; the fitted scattered floor, a flux of the
+    fitted band, is then rescaled by the ratio of the two bands' out-of-eclipse fluxes (a
+    band-independent scattered fraction, which is how the generator defines it)."""
     spec, data = fit["spec"], fit["data"]
-    model = fit["model"] if band is None else M.DirectLightCurveModel(
+    cross = band is not None and band != fit["cfg"]["band"]
+    model = fit["model"] if not cross else M.DirectLightCurveModel(
         band=band, flux_csv_path=table or require_table(band), wind_model=fit["cfg"]["wind_model"],
         dth=fit["cfg"]["dth"], sim_params=fit["cfg"]["sim_params"])
     _, shift_map = M.aligned_model_flux(fit["theta_map"], spec, fit["model"], data)
+
+    def curve_for(theta):
+        c = M.model_curve(theta, spec, model)
+        if c is None:
+            return None
+        phase, flux = c
+        if cross:
+            f_sc = spec.f_scatter(theta)
+            c_fit = M.model_curve(theta, spec, fit["model"])
+            if c_fit is None:
+                return None
+            fit_out, band_out = float(np.max(c_fit[1])) - f_sc, float(np.max(flux)) - f_sc
+            ratio = band_out / fit_out if fit_out > 0 else 1.0
+            flux = flux - f_sc + f_sc * ratio
+        return phase, flux
     grid = np.linspace(0.0, 1.0, 721)
     rng = np.random.default_rng(seed)
     idx = rng.choice(fit["samples"].shape[0], size=min(n_draws, fit["samples"].shape[0]), replace=False)
     curves = []
     for i in idx:
-        c = M.model_curve(fit["samples"][i], spec, model)
-        if c is None:
-            continue
-        curves.append(U.eval_periodic(*U.periodic_model(*c), grid, shift=shift_map))
+        c = curve_for(fit["samples"][i])
+        if c is not None:
+            curves.append(U.eval_periodic(*U.periodic_model(*c), grid, shift=shift_map))
     curves = np.array(curves)
-    c_map = M.model_curve(fit["theta_map"], spec, model)
+    c_map = curve_for(fit["theta_map"])
     map_curve = U.eval_periodic(*U.periodic_model(*c_map), grid, shift=shift_map)
     map_at_obs = U.eval_periodic(*U.periodic_model(*c_map), data.phase, shift=shift_map)
     return {"grid": grid, "map": map_curve, "map_at_obs": map_at_obs, "lo": np.percentile(curves, 16, axis=0),
@@ -801,16 +853,28 @@ def fig_injection(fit: dict, pred: dict) -> Tuple[plt.Figure, dict]:
     fig = plt.figure(figsize=(WIDTH, WIDTH * 0.62 + lh), constrained_layout=True)
     gs = fig.add_gridspec(3, 1, height_ratios=[3.0, 1.0, 4.0 * lh / (WIDTH * 0.62)])
     ax = fig.add_subplot(gs[0]); rx = fig.add_subplot(gs[1], sharex=ax); lax = fig.add_subplot(gs[2]); lax.axis("off")
-    chi2 = float(np.sum((data.flux - pred["map_at_obs"]) ** 2 / data.err2))
+    resid2 = (data.flux - pred["map_at_obs"]) ** 2
+    chi2 = float(np.sum(resid2 / data.err2))
     dof = M.degrees_of_freedom(fit["spec"], data.flux.size, True)
-    plot_lightcurve_fit(data.phase, data.flux, data.err, model_phase=pred["grid"], model_flux=pred["map"],
+    # Under the jitter likelihood the fitted intrinsic scatter is part of the model's variance:
+    # bars, residuals and the quoted chi2 use sigma_eff^2 = sigma^2 + (f m)^2 at the MAP.
+    j_f = fit["spec"].index("log_f")
+    if j_f is not None:
+        f_map = float(np.exp(fit["theta_map"][j_f]))
+        sigma = np.sqrt(data.err2 + (f_map * pred["map_at_obs"]) ** 2)
+        chi2_used = float(np.sum(resid2 / sigma ** 2))
+        obs_label = "synthetic bins (bars include the fitted intrinsic scatter)"
+    else:
+        f_map, sigma, chi2_used, obs_label = None, data.err, chi2, "synthetic bins"
+    plot_lightcurve_fit(data.phase, data.flux, sigma, model_phase=pred["grid"], model_flux=pred["map"],
                         obs_model=pred["map_at_obs"], obs_phase_width=binned["width"].to_numpy(), band=fit["cfg"]["band"],
-                        red_chi2=chi2 / dof, ax=ax, ax_res=rx, model_label="MAP model", obs_label="synthetic bins")
-    ax.fill_between(pred["grid"], pred["lo"], pred["hi"], color="C1", alpha=0.25, lw=0, label="68% posterior predictive")
+                        red_chi2=chi2_used / dof, ax=ax, ax_res=rx, model_label="MAP model", obs_label=obs_label)
+    ax.fill_between(pred["grid"], pred["lo"], pred["hi"], color="C1", alpha=0.25, lw=0, label="68% band of posterior model curves")
     if ax.get_legend() is not None:
         ax.get_legend().remove()
-    put_legend(lax, ax, ncol=3)
-    summary = {"chi2": chi2, "dof": int(dof), "shift_map": pred["shift"], "n_bins": int(data.flux.size)}
+    put_legend(lax, ax, ncol=3, fontsize=6.5)
+    summary = {"chi2_measurement_errors": chi2, "chi2_effective": chi2_used, "dof": int(dof), "f_map": f_map,
+               "shift_map": pred["shift"], "n_bins": int(data.flux.size)}
     return fig, summary
 
 
@@ -818,9 +882,15 @@ def fig_corner(fit: dict, truths: Dict[str, Optional[float]]) -> plt.Figure:
     import corner
     t = [truths.get(n) for n in fit["names"]]
     fig = corner.corner(fit["samples"], labels=fit["labels"], truths=[np.nan if v is None else v for v in t],
-                        truth_color="crimson", quantiles=[0.16, 0.5, 0.84], show_titles=True,
-                        title_kwargs={"fontsize": 7}, label_kwargs={"fontsize": 8}, max_n_ticks=4)
-    fig.set_size_inches(WIDTH * 1.15, WIDTH * 1.15)
+                        truth_color="crimson", quantiles=[0.16, 0.5, 0.84], show_titles=True, title_fmt=".3g",
+                        title_kwargs={"fontsize": 6.5}, label_kwargs={"fontsize": 7}, max_n_ticks=3,
+                        use_math_text=True, labelpad=0.08)
+    fig.set_size_inches(WIDTH * 1.2, WIDTH * 1.2)
+    for ax in fig.axes:
+        ax.tick_params(labelsize=5.5)
+    if "log_f" in fit["names"] and truths.get("log_f") is not None:
+        fig.text(0.62, 0.97, r"red lines: injected values; for $\ln f$ the reference is $\ln\epsilon$ of the"
+                 "\ninjected variability, an approximate correspondence", fontsize=7, ha="left", va="top")
     return fig
 
 
@@ -1034,7 +1104,7 @@ def fig_binning_bias(study: dict) -> plt.Figure:
 # Figure 14: cross-band prediction
 # ----------------------------------------------------------------------------
 
-def fig_crossband(fit: dict, bands: Sequence[str] = ("soft", "hard"), n_draws: int = 100) -> Tuple[plt.Figure, dict]:
+def fig_crossband(fit: dict, bands: Sequence[str] = ("soft", "medium", "hard"), n_draws: int = 100) -> Tuple[plt.Figure, dict]:
     """Predict the other bands' light curves from the broad-band posterior; overlay their synthetic bins."""
     tables = available_tables()
     bands = [b for b in bands if b in tables and os.path.isdir(data_dir("A", b))]
