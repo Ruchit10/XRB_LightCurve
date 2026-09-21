@@ -240,7 +240,9 @@ flux conversion averaged over the disk (**not** the conversion of `fl`).
 | `cloak/plot_results.py` | Standalone plots from a simulation CSV |
 | `cloak/utils.py` | Data loading, phase binning, smoothing, χ² fit |
 | `cloak/plots.py` | All plotting routines, shared by both fit scripts |
-| `cloak/synthetic/` | Generators: fake spectrum (PyXspec `fakeit`) and CIAO-layout synthetic light curves with a truth record |
+| `cloak/synthetic/` | Generators: fake spectrum (PyXspec `fakeit`) and CIAO-layout synthetic light curves with a truth record; `fiducial.py` defines the paper's two synthetic systems |
+| `synthetic_data/generate_synthetic_data.ipynb` | Notebook that writes the paper's synthetic inputs (flux tables under HEASoft, light curves of both fiducial systems) with diagnostic plots |
+| `figures/paper_figures.ipynb` | Notebook that produces every results figure and table of the paper from the synthetic data (`figures/figlib.py` holds the code; `figures/run_sbc.py` the calibration batch) |
 | `tests/` | `test_flux_methods.py`, `test_pipeline.py` |
 | `synthetic_data/` | Synthetic spectrum (PyXspec `fakeit`) and CIAO-layout light curves with a truth record, for injection–recovery tests; also holds the tracked example flux table and generated synthetic products |
 | `changes_tracked.md` | Development history |

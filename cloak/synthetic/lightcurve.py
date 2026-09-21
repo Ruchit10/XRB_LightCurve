@@ -115,13 +115,15 @@ def simulation_kwargs(args) -> Dict[str, object]:
                 mu_wind=args.mu_wind, f_opacity=args.f_opacity)
 
 
-def parse_visits(spec: str | None, t_start: float, n_orbits: float) -> List[Tuple[float, float]]:
+def parse_visits(spec: str | None, t_start: float, n_orbits: float,
+                 period: float = ORBITAL_PERIOD) -> List[Tuple[float, float]]:
     """``start:duration,start:duration,...`` in seconds after REF_EPOCH, or one
-    visit of *n_orbits* orbits starting at *t_start*. Visits must not overlap."""
+    visit of *n_orbits* orbits (of *period* seconds) starting at *t_start*.
+    Visits must not overlap."""
     if not spec:
         if n_orbits <= 0:
             raise ValueError("--n-orbits must be > 0")
-        return [(float(t_start), float(n_orbits) * ORBITAL_PERIOD)]
+        return [(float(t_start), float(n_orbits) * float(period))]
     visits = []
     for item in spec.split(","):
         parts = item.split(":")
@@ -187,6 +189,9 @@ def main() -> None:
     obs.add_argument("--flux-per-rate", type=float, default=DEFAULT_FLUX_PER_RATE,
                      help="flux per unit count rate for this band, erg cm^-2 s^-1 per count s^-1 "
                           "(cloak/synthetic/spectrum.py reports it per band)")
+    obs.add_argument("--orbital-period", type=float, default=float(ORBITAL_PERIOD), metavar="SECONDS",
+                     help="orbital period: sets the fold (phase = frac((t - REF_EPOCH) / P)) and the "
+                          "length of --n-orbits; pass the same value to the fitters")
     obs.add_argument("--dt", type=float, default=100.0, help="time bin (s)")
     obs.add_argument("--visits", type=str, default=None,
                      help="visits as start:duration[,start:duration...] in seconds after REF_EPOCH; "
@@ -198,6 +203,9 @@ def main() -> None:
     obs.add_argument("--phase-shift", type=float, default=0.0,
                      help="phase shift applied to the model (data phase of mid-eclipse = 0.5 + shift)")
     obs.add_argument("--scatter", type=float, default=0.0, help="additive scattered-flux floor (erg cm^-2 s^-1)")
+    obs.add_argument("--intrinsic-scatter", type=float, default=0.0, metavar="EPS",
+                     help="fractional log-normal intrinsic variability applied per bin before the "
+                          "Poisson draw (mean preserved); exercises the jitter likelihood")
     obs.add_argument("--bkg-rate", type=float, default=0.0,
                      help="background count rate added before sampling and subtracted from the net rate")
     obs.add_argument("--noiseless", action="store_true", help="write expected counts instead of Poisson draws")
@@ -210,10 +218,12 @@ def main() -> None:
         parser.error("--flux-per-rate must be > 0")
     if not (0.0 <= args.gap_fraction < 1.0):
         parser.error("--gap-fraction must be in [0, 1)")
-    if args.bkg_rate < 0 or args.scatter < 0:
-        parser.error("--bkg-rate and --scatter must be >= 0")
+    if args.bkg_rate < 0 or args.scatter < 0 or args.intrinsic_scatter < 0:
+        parser.error("--bkg-rate, --scatter and --intrinsic-scatter must be >= 0")
+    if args.orbital_period <= 0:
+        parser.error("--orbital-period must be > 0")
     try:
-        visits = parse_visits(args.visits, args.t_start, args.n_orbits)
+        visits = parse_visits(args.visits, args.t_start, args.n_orbits, args.orbital_period)
     except ValueError as e:
         parser.error(str(e))
 
@@ -226,7 +236,7 @@ def main() -> None:
         parser.error("a visit is shorter than one --dt bin")
     offsets = apply_gaps(blocks, args.dt, args.gap_fraction, args.gap_duration, rng)
     t_raw = REF_EPOCH + offsets
-    phase = frac((t_raw - REF_EPOCH) / ORBITAL_PERIOD)
+    phase = frac((t_raw - REF_EPOCH) / args.orbital_period)
 
     # Model band flux at the observed phases: native curve, shifted, plus the floor.
     try:
@@ -236,6 +246,11 @@ def main() -> None:
     flux_true = eval_periodic(*periodic_model(model_phase, model_flux), phase,
                               shift=args.phase_shift, offset=args.scatter)
 
+    if args.intrinsic_scatter > 0:
+        # Multiplicative log-normal variability with fractional std EPS and
+        # unit mean: sigma_ln = sqrt(ln(1 + EPS^2)), mean correction -sigma^2/2.
+        s_ln = float(np.sqrt(np.log1p(args.intrinsic_scatter ** 2)))
+        flux_true = flux_true * np.exp(rng.normal(-0.5 * s_ln ** 2, s_ln, flux_true.size))
     expected_src = flux_true / args.flux_per_rate * args.dt       # source counts per bin
     bkg_counts = args.bkg_rate * args.dt
     expected = expected_src + bkg_counts
@@ -251,7 +266,8 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
     header = ("# Synthetic light curve from cloak.kernel (cloak/synthetic/lightcurve.py)\n"
               f"# band {args.band}; wind_model {args.wind_model}; phase_shift {args.phase_shift}; "
-              f"scatter {args.scatter:g}; flux_per_rate {args.flux_per_rate:g}; seed {args.seed}\n"
+              f"scatter {args.scatter:g}; intrinsic_scatter {args.intrinsic_scatter:g}; "
+              f"flux_per_rate {args.flux_per_rate:g}; orbital_period {args.orbital_period:g}; seed {args.seed}\n"
               "# Columns: dt, t_raw, mjd, phase, counts, rate, rate_err, flux_t, exposure\n# \n")
     # The CIAO layout plus an explicit exposure column: with it the loaders know
     # that a zero-count row was observed (a CIAO file cannot tell a GTI gap
@@ -268,6 +284,7 @@ def main() -> None:
         "phase_shift": args.phase_shift,
         "mid_eclipse_data_phase": float((0.5 + args.phase_shift) % 1.0),
         "scatter": args.scatter,
+        "intrinsic_scatter": args.intrinsic_scatter,
         "flux_per_rate": args.flux_per_rate,
         "bkg_rate": args.bkg_rate,
         "dt": args.dt,
@@ -276,7 +293,7 @@ def main() -> None:
         "gap_duration": args.gap_duration,
         "noiseless": args.noiseless,
         "seed": args.seed,
-        "ephemeris": {"REF_EPOCH": REF_EPOCH, "ORBITAL_PERIOD": ORBITAL_PERIOD},
+        "ephemeris": {"REF_EPOCH": REF_EPOCH, "ORBITAL_PERIOD": float(args.orbital_period)},
         "n_bins": int(offsets.size),
         "total_counts": float(counts.sum()),
         "zero_count_bins": int(np.sum(counts == 0)),
@@ -290,7 +307,8 @@ def main() -> None:
           f"mean rate {net_rate.mean():.4f} cts/s, mid-eclipse at data phase {truth['mid_eclipse_data_phase']:.3f}")
     print(f"  truth: {stem}_truth.json")
     print(f"Fit with: python -m cloak.mcmc_fit --band {args.band} --flux-csv {args.flux_csv} "
-          f"--data-dir {out_dir} --obs-column flux_t --time-column t_raw ...")
+          f"--data-dir {out_dir} --obs-column flux_t --time-column t_raw --keep-zero-flux"
+          + (f" --orbital-period {args.orbital_period:g}" if args.orbital_period != ORBITAL_PERIOD else "") + " ...")
 
 
 if __name__ == "__main__":

@@ -890,6 +890,46 @@ from a prior that puts half the initial ball at `-inf`; a wrapping window with
 runs against the PyXspec stand-in (response, background, `calcFlux` and
 `fakeit` semantics mirrored from the live audit); pyflakes clean.
 
+### Commit 11 — Paper figures: fiducial systems, two notebooks, calibration batch
+
+- `cloak/synthetic/fiducial.py`: the paper's two generic systems (A WR-like,
+  B OB-like) with observing patterns; `kepler_prefactor`, `total_mass`,
+  `geometry`, `simulation_kwargs`, `describe`.
+- The orbital period is threaded through: `--orbital-period` folds the
+  light curves in both fitters (it used to enter Kepler's law only) and in the
+  generator (`--n-orbits` and the fold), `read_observation` / `load_data` /
+  `load_observed_lightcurves` take `period`/`epoch`. The generator also gained
+  `--intrinsic-scatter EPS` (mean-preserving log-normal variability per bin,
+  for the jitter likelihood).
+- `cloak.kernel.emitter_cell_columns`: per-cell columns and positions across
+  the emitter disk at one phase (tested against the kernel's own mean column).
+- `synthetic_data/generate_synthetic_data.ipynb` (tracked): tables under
+  HEASoft, light curves of both systems, diagnostics. Wrote System A/B broad
+  light curves (593 and 2058 bins of 100 counts after binning).
+- `figures/paper_figures.ipynb` + `figures/figlib.py` (tracked): fig02 wind
+  profiles, fig03 quadrature (plain rule vs the kernel's limb split), fig04
+  convergence (phase step, sector size; interpolated onto the finest grid,
+  normalized to the out-of-eclipse flux), fig05 per-cell vs mean column
+  (System B, 6 R☉ disk: factor 16), fig06 energy dependence, fig07 + table
+  invariances, fig08/fig09 + table injection-recovery of System A (MAP and
+  68 % predictive band; corner with injected values), fig10 SBC rank-ECDF
+  panels, fig11 the (M_tot, log f_opa) ridge under three priors, fig12 the
+  profiled shift against brute force, fig13 bin estimators, fig14 cross-band
+  prediction, and the performance table. MCMC fits run as cached
+  `python -m cloak.mcmc_fit` subprocesses; `CLOAK_QUICK=1` shrinks them for a
+  smoke run. `figures/run_sbc.py`: 100 prior draws (q_m and f_scatter
+  frozen, chi2 likelihood, same dth for data and fit), resumable, ranks to
+  `figures/results/sbc_ranks.csv`.
+- `.gitignore`: `figures/cache/` ignored; figure PDFs/PNGs and
+  `figures/results/*` re-included. Manuscript: quadrature caveat and
+  observation-model paragraphs rewritten for the limb split and the
+  exposure-weighted bins; `\graphicspath{{../}}` in the local root.
+- Verified: both notebooks execute end to end under the `henv` kernel (quick
+  mode: 13 figures, 5 tables, 13 inline images); the SBC script on two quick
+  draws; tests 13/13; pyflakes clean. The radial cell count stays a module
+  constant (measured effect < 0.3 % for extended emitters, none for
+  point-like ones).
+
 ### Commit 10 — Rename into the `cloak` package
 
 The flat scripts became one importable package named after the model

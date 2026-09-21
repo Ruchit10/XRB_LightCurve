@@ -300,6 +300,11 @@ def main() -> None:
              "precedence over both binning options.",
     )
     parser.add_argument(
+        "--orbital-period", type=float, default=float(ORBITAL_PERIOD), metavar="SECONDS",
+        help="Orbital period used to fold the light curves (phase = frac((t - REF_EPOCH) / P)). "
+             "Default: the module ephemeris (IC 10 X-1).",
+    )
+    parser.add_argument(
         "--keep-zero-flux",
         action="store_true",
         help="Keep rows with rate/flux <= 0 (observed zero-count bins, negative background-"
@@ -392,6 +397,7 @@ def main() -> None:
             obs_column=obs_column,
             obs_error_column=args.obs_error_column,
             time_column=args.time_column,
+            period=float(args.orbital_period),
         )
     except (FileNotFoundError, ValueError, pd.errors.EmptyDataError) as e:
         print(f"ERROR: {e}", file=sys.stderr)

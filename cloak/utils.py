@@ -387,8 +387,14 @@ def read_observation(
     obs_error_column: Optional[str] = None,
     time_column: Optional[str] = None,
     counts_column: Optional[str] = "counts",
+    period: float = ORBITAL_PERIOD,
+    epoch: float = REF_EPOCH,
 ) -> pd.DataFrame:
     """Read a single Chandra observation text file.
+
+    Phase is ``frac((time - epoch) / period)``; *period* and *epoch* default
+    to the module ephemeris (IC 10 X-1) and are what the fitters'
+    ``--orbital-period`` passes for another system.
 
     Two file shapes are supported:
 
@@ -425,7 +431,7 @@ def read_observation(
                 f"(time, rate[, error]); found {df.shape[1]}. Name the columns with a "
                 f"'# Columns: ...' header line instead.")
         df.columns = ["time", "rate", "error"][: df.shape[1]]
-        df["phase"] = frac((df["time"] - REF_EPOCH) / ORBITAL_PERIOD)
+        df["phase"] = frac((df["time"] - epoch) / period)
         df["obs"] = label
         return df
 
@@ -478,8 +484,8 @@ def read_observation(
     if exposure is not None:
         out["exposure"] = exposure
 
-    # Phase is always recomputed from the timestamps and the current ephemeris.
-    out["phase"] = frac((out["time"] - REF_EPOCH) / ORBITAL_PERIOD)
+    # Phase is always recomputed from the timestamps and the ephemeris given.
+    out["phase"] = frac((out["time"] - epoch) / period)
     out["obs"] = label
     return out
 
@@ -559,6 +565,8 @@ def load_data(
     obs_error_column: Optional[str] = None,
     time_column: Optional[str] = None,
     counts_column: Optional[str] = "counts",
+    period: float = ORBITAL_PERIOD,
+    epoch: float = REF_EPOCH,
 ) -> pd.DataFrame:
     """Load observational data from *data_dir*.
 
@@ -575,10 +583,15 @@ def load_data(
     counts_column : str, optional
         Name of column containing counts. If present, propagated into the
         combined output as ``counts``.
+    period, epoch : float
+        Ephemeris used to fold the time column (seconds); default the module
+        constants.
     Returns
     -------
     DataFrame with columns: time, rate (containing the specified observable), error (optional), phase, obs
     """
+    if not (np.isfinite(period) and period > 0):
+        raise ValueError(f"orbital period must be a positive number of seconds (got {period})")
     # Load all .txt files from directory
     txt_pattern = os.path.join(data_dir, "*.txt")
     files: List[str] = sorted(glob.glob(txt_pattern))
@@ -597,6 +610,8 @@ def load_data(
             obs_error_column,
             time_column,
             counts_column=counts_column,
+            period=period,
+            epoch=epoch,
         )
         for fp in files
     ]
@@ -631,6 +646,8 @@ def load_observed_lightcurves(
     error_column: Optional[str] = None,
     time_column: Optional[str] = None,
     drop_nonpositive_flux: bool = True,
+    period: float = ORBITAL_PERIOD,
+    epoch: float = REF_EPOCH,
 ) -> pd.DataFrame:
     """Load every observed light-curve file for one energy band.
 
@@ -657,6 +674,8 @@ def load_observed_lightcurves(
         obs_error_column=error_column,
         time_column=time_column,
         counts_column='counts',
+        period=period,
+        epoch=epoch,
     )
 
     combined = pd.DataFrame({

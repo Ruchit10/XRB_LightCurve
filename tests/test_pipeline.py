@@ -53,6 +53,19 @@ class KernelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             kernel.simulate_lightcurve(flux_csv_path=TABLE, band="broad", dth=5.0, **bad)
 
+    def test_per_cell_columns_match_the_kernel_mean(self):
+        geo = dict(GEOMETRY, r=1.0, d2h=6.0)
+        df = kernel.simulate_lightcurve(flux_csv_path=TABLE, band="broad", dth=1.0, **geo)
+        for deg in (0.0, 84.0, 88.0, 90.0):
+            row = df.iloc[int(np.argmin(np.abs(df["deg"].to_numpy() - deg)))]
+            cells = kernel.emitter_cell_columns(deg, **geo)
+            vis = cells["visible"]
+            if row["is_eclipsed"]:
+                self.assertFalse(vis.any())
+                continue
+            mean = np.sum(cells["column"][vis] * cells["area"][vis]) / np.sum(cells["area"][vis])
+            self.assertAlmostEqual(mean / row["fl"], 1.0, places=9, msg=f"deg {deg}")
+
     def test_flux_methods_agree_out_of_eclipse(self):
         a = kernel.simulate_lightcurve(flux_csv_path=TABLE, band="broad", dth=5.0, flux_method="interpolate", **GEOMETRY)
         b = kernel.simulate_lightcurve(flux_csv_path=TABLE, band="broad", dth=5.0, flux_method="refit", **GEOMETRY)

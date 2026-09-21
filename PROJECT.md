@@ -1075,6 +1075,28 @@ products (`convert_fits_to_txt.py`, `add_flux_simple.py`,
 
 ## Synthetic data (`synthetic_data/`)
 
+**Fiducial systems and the two notebooks.** `cloak/synthetic/fiducial.py`
+defines the paper's two generic systems (A: WR-like, `P = 1.6 d`, `a = 17`,
+`R = 2.5 R☉`, `i = 84°`, smooth_pl, `f_opa = 0.05`; B: OB-like, `P = 9 d`,
+`a = 60`, `R = 18 R☉`, `i = 78°`, beta_law, `f_opa = 1`) with their observing
+patterns. `synthetic_data/generate_synthetic_data.ipynb` turns them into data
+(tables under HEASoft, light curves for every band with a table, diagnostic
+plots) and `figures/paper_figures.ipynb` turns the data into the paper's
+results figures fig02–fig14 and tables (fiducial, priors, invariance,
+recovery, performance), caching the MCMC fits under `figures/cache/`;
+`figures/run_sbc.py` runs the simulation-based calibration batch that
+fig10 reads. The orbital period is an input everywhere (`--orbital-period`
+in both fitters and the generator; default the module ephemeris), so the
+9-day System B is folded with its own period. Findings recorded by the
+notebook: the phase step matters (interpolating a `dth = 4°` curve onto the
+data phases errs by up to 30 % of the out-of-eclipse flux for System A,
+`dth = 2°` by 0.3 %), the sector size and radial cell count do not for
+point-like emitters (< 1e-11; an extended `r = 1 R☉` emitter changes by
+< 1 % for `d2h = 12° → 1°` and < 0.3 % for 10 → 40 radial cells, so the
+radial count stays a constant), and the per-cell attenuation exceeds the
+mean-column one by a factor 16 for a `6 R☉` disk on System B while never
+exceeding 8 % on System A.
+
 Generators for injection–recovery tests; everything they write is read by the
 pipeline unchanged and the bands are `cloak.utils.CHANDRA_BANDS`.
 
@@ -1240,6 +1262,8 @@ MCMC fitter; the other scripts show a window only when `--output` is omitted.
 | [cloak/synthetic/](cloak/synthetic/) | ~430 | `spectrum.py` (PyXspec `fakeit` + per-band flux-per-rate factors) and `lightcurve.py` (CIAO-layout light curves with an `exposure` column from the forward model, with a truth record). |
 | [synthetic_data/](synthetic_data/) | data | Tracked synthetic products: the example flux table and generated light curves / tables / truth records. |
 | [tests/](tests/) | ~300 | `test_flux_methods.py`, `test_pipeline.py` (`python -m unittest discover -s tests`). |
+| [figures/](figures/) | ~900 | `paper_figures.ipynb` (every results figure/table of the paper), `figlib.py` (the code behind it), `run_sbc.py` (simulation-based calibration batch), the figure PDFs/PNGs and `results/` (tables as LaTeX rows, JSON summaries). `cache/` holds chains and is not tracked. |
+| [synthetic_data/generate_synthetic_data.ipynb](synthetic_data/generate_synthetic_data.ipynb) | nb | Writes the paper's synthetic inputs: flux tables (HEASoft) and light curves of the fiducial systems of `cloak/synthetic/fiducial.py`. |
 
 ### Package layout (`cloak/`)
 Everything importable lives in the `cloak` package: the library modules

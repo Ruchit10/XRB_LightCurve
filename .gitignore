@@ -54,3 +54,12 @@ paper/
 !synthetic_data/**/*.csv
 !synthetic_data/**/*.txt
 !synthetic_data/**/*.json
+
+# Paper figures: the notebooks, helper module, figure PDFs and small result
+# summaries are tracked; chains and other bulky intermediates are not.
+figures/cache/
+!figures/**/*.pdf
+!figures/**/*.png
+!figures/results/**/*.csv
+!figures/results/**/*.json
+!figures/results/**/*.txt

@@ -130,7 +130,6 @@ from cloak.utils import (
     write_model_blocks,
 )
 import matplotlib
-matplotlib.use("Agg")   # every figure is saved to a file; no display needed (SSH, clusters)
 
 from cloak.plots import (
     plot_corner,
@@ -1823,8 +1822,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "via a = K*M_tot^(1/3), q_m's posterior equals its prior, and M_X / "
                              "M_RH are derived. Freeze q_m to drop the dead dimension.")
     parser.add_argument("--orbital-period", type=float, default=float(ORBITAL_PERIOD),
-                        help="Orbital period in seconds for Kepler's third law (--kepler / "
-                             "--kepler-mtot only); the light curves are folded with utils.ORBITAL_PERIOD")
+                        help="Orbital period in seconds: folds the light curves (phase = frac((t - "
+                             "REF_EPOCH) / P)) and enters Kepler's third law under --kepler / "
+                             "--kepler-mtot. Default: the module ephemeris (IC 10 X-1).")
     parser.add_argument("--freeze", type=str, default=None, metavar="NAME=VAL[,NAME=VAL,...]",
                         help="Pin parameters and drop them from the chain. Names: d1,d2,a,q,r,R,"
                              "i0,M_X,M_RH,M_tot,q_m,f_scatter,log_fopa,Rb,p,fconf,ell,beta,H. "
@@ -1946,7 +1946,8 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
     obs_df = load_observed_lightcurves(band, args.data_dir, flux_column=args.obs_column,
                                        error_column=args.obs_error_column,
                                        time_column=args.time_column,
-                                       drop_nonpositive_flux=not args.keep_zero_flux)
+                                       drop_nonpositive_flux=not args.keep_zero_flux,
+                                       period=float(args.orbital_period))
     obs_df = apply_phase_window(obs_df, *args.phase_window)
     if 'flux_err' in obs_df.columns and not np.isfinite(obs_df['flux_err']).any():
         if args.no_phase_bin:
@@ -2076,9 +2077,6 @@ def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen
             err(f"{flag[name]} must be > 0.")
     if args.orbital_period <= 0:
         err("--orbital-period must be > 0.")
-    if 'orbital_period' in explicit and mode not in ('kepler', 'kepler_mtot'):
-        err("--orbital-period only enters Kepler's third law: use it with --kepler or "
-            "--kepler-mtot (the light curves are folded with utils.ORBITAL_PERIOD regardless).")
 
     # --- priors ----------------------------------------------------------------
     active_geometry = set(geometry_names(mode))
@@ -2119,6 +2117,9 @@ def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen
 def main():
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(line_buffering=True)   # keep stdout and stderr in order in log files
+    # The CLI saves every figure to a file: no display needed (SSH, clusters).
+    # Only here, so importing the module inside a notebook keeps its inline backend.
+    matplotlib.use("Agg")
     parser = build_parser()
     args = parser.parse_args()
     explicit = explicit_cli_dests(parser)

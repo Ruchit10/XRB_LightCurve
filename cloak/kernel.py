@@ -847,6 +847,73 @@ def _simulate_core(
     }
 
 
+def emitter_cell_columns(
+    gma_deg: float,
+    *,
+    r: float,
+    R: float,
+    d1: float,
+    d2: float,
+    i0: float,
+    d2h: float = 6.0,
+    wind_model: str = "smooth_pl",
+    wind_params: Optional[Dict[str, float]] = None,
+    mdot: float = 4.0e-6,
+    v_inf: float = 1750.0,
+    mu_wind: float = MU_WIND_DEFAULT,
+    f_opacity: float = 1.0,
+) -> Dict[str, np.ndarray]:
+    """Per-cell columns across the emitter disk at one phase angle (degrees).
+
+    Reproduces the kernel's grid (``N_RADIAL_CELLS`` radial segments per
+    angular sector of ``d2h`` degrees, each evaluated at its centre) in plain
+    numpy for diagnostics and figures: returns the cell centres in emitter
+    polar coordinates (``theta`` radians measured from the star-star line,
+    ``rho`` in solar radii), their sky-plane impact parameter ``b``, the
+    column ``N_H`` in 1e22 cm^-2 (including ``f_opacity``), the cell ``area``
+    and a ``visible`` flag (False when the cell centre is hidden behind the
+    companion). The area-weighted mean of the visible columns equals the
+    kernel's ``fl`` at that phase to round-off.
+    """
+    if not (0.0 < r < R):
+        raise ValueError(f"Need 0 < r < R (got r={r}, R={R}).")
+    if wind_params is None:
+        wind_params = default_wind_params(wind_model, R)
+    if wind_model in R_STAR_TIED_MODELS and "R_star" not in wind_params:
+        wind_params = {**wind_params, "R_star": float(R)}
+    model_id, p1, p2, p3 = pack_wind_params(wind_model, wind_params)
+    incl = inclination_to_internal_rad(i0)
+    a = float(d1) + float(d2)
+    gma = math.radians(float(gma_deg))
+    sin_g, cos_g = math.sin(gma), math.cos(gma)
+    h = a * sin_g * math.sin(incl)
+    L = a * cos_g
+    l = math.hypot(h, L)
+    z_start = a * sin_g * math.cos(incl)
+
+    n_th = max(2, int(360.0 / d2h))
+    th_step = 2.0 * math.pi / n_th
+    theta_c = (np.arange(n_th) + 0.5) * th_step
+    r_vals = np.linspace(r / 10.0, r, N_RADIAL_CELLS)
+    rho_c = 0.5 * (r_vals[1:] + r_vals[:-1])
+    area_seg = 0.5 * th_step * (r_vals[1:] ** 2 - r_vals[:-1] ** 2)
+
+    theta, rho = np.meshgrid(theta_c, rho_c, indexing="ij")
+    theta, rho = theta.ravel(), rho.ravel()
+    area = np.tile(area_seg, n_th)
+    b2 = rho ** 2 + l ** 2 - 2.0 * rho * l * np.cos(theta)
+    b = np.sqrt(np.clip(b2, 0.0, None))
+    visible = np.ones(b.size, dtype=bool) if sin_g <= 0.0 else b2 >= R * R
+
+    n0 = wind_density_norm_from_mdot(mdot, v_inf, wind_model, wind_params, mu=mu_wind)
+    col_scale = float(f_opacity) * n0 * R_SUN_CM / 1.0e22
+    column = np.full(b.size, np.nan)
+    for k in np.flatnonzero(visible):
+        column[k] = _los_gl_quadrature(float(b[k]), z_start, model_id, p1, p2, p3, _GL16_X, _GL16_W) * col_scale
+    return {"theta": theta, "rho": rho, "b": b, "column": column, "area": area, "visible": visible,
+            "l": l, "z_start": z_start}
+
+
 # Simulation defaults, taken from the one place they are defined.
 SIM_DEFAULTS: Dict[str, object] = {
     name: param.default for name, param in inspect.signature(_simulate_core).parameters.items()
