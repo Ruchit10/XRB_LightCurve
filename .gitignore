@@ -29,3 +29,37 @@ venv/
 
 # macOS
 .DS_Store
+
+# ---------------------------------------------------------------------------
+# Not part of the CLOAK release. These stay on disk but are never tracked:
+# real Chandra data and fit results, notebooks, legacy code, one-off helper
+# scripts, manuscript sources, reference PDFs, editor state and scratch.
+# Remove a line here (and `git add` the path) to start tracking it again.
+# ---------------------------------------------------------------------------
+data/
+mcmc_results/
+notebooks/
+legacy_r_code/
+extras/
+temp/
+paper/
+*.pdf
+.cursor/
+.vscode/
+.swp
+*.swp
+
+# Synthetic data products are released: re-include them under synthetic_data/
+# despite the blanket *.csv / *.txt / *.json rules above.
+!synthetic_data/**/*.csv
+!synthetic_data/**/*.txt
+!synthetic_data/**/*.json
+
+# Paper figures: the notebooks, helper module, figure PDFs and small result
+# summaries are tracked; chains and other bulky intermediates are not.
+figures/cache/
+!figures/**/*.pdf
+!figures/**/*.png
+!figures/results/**/*.csv
+!figures/results/**/*.json
+!figures/results/**/*.txt

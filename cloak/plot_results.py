@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""
+Standalone plotting of cloak.kernel simulation CSVs.
+------------------------------------------------------
+Thin CLI over ``cloak/plots.py``. The plotting itself lives there so that
+``cloak/mcmc_fit.py`` can produce the same geometry figures from a
+posterior point estimate.
+
+Usage
+~~~~~
+# Per-band model light curves
+$ python -m cloak.cloak.plot_results sim.csv --output bands.png
+
+# Geometry: projected separation vs the eclipse thresholds, sky-plane
+# components, N_H(phase) and the resulting band flux
+$ python -m cloak.cloak.plot_results sim.csv --geometric --R 2.0 --r 0.001 --output geom.png
+
+# Projected orbit / eclipse diagram (needs the geometry parameters)
+$ python -m cloak.cloak.plot_results sim.csv --orbit --R 2.0 --r 0.001 \
+    --d1 11.0 --d2 8.0 --i0 64.0 --output orbit.png
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+
+import pandas as pd
+
+if __package__ in (None, ""):   # run as a plain script: python cloak/plot_results.py
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+from cloak.utils import (
+    BAND_INFO,
+    detect_energy_bands,
+    get_band_display_name,
+)
+from cloak.plots import (
+    plot_geometry_vs_phase,
+    plot_orbit_geometry,
+    plot_simulation_bands,
+)
+
+__all__ = [
+    "BAND_INFO",
+    "detect_energy_bands",
+    "get_band_display_name",
+    "main",
+    "plot_geometry_vs_phase",
+    "plot_orbit_geometry",
+    "plot_simulation_bands",
+]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Plot XRB Lightcurve simulation results",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("data_file", type=str, help="CSV file with simulation results")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output file for saving plots (e.g., plots.png)")
+    parser.add_argument("--geometric", action="store_true",
+                        help="Plot geometry and absorption vs phase instead of band fluxes")
+    parser.add_argument("--orbit", action="store_true",
+                        help="Plot the projected orbit / eclipse diagram")
+    parser.add_argument("--R", type=float, default=None,
+                        help="Companion radius in solar radii (for --geometric / --orbit)")
+    parser.add_argument("--r", type=float, default=0.001,
+                        help="Compact object / disk radius in solar radii")
+    parser.add_argument("--d1", type=float, default=None,
+                        help="Compact-object distance from the centre of mass (--orbit)")
+    parser.add_argument("--d2", type=float, default=None,
+                        help="Companion distance from the centre of mass (--orbit)")
+    parser.add_argument("--i0", type=float, default=None,
+                        help="Orbital inclination in degrees from the orbital-plane "
+                             "normal, 90 = edge-on (--orbit)")
+    parser.add_argument("--band", type=str, default=None,
+                        help="Energy band label for titles and the flux panel")
+
+    args = parser.parse_args()
+
+    try:
+        df = pd.read_csv(args.data_file)
+    except FileNotFoundError:
+        print(f"Error: File {args.data_file} not found!")
+        sys.exit(1)
+
+    try:
+        if args.orbit:
+            missing = [n for n in ("R", "d1", "d2", "i0") if getattr(args, n) is None]
+            if missing:
+                parser.error(f"--orbit requires {', '.join('--' + m for m in missing)}")
+            fig = plot_orbit_geometry(
+                df, R=args.R, r=args.r, d1=args.d1, d2=args.d2, i0=args.i0,
+                output_path=args.output, band=args.band,
+            )
+        elif args.geometric:
+            if args.R is None:
+                parser.error("--geometric requires --R (the eclipse thresholds need it)")
+            fig = plot_geometry_vs_phase(
+                df, R=args.R, r=args.r, band=args.band, output_path=args.output,
+            )
+        else:
+            fig = plot_simulation_bands(df, output_path=args.output)
+    except KeyError as e:
+        print(f"Error: {args.data_file} lacks the column {e} the requested figure needs; "
+              f"use a CSV written by the simulator (cloak/kernel.py).", file=sys.stderr)
+        sys.exit(1)
+    if args.output is None and fig is not None:
+        # The plotting routines return the figure when no path is given.
+        import matplotlib.pyplot as plt
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()

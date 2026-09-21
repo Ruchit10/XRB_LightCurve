@@ -1,0 +1,67 @@
+{
+  "simulation": {
+    "r": 0.001,
+    "R": 2.5,
+    "d1": 10.2,
+    "d2": 6.800000000000001,
+    "i0": 84.0,
+    "gma0": -90.0,
+    "dth": 1.0,
+    "d2h": 6.0,
+    "flux_method": "interpolate",
+    "flux_type": "erg",
+    "flux_csv_path": "/Users/rpanchal/Desktop/xrb_lc/XRB_LightCurve/synthetic_data/flux_vs_nH_tbabs_broad.csv",
+    "band": "broad",
+    "wind_model": "smooth_pl",
+    "wind_params": {
+      "Rb": 6.0,
+      "p": 4.0,
+      "Delta": 2.0
+    },
+    "mdot": 1e-05,
+    "v_inf": 1750.0,
+    "mu_wind": 1.4,
+    "f_opacity": 0.05
+  },
+  "phase_shift": 0.02,
+  "mid_eclipse_data_phase": 0.52,
+  "scatter": 3.35693e-14,
+  "intrinsic_scatter": 0.1,
+  "flux_per_rate": 2.237953e-12,
+  "bkg_rate": 0.0,
+  "dt": 100.0,
+  "visits_s_after_ref_epoch": [
+    [
+      0.0,
+      40000.0
+    ],
+    [
+      456192.0,
+      40000.0
+    ],
+    [
+      1050620.0,
+      40000.0
+    ],
+    [
+      1783300.0,
+      40000.0
+    ],
+    [
+      2654210.0,
+      40000.0
+    ]
+  ],
+  "gap_fraction": 0.1,
+  "gap_duration": 3000.0,
+  "noiseless": false,
+  "seed": 11,
+  "ephemeris": {
+    "REF_EPOCH": 278801348,
+    "ORBITAL_PERIOD": 138240.0
+  },
+  "n_bins": 1698,
+  "total_counts": 72428.0,
+  "zero_count_bins": 10,
+  "output": "/Users/rpanchal/Desktop/xrb_lc/XRB_LightCurve/synthetic_data/systemA/broad/systemA_broad.txt"
+}

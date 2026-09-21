@@ -1,7 +1,24 @@
+# Core forward model. numba is REQUIRED: the Gauss-Legendre mega-kernel is the
+# only LOS integrator, and the only path producing the per-cell columns that the
+# nonlinear nH -> flux conversion needs. (scipy is no longer imported directly;
+# emcee and arviz pull it in.)
 numpy>=1.21.0
 pandas>=1.3.0
-matplotlib>=3.5.0 
-scipy>=1.7.0
+numba>=0.56.0
+matplotlib>=3.5.0
+
+# MCMC inference
 emcee>=3.1.0
 corner>=2.2.0
 tqdm>=4.64.0
+
+# Optional: alternative sampler and convergence diagnostics.
+# zeus-mcmc powers --sampler zeus; arviz powers the ArviZ summary / R-hat table.
+zeus-mcmc>=2.5.0
+arviz>=0.14.0
+
+# Optional: FITS light-curve conversion (extras/convert_fits_to_txt.py).
+astropy>=5.0
+
+# Not installable via pip: cloak/flux_table.py requires XSPEC / PyXspec
+# from a HEASoft installation.
