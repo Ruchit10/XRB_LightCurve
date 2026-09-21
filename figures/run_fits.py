@@ -29,6 +29,7 @@ def main() -> None:
     for name in args.names:
         if name not in FITS:
             parser.error(f"unknown fit {name!r}; choose from {FITS}")
+    for name in args.names:
         t0 = time.time()
         cfg = L.ensure_fit(name)
         print(f"{name}: done in {(time.time() - t0) / 60:.1f} min -> {os.path.relpath(cfg['chain'], L.ROOT)}", flush=True)

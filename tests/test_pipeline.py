@@ -66,6 +66,18 @@ class KernelTests(unittest.TestCase):
             mean = np.sum(cells["column"][vis] * cells["area"][vis]) / np.sum(cells["area"][vis])
             self.assertAlmostEqual(mean / row["fl"], 1.0, places=9, msg=f"deg {deg}")
 
+    def test_partial_occultation_scales_with_the_visible_fraction(self):
+        # No absorption, near edge-on (the fiducial 78 deg never occults the emitter): the flux of a
+        # 1 R_sun disk must fall exactly with its visible fraction through the partial phases.
+        geo = dict(GEOMETRY, r=1.0, f_opacity=0.0, i0=88.0)
+        df = kernel.simulate_lightcurve(flux_csv_path=TABLE, band="broad", dth=1.0, **geo)
+        f_out = df["nfl_broad"].max()
+        frac = df["A2"].to_numpy() / (np.pi * (1.0 ** 2 - 0.1 ** 2))
+        partial = (frac > 0.01) & (frac < 0.99)
+        self.assertGreater(partial.sum(), 5)
+        np.testing.assert_allclose(df["nfl_broad"].to_numpy()[partial], f_out * frac[partial], rtol=1e-9)
+        self.assertTrue(np.all(df["nfl_broad"].to_numpy()[frac >= 1.0 - 1e-9] == f_out))   # fully visible: unchanged exactly
+
     def test_flux_methods_agree_out_of_eclipse(self):
         a = kernel.simulate_lightcurve(flux_csv_path=TABLE, band="broad", dth=5.0, flux_method="interpolate", **GEOMETRY)
         b = kernel.simulate_lightcurve(flux_csv_path=TABLE, band="broad", dth=5.0, flux_method="refit", **GEOMETRY)

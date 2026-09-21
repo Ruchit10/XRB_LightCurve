@@ -221,12 +221,24 @@ finite interval, so 16 fixed nodes give better than 1e-5 for `smooth_pl` and
 `confinement` at any impact parameter — the full `z`-tail is always
 integrated, with no cutoff radius to choose and no special-casing of `b` vs
 `Rb`. The `beta_law` profile diverges at the photosphere, so a ray grazing the
-limb (`b − R⋆ < 0.3 R☉`) has an integrand peaked at closest approach that 16
-nodes over the whole interval under-resolve (−30 % at `b − R⋆ = 0.01`, −90 %
-at 0.001); such rays are integrated piecewise around the peak (`_gl_piece`),
-which brings the error below 1e-7 against adaptive quadrature. Rays that cross
+limb (`(b − R⋆)/R⋆ < 0.4`, a relative gate so the rule is scale-covariant) has
+an integrand peaked at closest approach that 16 nodes over the whole interval
+under-resolve (−30 % at `(b − R⋆)/R⋆ = 0.005`, −90 % at 0.0005); such rays are
+integrated piecewise around the peak (`_gl_piece`), which keeps the error
+below 1.1e-7 against adaptive quadrature at every distance and for every
+stellar radius. Rays that cross
 the photosphere (`b < R⋆`) have a divergent column and are opaque either way.
 Nodes and weights are module constants (`_GL16_X`, `_GL16_W`).
+
+**Flux of a partially occulted emitter.** The per-cell pass averages the
+attenuated flux over the visible cells; `_simulate_core` then multiplies by
+the visible fraction `A2 / (π (r² − (r/10)²))`, because hidden cells emit
+nothing towards the observer. Before Phase 34's figure work the visible-area
+mean was returned as the band flux, so a resolved disk 98 % behind the
+companion still showed its full flux (a factor 6 at a 17 %-visible phase of a
+6 R☉ disk). Fully visible phases keep their value exactly, so point-like
+emitters, whose partial phases span 0.006° and are never sampled, are
+unaffected; the mean column `flx` / `fl` stays a visible-area mean.
 
 **Numba is a hard requirement.** The module raises `ImportError` at import if it
 is missing. There is no trapezoid fallback: the kernel is also the only path
@@ -241,7 +253,7 @@ interpolation in log–log space, extrapolated from the upper end segment and
 held at the first tabulated flux below the table — absorption cannot exceed 1,
 and extrapolating the first segment returned up to 28 % above the plateau for
 tables starting at 0.01 — with the column clipped to `[1e-6, 1e6] × 1e22`) and `_cell_flux_exp` (`A·e^{-B·N}`) each take
-the kernel's per-cell columns and areas and return the area-averaged flux per
+the kernel's per-cell columns and areas and return the visible-area-averaged flux per
 phase in one `prange` pass; the former reproduces the previous
 `scipy.interp1d` path to 5e-15.
 
@@ -1085,7 +1097,14 @@ plots) and `figures/paper_figures.ipynb` turns the data into the paper's
 results figures fig02–fig14 and tables (fiducial, priors, invariance,
 recovery, performance), caching the MCMC fits under `figures/cache/`;
 `figures/run_sbc.py` runs the simulation-based calibration batch that
-fig10 reads. The orbital period is an input everywhere (`--orbital-period`
+fig10 reads: it fits the paper's own model (jitter likelihood, wind shape,
+opacity and floor free, `--kepler-mtot`, the sampling settings of
+`figlib.FIT_SETTINGS`) with two stated changes a calibration test needs — the
+floor gets the fixed prior `figlib.FLOOR_PRIOR` (`--prior-fscatter`) from
+which the injected floor is drawn, and `q_m` is frozen at its drawn value —
+injects 10 % intrinsic variability, ranks the jitter parameter as a
+diagnostic only, records the fitter's convergence verdict per draw and lets
+the figure use converged draws only. The orbital period is an input everywhere (`--orbital-period`
 in both fitters and the generator; default the module ephemeris), so the
 9-day System B is folded with its own period. Findings recorded by the
 notebook: the phase step matters (interpolating a `dth = 4°` curve onto the

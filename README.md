@@ -222,7 +222,7 @@ Both conversions are applied per emitter cell inside a compiled kernel.
 | `is_eclipsed` | Per-phase geometric eclipse flag |
 | `flx` | Dimensionless mean wind LOS integral ∫g(r)dz, r in R☉ |
 | `fl` | Absolute mean column density `N_H` (10²² cm⁻²) |
-| `nfl_{band}` | Absorbed band flux, area-averaged over the emitter disk |
+| `nfl_{band}` | Absorbed band flux: attenuated per cell, averaged over the visible cells, scaled by the visible fraction of the disk |
 
 `fl = flx × f_opacity × n₀ × R_sun / 10²²`, and `nfl_{band}` is the per-cell
 flux conversion averaged over the disk (**not** the conversion of `fl`).

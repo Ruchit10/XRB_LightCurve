@@ -248,8 +248,10 @@ def _gl_piece(b, u_lo, u_hi, model_id, p1, p2, p3, gl_x, gl_w):
     return integral * b * half_range
 
 
-# beta_law rays closer than this to the photosphere get the split quadrature.
-_LIMB_SPLIT_EXCESS = 0.3
+# beta_law rays with (b - R_star) / R_star below this get the split quadrature. The
+# criterion is relative, so the numerical model is scale-covariant (all lengths x lambda
+# leaves the rule's decision unchanged); the plain 16-node rule is accurate to ~1e-7 beyond it.
+_LIMB_SPLIT_RATIO = 0.4
 
 
 @njit(cache=True, inline="always")
@@ -266,10 +268,12 @@ def _los_gl_quadrature(b, z_start, model_id, p1, p2, p3, gl_x, gl_w):
     parameter. The beta_law profile diverges at the photosphere, so a ray
     grazing the limb (b - R_star small) has an integrand peaked at closest
     approach (u = 0) with a width ~ sqrt(2 (b - R_star) / b) that 16 nodes over
-    the whole interval under-resolve (-30 % at b - R_star = 0.01, -90 % at
-    0.001). Such rays are integrated piecewise: [-pi/2, -w], [-w, 0], [0, w],
-    [w, u_start] with the two central pieces halved again, which brings the
-    error below 1e-7 everywhere (checked against adaptive quadrature).
+    the whole interval under-resolve (-30 % at (b - R_star) / R_star = 0.005,
+    -90 % at 0.0005). Rays with (b - R_star) / R_star < _LIMB_SPLIT_RATIO are
+    integrated piecewise: [-pi/2, -w], [-w, 0], [0, w], [w, u_start] with the
+    two central pieces halved again, which brings the error below 1e-7
+    everywhere (checked against adaptive quadrature); the gate is relative so
+    that scaling every length leaves the rule, and hence the model, invariant.
     """
     if b < 1e-8:
         b = 1e-8
@@ -277,7 +281,7 @@ def _los_gl_quadrature(b, z_start, model_id, p1, p2, p3, gl_x, gl_w):
     u_lo = -1.5707963267948966  # -pi/2
     if u_hi <= u_lo:
         return 0.0
-    if model_id == 2 and u_hi > 0.0 and 0.0 < b - p1 < _LIMB_SPLIT_EXCESS:
+    if model_id == 2 and u_hi > 0.0 and 0.0 < b - p1 < _LIMB_SPLIT_RATIO * p1:
         w = 4.0 * math.sqrt(2.0 * (b - p1) / b)
         if w > 0.6:
             w = 0.6
@@ -333,7 +337,9 @@ def _simulate_phases_numba(
 
     Returns
     -------
-    flx, A2, l, L, h : per-phase arrays
+    flx, A2, l, L, h : per-phase arrays (flx is the visible-area mean column,
+                       A2 the visible area of the grid, whose full area is
+                       pi (r^2 - (r/10)^2))
     eclipsed         : uint8 per-phase flag
     cell_col, cell_area : (n_phases, n_cells_max) per-cell columns and areas
     cell_count       : number of valid cells per phase
@@ -824,6 +830,18 @@ def _simulate_core(
     flx, A2, l_arr, h_arr, eclipsed, nfl = (
         _unmirror(x, run, partner) for x in (flx, A2, l_arr, h_arr, eclipsed, nfl))
     L_arr = _unmirror(L_arr, run, partner, negate=True)
+
+    # The per-cell pass averages the attenuated flux over the *visible* cells.
+    # Hidden cells emit nothing towards the observer, so the band flux of a
+    # partially occulted emitter is that average times the visible fraction of
+    # the disk (the grid covers r/10 .. r; a fully visible phase keeps the
+    # value exactly, so point-like emitters, whose partial phases are never
+    # sampled, are unaffected). The mean column flx / fl stays a visible-area
+    # mean, which is the diagnostic it is meant to be.
+    r_min = r / 10.0
+    A_full = np.pi * (r * r - r_min * r_min)
+    visible_fraction = np.where(A2 >= A_full * (1.0 - 1e-12), 1.0, A2 / A_full)
+    nfl = nfl * visible_fraction
 
     # Eclipsed phases have no visible cells, so nfl is already 0 there; the
     # scattered-light floor is a constant, phase-independent addition.

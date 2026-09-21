@@ -6,63 +6,63 @@
         "value": 4.0,
         "max_rel_change": 0.10866234210207563,
         "mean_rel_change": 0.001211497479184626,
-        "wall_ms": 3.856888972222805
+        "wall_ms": 2.9439269565045834
       },
       {
         "value": 2.0,
         "max_rel_change": 0.1604472314652978,
         "mean_rel_change": 0.00095045915248126,
-        "wall_ms": 6.055973004549742
+        "wall_ms": 8.12905200291425
       },
       {
         "value": 1.0,
         "max_rel_change": 0.13752619839882668,
         "mean_rel_change": 0.00039633301907067317,
-        "wall_ms": 12.841096962802112
+        "wall_ms": 14.449078007601202
       },
       {
         "value": 0.5,
         "max_rel_change": 0.09168413226588812,
         "mean_rel_change": 0.0001301916402101225,
-        "wall_ms": 27.279834961518645
+        "wall_ms": 23.065462009981275
       },
       {
         "value": 0.25,
         "max_rel_change": 0.0,
         "mean_rel_change": 0.0,
-        "wall_ms": 47.30660899076611
+        "wall_ms": 49.120430019684136
       }
     ],
     "B": [
       {
         "value": 4.0,
-        "max_rel_change": 0.0789163128016808,
-        "mean_rel_change": 0.0012883310729103058,
-        "wall_ms": 2.4117770371958613
+        "max_rel_change": 0.07891761878603983,
+        "mean_rel_change": 0.0012858688373574099,
+        "wall_ms": 3.4197360510006547
       },
       {
         "value": 2.0,
-        "max_rel_change": 0.10383929010577833,
-        "mean_rel_change": 0.0007760773571894636,
-        "wall_ms": 4.376179073005915
+        "max_rel_change": 0.10422640307397775,
+        "mean_rel_change": 0.0007576829476323423,
+        "wall_ms": 7.249595946632326
       },
       {
         "value": 1.0,
-        "max_rel_change": 0.03018595345016418,
-        "mean_rel_change": 0.0002209772322094615,
-        "wall_ms": 8.650303003378212
+        "max_rel_change": 0.03352353762085335,
+        "mean_rel_change": 0.00023799558591411108,
+        "wall_ms": 13.824900961481035
       },
       {
         "value": 0.5,
         "max_rel_change": 0.015742461071278024,
-        "mean_rel_change": 4.7358910114333536e-05,
-        "wall_ms": 16.557574970647693
+        "mean_rel_change": 5.575541238505582e-05,
+        "wall_ms": 25.97472700290382
       },
       {
         "value": 0.25,
         "max_rel_change": 0.0,
         "mean_rel_change": 0.0,
-        "wall_ms": 30.012586968950927
+        "wall_ms": 52.01247497461736
       }
     ]
   },
@@ -72,95 +72,95 @@
         "value": 12.0,
         "max_rel_change": 3.698493869067541e-12,
         "mean_rel_change": 5.076563188383038e-14,
-        "wall_ms": 11.108194943517447
+        "wall_ms": 5.403685034252703
       },
       {
         "value": 6.0,
         "max_rel_change": 3.538231215686778e-12,
         "mean_rel_change": 3.907354688172563e-14,
-        "wall_ms": 12.5535789411515
+        "wall_ms": 13.384005054831505
       },
       {
         "value": 3.0,
         "max_rel_change": 9.026505190133854e-13,
         "mean_rel_change": 2.8360543968123855e-14,
-        "wall_ms": 25.126605993136764
+        "wall_ms": 22.112895967438817
       },
       {
         "value": 2.0,
         "max_rel_change": 3.5833502059403713e-13,
         "mean_rel_change": 5.5591609213566104e-15,
-        "wall_ms": 32.14282693807036
+        "wall_ms": 36.967376014217734
       },
       {
         "value": 1.0,
         "max_rel_change": 0.0,
         "mean_rel_change": 0.0,
-        "wall_ms": 61.53752002865076
+        "wall_ms": 63.23253794107586
       }
     ],
     "B": [
       {
         "value": 12.0,
         "max_rel_change": 4.216711753891478e-14,
-        "mean_rel_change": 3.000295145849816e-14,
-        "wall_ms": 4.312383942306042
+        "mean_rel_change": 3.0006021421132605e-14,
+        "wall_ms": 8.842093986459076
       },
       {
         "value": 6.0,
         "max_rel_change": 2.907490765788076e-14,
-        "mean_rel_change": 1.9282258193698782e-14,
-        "wall_ms": 8.095282944850624
+        "mean_rel_change": 1.9290051175770828e-14,
+        "wall_ms": 13.66891199722886
       },
       {
         "value": 3.0,
         "max_rel_change": 3.1965395553693465e-14,
-        "mean_rel_change": 2.3026254739629222e-14,
-        "wall_ms": 15.572445932775736
+        "mean_rel_change": 2.3027435494488622e-14,
+        "wall_ms": 31.454235897399485
       },
       {
         "value": 2.0,
         "max_rel_change": 9.521607186206565e-15,
-        "mean_rel_change": 3.3931647583310334e-15,
-        "wall_ms": 24.122180067934096
+        "mean_rel_change": 3.3950539661060748e-15,
+        "wall_ms": 41.83200700208545
       },
       {
         "value": 1.0,
         "max_rel_change": 0.0,
         "mean_rel_change": 0.0,
-        "wall_ms": 55.84979697596282
+        "wall_ms": 82.47259096242487
       }
     ],
     "A_extended": [
       {
         "value": 12.0,
-        "max_rel_change": 0.001757483720613049,
-        "mean_rel_change": 5.585105047091657e-05,
-        "wall_ms": 5.363864009268582
+        "max_rel_change": 0.0022813114583564325,
+        "mean_rel_change": 7.926702428176319e-05,
+        "wall_ms": 8.370148949325085
       },
       {
         "value": 6.0,
-        "max_rel_change": 0.0006636532394311813,
-        "mean_rel_change": 2.1200912085276233e-05,
-        "wall_ms": 10.66936703864485
+        "max_rel_change": 0.00085953629508197,
+        "mean_rel_change": 3.036856720642114e-05,
+        "wall_ms": 10.696985991671681
       },
       {
         "value": 3.0,
-        "max_rel_change": 0.00031994397031495766,
-        "mean_rel_change": 1.0201507173204175e-05,
-        "wall_ms": 22.13771897368133
+        "max_rel_change": 0.0003677757129015979,
+        "mean_rel_change": 1.4037179646749236e-05,
+        "wall_ms": 25.982895982451737
       },
       {
         "value": 2.0,
-        "max_rel_change": 0.00019648204477319182,
-        "mean_rel_change": 6.474030168172693e-06,
-        "wall_ms": 31.750711030326784
+        "max_rel_change": 0.000306475123782508,
+        "mean_rel_change": 9.507049034137913e-06,
+        "wall_ms": 40.43498309329152
       },
       {
         "value": 1.0,
         "max_rel_change": 0.0,
         "mean_rel_change": 0.0,
-        "wall_ms": 62.890687957406044
+        "wall_ms": 70.18102298025042
       }
     ]
   },

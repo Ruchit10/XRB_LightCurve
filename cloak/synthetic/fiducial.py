@@ -14,7 +14,9 @@ observation settings under ``observation``.
 """
 from __future__ import annotations
 
+import glob
 import math
+import os
 from typing import Dict
 
 G_SI = 6.674e-11
@@ -66,6 +68,20 @@ SYSTEMS: Dict[str, Dict] = {
         },
     },
 }
+
+
+def available_tables(data_dir: str, bands) -> Dict[str, str]:
+    """Band -> flux-vs-nH CSV under *data_dir*. The generic tables written by the data notebook
+    (``tables/flux_vs_nH_<band>.csv``) are used exclusively as soon as any exists; only without them
+    do the tracked example table(s) ``flux_vs_nH_tbabs_<band>.csv`` serve, so tables from two
+    different spectra are never mixed. Shared by the data notebook and the figure code."""
+    generic = {os.path.basename(p)[len("flux_vs_nH_"):-4]: p
+               for p in sorted(glob.glob(os.path.join(data_dir, "tables", "flux_vs_nH_*.csv")))}
+    generic = {b: p for b, p in generic.items() if b in bands}
+    if generic:
+        return generic
+    return {b: os.path.join(data_dir, f"flux_vs_nH_tbabs_{b}.csv") for b in bands
+            if os.path.exists(os.path.join(data_dir, f"flux_vs_nH_tbabs_{b}.csv"))}
 
 
 def visits(system: Dict):

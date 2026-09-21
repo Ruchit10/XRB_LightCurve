@@ -1,10 +1,12 @@
 {
-  "search_shift": 0.019482421875,
-  "search_chi2": 832.2077641315059,
-  "brute_shift": 0.0195,
-  "brute_chi2": 832.221497804278,
-  "search_minus_brute_chi2": -0.01373367277210491,
+  "objective": "jitter -2lnL",
+  "jitter_f": 0.059743983074578476,
+  "search_shift": 0.020009765625000002,
+  "search_value": -34873.83089819488,
+  "brute_shift": 0.02,
+  "brute_value": -34873.826452428155,
+  "search_minus_brute": -0.004445766724529676,
   "brute_grid_step": 5e-05,
   "search_resolution": 9.765625e-06,
-  "note": "a negative difference means the search's finer final step found a lower chi2 than the brute-force grid"
+  "note": "a negative difference means the search's finer final step found a lower value than the brute-force grid"
 }

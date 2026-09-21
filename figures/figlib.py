@@ -19,6 +19,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -47,6 +48,17 @@ DATA = os.path.join(ROOT, "synthetic_data")
 TABLES = os.path.join(DATA, "tables")
 BANDS = dict(U.CHANDRA_BANDS)                       # name -> (emin, emax) keV
 WIDTH = 13.5 / 2.54                                 # MDPI figure width in inches
+
+# One place for the sampling settings of every paper fit (and of the calibration batch,
+# which imports them). Chains must be long against the autocorrelation time (about
+# 100-300 steps for the fiducial fits); "extra_args" holds prior overrides applied to all
+# fits, e.g. ["--prior-R", "2.5,1.0,1.0,8.0"]. Everything here enters the fit-cache digest.
+FIT_SETTINGS = {"n_walkers": 32, "n_steps": 5000, "n_burn": 1000, "ridge_n_steps": 3000, "extra_args": []}
+# Fixed prior of the scattered floor used by the calibration batch (flux units, System A's scale):
+# mean 3 % of the fiducial out-of-eclipse flux, wide, non-negative.
+FLOOR_PRIOR = {"mean": 3.4e-14, "std": 2.0e-14, "min": 0.0, "max": 1.2e-13}
+SBC_INTRINSIC_SCATTER = 0.10                        # per-row log-normal variability injected in the batch
+PRIOR_REGISTRIES = ("R_PRIOR", "SMALL_R_PRIOR", "I0_PRIOR", "WIND_SHAPE_PRIORS", "FOPACITY_PRIOR", "JITTER_PRIOR")
 PROFILE_LABELS = {"smooth_pl": "smoothly broken power law", "confinement": "confinement", "beta_law": r"$\beta$-law"}
 os.makedirs(CACHE, exist_ok=True)
 os.makedirs(RESULTS, exist_ok=True)
@@ -66,9 +78,18 @@ def style() -> None:
     })
 
 
-def save_fig(fig: plt.Figure, name: str) -> str:
-    """Write ``figures/<name>.pdf`` (vector, for the paper)."""
+def save_fig(fig: Optional[plt.Figure], name: str) -> Optional[str]:
+    """Write ``figures/<name>.pdf`` (vector, for the paper).
+
+    ``fig=None`` means the figure function had nothing to draw (its inputs are missing, e.g. no
+    SBC ranks yet): nothing is written and a ``figures/<name>.pdf`` left by an earlier run is
+    removed, so the PDFs on disk never include a placeholder or an outdated figure."""
     path = os.path.join(FIG_DIR, f"{name}.pdf")
+    if fig is None:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"removed stale {os.path.relpath(path, ROOT)} (nothing to draw)")
+        return None
     fig.savefig(path, bbox_inches="tight")
     print(f"saved {os.path.relpath(path, ROOT)}")
     return path
@@ -155,12 +176,27 @@ def merged_handles(axes):
 
 
 def fmt(x: float, digits: int = 3) -> str:
-    """Compact number for tables: 3 significant digits, scientific when needed."""
+    """Number for LaTeX math mode: 3 significant digits, ``a \\times 10^{b}`` outside [1e-3, 1e4)."""
     if x == 0 or not np.isfinite(x):
         return f"{x:g}"
     if 1e-3 <= abs(x) < 1e4:
         return f"{x:.{digits}g}"
-    return f"{x:.{digits - 1}e}"
+    mant, exp = f"{x:.{digits - 1}e}".split("e")
+    return rf"{mant} \times 10^{{{int(exp)}}}"
+
+
+def fmt_pm(med: float, plus: float, minus: float) -> str:
+    """``med^{+plus}_{-minus}`` for LaTeX math mode; outside [1e-3, 1e4) the three share one power of ten,
+    ``(a^{+b}_{-c}) \\times 10^{e}`` (a bare ``10^{e}^{+b}`` would be a LaTeX double superscript)."""
+    if med == 0 or not np.isfinite(med) or 1e-3 <= abs(med) < 1e4:
+        return f"{fmt(med)}^{{+{fmt(plus, 2)}}}_{{-{fmt(minus, 2)}}}"
+    e = int(math.floor(math.log10(abs(med))))
+    s = 10.0 ** e
+    return rf"({med / s:.3g}^{{+{plus / s:.2g}}}_{{-{minus / s:.2g}}}) \times 10^{{{e}}}"
+
+
+SHAPE_SYMBOLS = {"Rb": r"R_{\rm b}", "p": "p", "Delta": r"\Delta", "fconf": r"f_{\rm c}", "ell": r"\ell",
+                 "beta": r"\beta", "H": "H", "R_star": r"R_\star"}
 
 
 # ----------------------------------------------------------------------------
@@ -168,17 +204,8 @@ def fmt(x: float, digits: int = 3) -> str:
 # ----------------------------------------------------------------------------
 
 def available_tables() -> Dict[str, str]:
-    """Band -> flux-vs-nH CSV. The generic tables written by the data notebook
-    (``synthetic_data/tables/flux_vs_nH_<band>.csv``) are used exclusively as soon as any exists;
-    only without them do the tracked example table(s) ``synthetic_data/flux_vs_nH_tbabs_<band>.csv``
-    serve, so tables from two different spectra are never mixed in one figure."""
-    generic = {os.path.basename(p)[len("flux_vs_nH_"):-4]: p
-               for p in sorted(glob.glob(os.path.join(TABLES, "flux_vs_nH_*.csv")))}
-    generic = {b: p for b, p in generic.items() if b in BANDS}
-    if generic:
-        return generic
-    return {b: os.path.join(DATA, f"flux_vs_nH_tbabs_{b}.csv") for b in BANDS
-            if os.path.exists(os.path.join(DATA, f"flux_vs_nH_tbabs_{b}.csv"))}
+    """Band -> flux-vs-nH CSV, by the policy shared with the data notebook (``fiducial.available_tables``)."""
+    return F.available_tables(DATA, BANDS)
 
 
 def require_table(band: str) -> str:
@@ -226,13 +253,13 @@ def fiducial_table() -> str:
     gA, gB = F.geometry(A), F.geometry(B)
 
     def shape(s):
-        return ", ".join(f"${k}={v:g}$" for k, v in s["wind_params"].items())
+        return ", ".join(f"${SHAPE_SYMBOLS.get(k, k)}={v:g}$" for k, v in s["wind_params"].items())
     rows.append(["$P$ (d)", f"{dA['period_d']:g}", f"{dB['period_d']:g}"])
     rows.append(["$a$ ($R_\\odot$); $M_{\\rm tot}$ ($M_\\odot$)", f"{dA['a']:g}; {dA['M_tot']:.1f}", f"{dB['a']:g}; {dB['M_tot']:.1f}"])
     rows.append(["$R$, $r$ ($R_\\odot$)", f"{gA['R']:g}, {gA['r']:g}", f"{gB['R']:g}, {gB['r']:g}"])
     rows.append(["$i$ (deg)", f"{gA['i0']:g}", f"{gB['i0']:g}"])
     rows.append(["profile; shape", f"{PROFILE_LABELS[A['wind_model']]}; {shape(A)}", f"{PROFILE_LABELS[B['wind_model']]}; {shape(B)}"])
-    rows.append(["$\\dot M$ ($M_\\odot$\\,yr$^{-1}$), $v_\\infty$ (km\\,s$^{-1}$)", f"{A['mdot']:.0e}, {A['v_inf']:g}", f"{B['mdot']:.0e}, {B['v_inf']:g}"])
+    rows.append(["$\\dot M$ ($M_\\odot$\\,yr$^{-1}$), $v_\\infty$ (km\\,s$^{-1}$)", f"${fmt(A['mdot'], 1)}$, {A['v_inf']:g}", f"${fmt(B['mdot'], 1)}$, {B['v_inf']:g}"])
     rows.append(["$f_{\\rm opa}$, $f_{\\rm sc}/F_{\\rm out}$", f"{A['f_opacity']:g}, {A['observation']['scatter_fraction']:g}",
                  f"{B['f_opacity']:g}, {B['observation']['scatter_fraction']:g}"])
     rows.append(["bands (keV)", ", ".join(f"{lo:g}--{hi:g}" for lo, hi in BANDS.values()), "same"])
@@ -481,8 +508,12 @@ def table_flux_of_column(band: str, column_1e22: np.ndarray) -> np.ndarray:
     """F(N) from the band's table, log-log interpolation with the kernel's clamping."""
     ctx = K._build_flux_context(require_table(band), flux_type="erg")
     info = ctx["band_data"][band]
+    lnh, lfl = info["log_nh"], info["log_flux"]
     lx = np.log10(np.clip(column_1e22, 1e-6, 1e6))
-    lf = np.interp(lx, info["log_nh"], info["log_flux"], left=info["log_flux"][0])
+    lf = np.interp(lx, lnh, lfl, left=lfl[0])
+    above = lx > lnh[-1]                    # the kernel extrapolates the upper end segment
+    slope = (lfl[-1] - lfl[-2]) / (lnh[-1] - lnh[-2])
+    lf = np.where(above, lfl[-1] + slope * (lx - lnh[-1]), lf)
     return 10.0 ** lf
 
 
@@ -573,7 +604,14 @@ def eclipse_width_half_depth(phase: np.ndarray, flux: np.ndarray) -> Tuple[float
     hi = kk
     while hi < fl.size - 1 and below[hi + 1]:
         hi += 1
-    return float(u[hi] - u[lo]), depth
+    # Linear interpolation of the two crossings, so the width is not quantised to the grid step.
+    def cross(i_in, i_out):
+        f_in, f_out_ = fl[i_in], fl[i_out]
+        t = (level - f_in) / (f_out_ - f_in) if f_out_ != f_in else 0.0
+        return u[i_in] + t * (u[i_out] - u[i_in])
+    left = cross(lo, lo - 1) if lo > 0 else u[lo]
+    right = cross(hi, hi + 1) if hi < fl.size - 1 else u[hi]
+    return float(right - left), depth
 
 
 def fig_energy_dependence(dth: float = 1.0) -> Tuple[plt.Figure, dict]:
@@ -652,13 +690,13 @@ def invariance_table(study: dict, lams=(0.8, 2.0)) -> str:
     rows = []
     short = {"smooth_pl": "PL", "confinement": "conf.", "beta_law": r"$\beta$"}
     def cells(key):
-        return " / ".join(fmt(study[m][key], 2) for m in K.WIND_MODEL_IDS)
+        return " / ".join(f"${fmt(study[m][key], 2)}$" for m in K.WIND_MODEL_IDS)
     rows.append([r"$q$: 0.20 $\to$ 0.95 at fixed $a$", " / ".join(short.values()), cells("q"), "0 (round-off)"])
     for lam in lams:
         rows.append([rf"$T_\lambda$, $\lambda={lam:g}$", " / ".join(short.values()), cells(f"T_{lam:g}"), "0 (round-off)"])
     for lam in lams:
         rows.append([rf"lengths $\times\lambda$, $f_{{\rm opa}}$ fixed (control), $\lambda={lam:g}$", "PL",
-                     fmt(study["smooth_pl"][f"control_{lam:g}"], 2), r"$\mathcal{O}(1-\lambda)$"])
+                     f"${fmt(study['smooth_pl'][f'control_{lam:g}'], 2)}$", r"$\mathcal{O}(1-\lambda)$"])
     return write_table("tab_invariance", rows, caption_note="Table: numerical verification of Propositions 1 and 2")
 
 
@@ -692,16 +730,31 @@ def fig_invariance(study: dict, model: str = "smooth_pl", lams=(0.8, 2.0)) -> pl
 FIT_NAMES = ("A_fiducial", "ridge_broad", "ridge_tightR", "ridge_fopa_frozen")
 
 
-def _inputs_digest(files: Sequence[str], settings: Sequence[str]) -> str:
-    """Short digest of the input files' contents and the fit settings (paths made relative)."""
+def _inputs_digest(files: Sequence[str], settings: Sequence[str], path_values: Sequence[str] = ()) -> str:
+    """Short digest of the input files' contents, the fit settings and the prior/simulator
+    registries. Only the tokens listed in *path_values* are treated as paths (made relative to the
+    repository); truth JSON files are hashed without their absolute-path entries."""
     h = hashlib.sha1()
     for path in files:
         h.update(os.path.basename(path).encode())
-        with open(path, "rb") as fh:
-            h.update(fh.read())
+        if path.endswith(".json"):
+            with open(path) as fh:
+                obj = json.load(fh)
+            for key in ("output", "flux_csv_path"):
+                obj.pop(key, None)
+                if isinstance(obj.get("simulation"), dict):
+                    obj["simulation"].pop(key, None)
+            h.update(json.dumps(obj, sort_keys=True).encode())
+        else:
+            with open(path, "rb") as fh:
+                h.update(fh.read())
     for item in settings:
-        h.update((os.path.relpath(item, ROOT) if os.path.exists(item) else item).encode())
+        h.update((os.path.relpath(item, ROOT) if item in path_values else item).encode())
         h.update(b"\0")
+    for name in PRIOR_REGISTRIES:
+        h.update(f"{name}={getattr(M, name)!r}".encode())
+    h.update(f"scale_priors={M.MODES['kepler_mtot']['scale_priors']!r}".encode())
+    h.update(f"SIM_DEFAULTS={sorted(K.SIM_DEFAULTS.items())!r}".encode())
     return h.hexdigest()[:10]
 
 
@@ -717,14 +770,15 @@ def fit_config(name: str) -> dict:
     dth = 2.0
     table = require_table(band)
     ddir = data_dir("A", band)
-    steps = ("32", "3000", "1000") if name.startswith("ridge") else ("32", "5000", "1000")
+    S = FIT_SETTINGS
+    n_steps = S["ridge_n_steps"] if name.startswith("ridge") else S["n_steps"]
     opts = ["--band", band, "--flux-csv", table, "--data-dir", ddir, "--obs-column", "flux_t",
             "--time-column", "t_raw", "--counts-per-bin", "100", "--keep-zero-flux", "--kepler-mtot",
-            "--orbital-period", f"{sysA['period_s']:g}", "--mdot", f"{sysA['mdot']:g}",
-            "--v-inf", f"{sysA['v_inf']:g}", "--mu-wind", f"{sysA['mu_wind']:g}",
+            "--orbital-period", f"{sysA['period_s']:g}", "--wind-model", sysA["wind_model"],
+            "--mdot", f"{sysA['mdot']:g}", "--v-inf", f"{sysA['v_inf']:g}", "--mu-wind", f"{sysA['mu_wind']:g}",
             "--fit-wind-shape", "--fit-scatter", "--likelihood", "jitter", "--dth", f"{dth:g}",
-            "--n-walkers", steps[0], "--n-steps", steps[1], "--n-burn", steps[2], "--seed", "1",
-            "--compute-bic", "--save-chi2", "--quiet", "--no-geometry-plots"]
+            "--n-walkers", str(S["n_walkers"]), "--n-steps", str(n_steps), "--n-burn", str(S["n_burn"]),
+            "--seed", "1", "--compute-bic", "--save-chi2", "--quiet", "--no-geometry-plots"] + list(S["extra_args"])
     truth_fopa = math.log10(sysA["f_opacity"])
     if name == "A_fiducial":
         opts += ["--fit-fopacity"]
@@ -735,7 +789,7 @@ def fit_config(name: str) -> dict:
     elif name == "ridge_fopa_frozen":
         opts += ["--prior-R", "2.5,2.0,1.0,8.0", "--freeze", f"log_fopa={truth_fopa:.6f}"]
     files = [table] + sorted(glob.glob(os.path.join(ddir, "*.txt"))) + sorted(glob.glob(os.path.join(ddir, "*.json")))
-    out_dir = os.path.join(CACHE, f"{name}_{_inputs_digest(files, opts)}")
+    out_dir = os.path.join(CACHE, f"{name}_{_inputs_digest(files, opts, path_values=(table, ddir))}")
     cmd = [PY, "-m", "cloak.mcmc_fit"] + opts + ["--output-dir", out_dir]
     return {"name": name, "cmd": cmd, "out_dir": out_dir, "band": band, "wind_model": sysA["wind_model"],
             "dth": dth, "sim_params": {"mdot": sysA["mdot"], "v_inf": sysA["v_inf"], "mu_wind": sysA["mu_wind"]},
@@ -782,10 +836,56 @@ def load_fit(cfg: dict) -> dict:
     data = M.FitData.build(binned["phase"].to_numpy(), binned["flux"].to_numpy(), err, fit_phase_shift=True,
                            n_model=int(round(360.0 / cfg["dth"])), is_binned=True,
                            phase_width=binned["width"].to_numpy())
+    if int(meta["n_obs"]) != data.flux.size:
+        raise RuntimeError(f"{cfg['chain']}: the chain was fitted to {int(meta['n_obs'])} bins but the data "
+                           f"now bin to {data.flux.size}; the cache is stale (regenerated data?).")
     i_map = int(np.argmax(lp))
+    diag = fit_diagnostics(cfg)
+    if diag.get("converged") is False:
+        print(f"WARNING: {cfg['name']}: the fitter judged this chain unconverged "
+              f"(max autocorrelation time {diag.get('tau_max', float('nan')):.0f} steps for {chain.shape[0]} "
+              f"post-burn steps); lengthen FIT_SETTINGS or broaden the priors before publishing.")
     return {"cfg": cfg, "names": names, "labels": spec.active_labels, "frozen": frozen, "chain": chain,
             "samples": samples, "log_prob": lp, "theta_map": samples[i_map], "spec": spec, "model": model,
-            "data": data, "binned": binned}
+            "data": data, "binned": binned, "diagnostics": diag}
+
+
+def fit_diagnostics(cfg: dict) -> dict:
+    """The fitter's convergence verdict for a cached fit (its ``*_diagnostics.json``; older caches
+    fall back to the summary text). Keys: converged (bool or None), tau_max (float or nan)."""
+    base = os.path.join(cfg["out_dir"], f"{cfg['band']}_{cfg['wind_model']}")
+    out = {"converged": None, "tau_max": float("nan")}
+    path = base + "_diagnostics.json"
+    if os.path.exists(path):
+        with open(path) as fh:
+            d = json.load(fh)
+        out["converged"] = d.get("converged")
+        taus = d.get("autocorr_time") or {}
+        if taus:
+            out["tau_max"] = float(max(taus.values()))
+        return out
+    summary = base + "_summary.txt"
+    if os.path.exists(summary):
+        text = open(summary).read()
+        m = re.search(r"converged:\s*(True|False)", text)
+        if m:
+            out["converged"] = m.group(1) == "True"
+        taus = [float(x) for x in re.findall(r":\s*([0-9.]+)\s+\([0-9.]+ tau in chain", text)]
+        if taus:
+            out["tau_max"] = max(taus)
+    return out
+
+
+def unconverged_note(fig: plt.Figure, *fits: Optional[dict]) -> None:
+    """One red line under a figure drawn from chains the fitter judged unconverged.
+
+    Drawn once per figure, below the panels (figure y < 0): the layout engine does not size the
+    panels around it (a per-panel note collapsed the narrow ridge panels) and it never sits on
+    data; ``bbox_inches="tight"`` still exports it."""
+    bad = [f["cfg"]["name"] for f in fits if f is not None and (f.get("diagnostics") or {}).get("converged") is False]
+    if bad:
+        fig.text(0.5, -0.01, f"unconverged chain{'s' if len(bad) > 1 else ''} (fitter verdict): {', '.join(bad)}; "
+                 "numbers are provisional", ha="center", va="top", fontsize=6, color="crimson")
 
 
 def predictive_curves(fit: dict, n_draws: int = 200, seed: int = 0, band: Optional[str] = None,
@@ -800,9 +900,10 @@ def predictive_curves(fit: dict, n_draws: int = 200, seed: int = 0, band: Option
     model = fit["model"] if not cross else M.DirectLightCurveModel(
         band=band, flux_csv_path=table or require_table(band), wind_model=fit["cfg"]["wind_model"],
         dth=fit["cfg"]["dth"], sim_params=fit["cfg"]["sim_params"])
-    _, shift_map = M.aligned_model_flux(fit["theta_map"], spec, fit["model"], data)
 
     def curve_for(theta):
+        """(phase, flux, shift): the draw's own profiled shift, as the likelihood used it."""
+        _, shift = M.aligned_model_flux(theta, spec, fit["model"], data)
         c = M.model_curve(theta, spec, model)
         if c is None:
             return None
@@ -815,7 +916,7 @@ def predictive_curves(fit: dict, n_draws: int = 200, seed: int = 0, band: Option
             fit_out, band_out = float(np.max(c_fit[1])) - f_sc, float(np.max(flux)) - f_sc
             ratio = band_out / fit_out if fit_out > 0 else 1.0
             flux = flux - f_sc + f_sc * ratio
-        return phase, flux
+        return phase, flux, shift
     grid = np.linspace(0.0, 1.0, 721)
     rng = np.random.default_rng(seed)
     idx = rng.choice(fit["samples"].shape[0], size=min(n_draws, fit["samples"].shape[0]), replace=False)
@@ -823,27 +924,47 @@ def predictive_curves(fit: dict, n_draws: int = 200, seed: int = 0, band: Option
     for i in idx:
         c = curve_for(fit["samples"][i])
         if c is not None:
-            curves.append(U.eval_periodic(*U.periodic_model(*c), grid, shift=shift_map))
+            curves.append(U.eval_periodic(*U.periodic_model(c[0], c[1]), grid, shift=c[2]))
     curves = np.array(curves)
-    c_map = curve_for(fit["theta_map"])
-    map_curve = U.eval_periodic(*U.periodic_model(*c_map), grid, shift=shift_map)
-    map_at_obs = U.eval_periodic(*U.periodic_model(*c_map), data.phase, shift=shift_map)
+    ph_m, fl_m, shift_map = curve_for(fit["theta_map"])
+    map_curve = U.eval_periodic(*U.periodic_model(ph_m, fl_m), grid, shift=shift_map)
+    map_at_obs = U.eval_periodic(*U.periodic_model(ph_m, fl_m), data.phase, shift=shift_map)
     return {"grid": grid, "map": map_curve, "map_at_obs": map_at_obs, "lo": np.percentile(curves, 16, axis=0),
             "hi": np.percentile(curves, 84, axis=0), "shift": shift_map, "n_draws": int(curves.shape[0])}
 
 
-def truth_for_names(names: Sequence[str], system: str = "A", band: str = "broad") -> Dict[str, Optional[float]]:
-    """Injected value of every sampled parameter (None where the truth is not defined)."""
+def truth_for_names(names: Sequence[str], system: str = "A", band: str = "broad",
+                    rows_per_bin: Optional[float] = None) -> Dict[str, Optional[float]]:
+    """Injected value of every sampled parameter (None where the truth is not defined).
+
+    Values come from the light curve's own truth file, checked against ``fiducial.SYSTEMS`` so an
+    edit to the systems cannot silently desynchronise them from the data on disk. The reference for
+    the jitter parameter is ``ln(eps / sqrt(rows_per_bin))``: the variability is injected per time
+    row while the fitter's ``f`` acts on bins of several rows, so it is diluted by the square root of
+    the rows per bin (an approximate correspondence, reported as such)."""
     s = F.SYSTEMS[system]
-    g = F.geometry(s)
-    truth_json = load_truth(system, band) or {}
-    obs = s["observation"]
-    a = g["d1"] + g["d2"]
-    values = {"M_tot": F.total_mass(a, s["period_s"]), "q_m": s["q_m"], "R": g["R"], "r": g["r"], "i0": g["i0"],
-              "a": a, "d1": g["d1"], "d2": g["d2"], "log_fopa": math.log10(s["f_opacity"]),
-              "f_scatter": truth_json.get("scatter"),
-              "log_f": math.log(obs["intrinsic_scatter"]) if obs.get("intrinsic_scatter", 0) > 0 else None}
-    values.update({k: float(v) for k, v in s["wind_params"].items()})
+    truth_json = load_truth(system, band)
+    if truth_json is None:
+        raise FileNotFoundError(f"no truth file for system {system}, band {band}: run the data notebook")
+    sim = truth_json["simulation"]
+    expected = F.simulation_kwargs(s)
+    for key in ("d1", "d2", "r", "R", "i0", "f_opacity", "mdot", "v_inf"):
+        if not math.isclose(float(sim[key]), float(expected[key]), rel_tol=1e-9, abs_tol=0.0):
+            raise RuntimeError(f"synthetic data on disk were generated with {key}={sim[key]} but "
+                               f"fiducial.SYSTEMS[{system!r}] says {expected[key]}; regenerate the data "
+                               f"(data notebook, FORCE=True) or restore the system definition.")
+    for key, val in expected["wind_params"].items():
+        if not math.isclose(float(sim["wind_params"][key]), float(val), rel_tol=1e-9, abs_tol=0.0):
+            raise RuntimeError(f"synthetic data on disk use {key}={sim['wind_params'][key]}, fiducial says {val}")
+    a = float(sim["d1"]) + float(sim["d2"])
+    period = float(truth_json["ephemeris"]["ORBITAL_PERIOD"])
+    eps = float(truth_json.get("intrinsic_scatter", 0.0))
+    dilution = math.sqrt(rows_per_bin) if rows_per_bin else 1.0
+    values = {"M_tot": F.total_mass(a, period), "q_m": s["q_m"], "R": float(sim["R"]), "r": float(sim["r"]),
+              "i0": float(sim["i0"]), "a": a, "d1": float(sim["d1"]), "d2": float(sim["d2"]),
+              "log_fopa": math.log10(float(sim["f_opacity"])), "f_scatter": float(truth_json["scatter"]),
+              "log_f": math.log(eps / dilution) if eps > 0 else None}
+    values.update({k: float(v) for k, v in sim["wind_params"].items()})
     return {n: values.get(n) for n in names}
 
 
@@ -873,8 +994,9 @@ def fig_injection(fit: dict, pred: dict) -> Tuple[plt.Figure, dict]:
     if ax.get_legend() is not None:
         ax.get_legend().remove()
     put_legend(lax, ax, ncol=3, fontsize=6.5)
+    unconverged_note(fig, fit)
     summary = {"chi2_measurement_errors": chi2, "chi2_effective": chi2_used, "dof": int(dof), "f_map": f_map,
-               "shift_map": pred["shift"], "n_bins": int(data.flux.size)}
+               "shift_map": pred["shift"], "n_bins": int(data.flux.size), "converged": fit.get("diagnostics", {}).get("converged")}
     return fig, summary
 
 
@@ -888,9 +1010,13 @@ def fig_corner(fit: dict, truths: Dict[str, Optional[float]]) -> plt.Figure:
     fig.set_size_inches(WIDTH * 1.2, WIDTH * 1.2)
     for ax in fig.axes:
         ax.tick_params(labelsize=5.5)
+    note = "red lines: injected values"
     if "log_f" in fit["names"] and truths.get("log_f") is not None:
-        fig.text(0.62, 0.97, r"red lines: injected values; for $\ln f$ the reference is $\ln\epsilon$ of the"
-                 "\ninjected variability, an approximate correspondence", fontsize=7, ha="left", va="top")
+        note += (r"; for $\ln f$ the reference is $\ln(\epsilon/\sqrt{\bar n})$, the injected per-row" + "\n"
+                 + r"variability diluted over the $\bar n$ rows of a bin (an approximate correspondence)")
+    if (fit.get("diagnostics") or {}).get("converged") is False:
+        note += "\nunconverged chain (fitter verdict); numbers are provisional"
+    fig.text(0.55, 0.985, note, fontsize=7, ha="left", va="top", color="0.2")
     return fig
 
 
@@ -906,7 +1032,9 @@ def recovery_table(fit: dict, truths: Dict[str, Optional[float]]) -> Tuple[str, 
             note = r"posterior $\equiv$ prior"
         if name == "M_tot":
             note = "prior-anchored via $R$"
-        rows.append([label, "--" if tv is None else fmt(tv), f"{fmt(med)}$^{{+{fmt(hi - med, 2)}}}_{{-{fmt(med - lo, 2)}}}$",
+        if name == "log_f":
+            note = r"reference $\ln(\epsilon/\sqrt{\bar n})$, approximate"
+        rows.append([label, "--" if tv is None else f"${fmt(tv)}$", f"${fmt_pm(med, hi - med, med - lo)}$",
                      ("yes" if inside else "no") if inside is not None else "--", note])
         records.append({"param": name, "truth": tv, "median": float(med), "p16": float(lo), "p84": float(hi), "inside68": inside})
     path = write_table("tab_recovery", rows, header=["Parameter", "Injected", "Median (68\\%)", "Truth in 68\\%?", "Note"],
@@ -919,23 +1047,34 @@ def recovery_table(fit: dict, truths: Dict[str, Optional[float]]) -> Tuple[str, 
 # Figure 10: simulation-based calibration
 # ----------------------------------------------------------------------------
 
-def fig_sbc(alpha: float = 0.05) -> Tuple[plt.Figure, dict]:
+def fig_sbc(alpha: float = 0.05) -> Tuple[Optional[plt.Figure], dict]:
+    """Rank-ECDF panels from ``figures/results/sbc_ranks.csv``; ``(None, summary)`` when there is nothing to draw."""
     path = os.path.join(RESULTS, "sbc_ranks.csv")
     labels = {"M_tot": r"$M_{\rm tot}$", "R": "$R$", "r": "$r$", "i0": "$i$", "Rb": r"$R_{\rm b}$", "p": "$p$",
               "log_fopa": r"$\log_{10} f_{\rm opa}$"}
     if not os.path.exists(path):
-        fig, ax = plt.subplots(figsize=(WIDTH, WIDTH * 0.3)); ax.axis("off")
-        ax.text(0.5, 0.5, "no SBC ranks yet: run  python figures/run_sbc.py --n-draws 100", ha="center", va="center")
-        return fig, {"n_draws": 0}
+        print(f"fig10 skipped: no SBC ranks yet. Run  python figures/run_sbc.py  (50 draws by default, about half an "
+              f"hour each); it writes {os.path.relpath(path, ROOT)}.")
+        return None, {"n_draws": 0}
     ranks = pd.read_csv(path)
+    if len(set(ranks["config"])) > 1:
+        raise RuntimeError(f"{path} mixes runs with different configurations; keep one per file")
+    n_total = ranks["draw"].nunique()
+    if "converged" in ranks.columns:
+        conv = ranks["converged"].astype(str).str.lower().isin(["true", "1"])
+        ranks = ranks[conv]
+    n_draws = ranks["draw"].nunique()
+    labels["log_f"] = r"$\ln f$ (diagnostic)"
     params = [p for p in labels if p in set(ranks["param"])]
-    n_draws = ranks.groupby("param")["draw"].nunique().min()
+    if n_draws == 0:
+        print(f"fig10 skipped: {n_total} SBC draws recorded in {os.path.relpath(path, ROOT)}, none judged converged.")
+        return None, {"n_draws": 0, "n_total": int(n_total)}
     eps = math.sqrt(math.log(2.0 / alpha) / (2.0 * n_draws))            # DKW band
     ncol = 4
     nrow = int(math.ceil(len(params) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(WIDTH, WIDTH * 0.3 * nrow), sharex=True, sharey=True)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(WIDTH, WIDTH * 0.3 * nrow), sharex=True, sharey=True, squeeze=False)
     axes = np.ravel(axes)
-    summary = {"n_draws": int(n_draws), "dkw_eps": eps}
+    summary = {"n_draws": int(n_draws), "n_total": int(n_total), "dkw_eps": eps}
     for ax, p in zip(axes, params):
         sub = ranks[ranks["param"] == p]
         u = np.sort((sub["rank"].to_numpy() + 0.5) / (sub["n_post"].to_numpy() + 1.0))
@@ -943,16 +1082,21 @@ def fig_sbc(alpha: float = 0.05) -> Tuple[plt.Figure, dict]:
         grid = np.linspace(0, 1, 201)
         diff = np.interp(grid, u, ecdf, left=0.0, right=1.0) - grid
         ax.fill_between(grid, -eps, eps, color="0.85", lw=0)
-        ax.plot(grid, diff, color="C0")
+        ax.plot(grid, diff, color="0.5" if p == "log_f" else "C0", ls="--" if p == "log_f" else "-")
         ax.axhline(0, color="k", lw=0.6)
-        ax.set_title(labels[p], fontsize=8)
-        summary[p] = {"max_abs_ecdf_diff": float(np.max(np.abs(diff))), "outside_band": bool(np.max(np.abs(diff)) > eps)}
+        ax.set_title(labels[p], fontsize=8, color="0.4" if p == "log_f" else "k")
+        summary[p] = {"max_abs_ecdf_diff": float(np.max(np.abs(diff))), "outside_band": bool(np.max(np.abs(diff)) > eps),
+                      "diagnostic_only": p == "log_f"}
     for ax in axes[len(params):]:
         ax.axis("off")
-    for ax in axes[-ncol:]:
-        ax.set_xlabel("rank / $L$")
-    axes[0].set_ylabel("ECDF $-$ uniform")
-    fig.suptitle(f"SBC, {n_draws} prior draws; grey: {100 * (1 - alpha):.0f}% DKW band", fontsize=8)
+    n_used = len(params)
+    for i, ax in enumerate(axes[:n_used]):
+        if i + ncol >= n_used:                       # last visible axis of each column
+            ax.set_xlabel("rank / $L$")
+    for i in range(0, n_used, ncol):
+        axes[i].set_ylabel("ECDF $-$ uniform")
+    fig.suptitle(f"SBC on the paper's fit (jitter likelihood, floor free with a fixed prior, $q_m$ frozen): "
+                 f"{n_draws} converged of {n_total} prior draws; grey: {100 * (1 - alpha):.0f}% DKW band", fontsize=7.5)
     fig.tight_layout()
     save_json("sbc_summary", summary)
     return fig, summary
@@ -967,9 +1111,15 @@ def fig_ridge(fits: Dict[str, dict], truths: Dict[str, float]) -> plt.Figure:
     titles = {"ridge_broad": r"(a) broad priors on $R$ and $f_{\rm opa}$", "ridge_tightR": r"(b) tight prior on $R$",
               "ridge_fopa_frozen": r"(c) $f_{\rm opa}$ frozen"}
     fig, axes, (lax,) = panels(3, WIDTH * 0.34, legend_rows=1, span_legend=True)
-    for ax in axes[1:]:
-        ax.sharey(axes[0]); plt.setp(ax.get_yticklabels(), visible=False)
     m_true, f_true = truths["M_tot"], truths["log_fopa"]
+    # Common ranges from the 0.5-99.5 % spans of every fit, so the panels are comparable and
+    # nothing is clipped (corner.hist2d would otherwise impose the last panel's [min, max]).
+    ms = [f["samples"][:, f["names"].index("M_tot")] for f in fits.values() if f is not None]
+    fs = [f["samples"][:, f["names"].index("log_fopa")] for f in fits.values() if f is not None and "log_fopa" in f["names"]]
+    fs += [np.array([f["frozen"]["log_fopa"]]) for f in fits.values() if f is not None and "log_fopa" in f["frozen"]]
+    xr = (min(np.percentile(m, 0.5) for m in ms), max(np.percentile(m, 99.5) for m in ms))
+    yr = (min(np.percentile(f, 0.5) for f in fs) - 0.2, max(np.percentile(f, 99.5) for f in fs) + 0.2)
+    xr = (min(xr[0], 0.8 * m_true), max(xr[1], 1.2 * m_true)); yr = (min(yr[0], f_true - 0.3), max(yr[1], f_true + 0.3))
     for ax, name in zip(axes, ("ridge_broad", "ridge_tightR", "ridge_fopa_frozen")):
         fit = fits.get(name)
         ax.set_title(titles[name], fontsize=8)
@@ -980,8 +1130,8 @@ def fig_ridge(fits: Dict[str, dict], truths: Dict[str, float]) -> plt.Figure:
         m = fit["samples"][:, jm]
         if "log_fopa" in fit["names"]:
             f = fit["samples"][:, fit["names"].index("log_fopa")]
-            corner.hist2d(m, f, ax=ax, bins=40, levels=(0.393, 0.865), plot_datapoints=False, smooth=1.0,
-                          color="C0", fill_contours=True)
+            corner.hist2d(m, f, ax=ax, bins=40, range=[xr, yr], levels=(0.393, 0.865), plot_datapoints=False,
+                          smooth=1.0, color="C0", fill_contours=True, new_fig=False)
         else:
             f0 = fit["frozen"]["log_fopa"]
             lo68, hi68 = np.percentile(m, [16, 84]); lo95, hi95 = np.percentile(m, [2.5, 97.5])
@@ -991,9 +1141,13 @@ def fig_ridge(fits: Dict[str, dict], truths: Dict[str, float]) -> plt.Figure:
         ax.plot(mm, f_true + (1.0 / 3.0) * np.log10(mm / m_true), "k--", lw=1.0, label=r"flat direction $f_{\rm opa}\propto M_{\rm tot}^{1/3}$")
         ax.plot([m_true], [f_true], marker="*", ms=10, color="crimson", ls="none", label="injected")
         ax.set_xlabel(r"$M_{\rm tot}$ ($M_\odot$)")
+        ax.set_xlim(*xr); ax.set_ylim(*yr)
+    for ax in axes[1:]:
+        plt.setp(ax.get_yticklabels(), visible=False)
     axes[0].set_ylabel(r"$\log_{10} f_{\rm opa}$")
     handles, labels = merged_handles(axes)
     put_legend(lax, handles=handles, labels=labels, ncol=3, fontsize=6.5)
+    unconverged_note(fig, *fits.values())
     return fig
 
 
@@ -1021,30 +1175,57 @@ def fig_shift_profile(fit: Optional[dict] = None, seed: int = 3) -> Tuple[plt.Fi
         obs_flux = U.eval_periodic(pe, fe, obs_phase, shift=true_shift) + rng.normal(0, sig, obs_phase.size)
         err2 = np.full(obs_phase.size, sig ** 2)
         n_model = 180
+    # The objective the fit actually profiled: chi2, or the jitter -2 ln L (up to a constant)
+    # when the fit carried a jitter parameter (evaluated at the MAP's f).
+    jitter = None
+    if fit is not None and fit["spec"].index("log_f") is not None:
+        jitter = float(np.exp(fit["theta_map"][fit["spec"].index("log_f")]))
+
+    def objective(s):
+        m = U.eval_periodic(pe, fe, obs_phase, shift=s)
+        if jitter is None:
+            return float(np.sum((obs_flux - m) ** 2 / err2))
+        s2 = err2 + (jitter * m) ** 2
+        return float(np.sum((obs_flux - m) ** 2 / s2 + np.log(s2)))
     search = U.build_phase_shift_search(obs_phase, n_model=n_model)
-    _, best_shift, best_chi2 = U.best_phase_shift(pe, fe, obs_flux, err2, search)
+    _, best_shift, best_obj = U.best_phase_shift(pe, fe, obs_flux, err2, search, jitter_frac=jitter)
     grid = np.linspace(0, 1, 20001)[:-1]
-    chi2 = np.array([np.sum((obs_flux - U.eval_periodic(pe, fe, obs_phase, shift=s)) ** 2 / err2) for s in grid])
-    coarse = np.array([np.sum((obs_flux - U.eval_periodic(pe, fe, obs_phase, shift=s)) ** 2 / err2) for s in search.shift_grid])
-    fig, (ax, bx), (la, lb) = panels(2, WIDTH * 0.38, legend_rows=2)
+    chi2 = np.array([objective(s) for s in grid])
+    coarse = np.array([objective(s) for s in search.shift_grid])
+    # The two dense passes, reproduced from the search's definition (+-1 previous step, 33 points).
+    passes = []
+    centre, step = float(search.shift_grid[int(np.argmin(coarse))]), 1.0 / search.shift_grid.size
+    for _ in range(search.n_levels):
+        cand = centre + np.linspace(-step, step, search.n_fine)
+        vals = np.array([objective(c % 1.0) for c in cand])
+        passes.append((cand % 1.0, vals))
+        centre = float(cand[int(np.argmin(vals))]); step = 2.0 * step / (search.n_fine - 1)
+    ylabel = r"$-2\ln L$ (jitter)" if jitter is not None else r"$\chi^2$"
+    fig, (ax, bx), (la, lb) = panels(2, WIDTH * 0.38, legend_rows=3)
     ax.plot(grid, chi2, color="0.3", lw=0.8, label="brute force (20 000 shifts)")
     ax.plot(search.shift_grid, coarse, "o", ms=2.5, color="C0", label=f"coarse grid ({search.shift_grid.size})")
-    ax.plot([best_shift], [best_chi2], "*", ms=10, color="crimson", label="search result")
-    ax.set(xlabel="trial phase shift", ylabel=r"$\chi^2$", yscale="log")
+    ax.plot([best_shift], [best_obj], "*", ms=10, color="crimson", label="search result")
+    ax.set(xlabel="trial phase shift", ylabel=ylabel)
+    if jitter is None:
+        ax.set_yscale("log")
     j = int(np.argmin(chi2)); half = 1.0 / search.shift_grid.size
     sel = np.abs(((grid - grid[j] + 0.5) % 1.0) - 0.5) < 1.5 * half
     bx.plot(grid[sel], chi2[sel], color="0.3", lw=0.8)
     near = np.abs(((search.shift_grid - grid[j] + 0.5) % 1.0) - 0.5) < 1.5 * half
     bx.plot(search.shift_grid[near], coarse[near], "o", ms=3, color="C0")
-    bx.plot([best_shift], [best_chi2], "*", ms=10, color="crimson")
+    for k, (cand, vals) in enumerate(passes):
+        bx.plot(cand, vals, "s" if k == 0 else "^", ms=2.5 if k == 0 else 2.0, color=f"C{k + 2}", ls="none",
+                label=f"dense pass {k + 1} ({search.n_fine} points)")
+    bx.plot([best_shift], [best_obj], "*", ms=10, color="crimson")
     bx.axvline(grid[j], color="0.6", lw=0.7)
-    bx.set(xlabel="trial phase shift (zoom)", ylabel=r"$\chi^2$")
+    bx.set(xlabel="trial phase shift (zoom)", ylabel=ylabel)
     label_panels([ax, bx])
-    put_legend(la, ax, ncol=2, fontsize=6.5)
-    summary = {"search_shift": best_shift, "search_chi2": best_chi2, "brute_shift": float(grid[j]),
-               "brute_chi2": float(chi2[j]), "search_minus_brute_chi2": float(best_chi2 - chi2[j]),
+    put_legend(la, ax, ncol=1, fontsize=6.5); put_legend(lb, bx, ncol=1, fontsize=6.5)
+    summary = {"objective": "jitter -2lnL" if jitter is not None else "chi2", "jitter_f": jitter,
+               "search_shift": best_shift, "search_value": best_obj, "brute_shift": float(grid[j]),
+               "brute_value": float(chi2[j]), "search_minus_brute": float(best_obj - chi2[j]),
                "brute_grid_step": float(grid[1] - grid[0]), "search_resolution": search.resolution,
-               "note": "a negative difference means the search's finer final step found a lower chi2 than the brute-force grid"}
+               "note": "a negative difference means the search's finer final step found a lower value than the brute-force grid"}
     save_json("shift_profile", summary)
     return fig, summary
 
@@ -1104,17 +1285,20 @@ def fig_binning_bias(study: dict) -> plt.Figure:
 # Figure 14: cross-band prediction
 # ----------------------------------------------------------------------------
 
-def fig_crossband(fit: dict, bands: Sequence[str] = ("soft", "medium", "hard"), n_draws: int = 100) -> Tuple[plt.Figure, dict]:
-    """Predict the other bands' light curves from the broad-band posterior; overlay their synthetic bins."""
+def fig_crossband(fit: dict, bands: Sequence[str] = ("soft", "medium", "hard"),
+                  n_draws: int = 100) -> Tuple[Optional[plt.Figure], dict]:
+    """Predict the other bands' light curves from the broad-band posterior; overlay their synthetic bins.
+
+    Returns ``(None, {})`` when no other band has both a flux table and synthetic light curves."""
     tables = available_tables()
     bands = [b for b in bands if b in tables and os.path.isdir(data_dir("A", b))]
-    fig, axes_list, laxes = panels(max(1, len(bands)), WIDTH * 0.4, legend_rows=2)
-    axes = np.array([axes_list])
     summary = {}
     if not bands:
-        axes[0, 0].text(0.5, 0.5, "no other-band tables / synthetic data available", ha="center", va="center")
-        axes[0, 0].axis("off")
-        return fig, summary
+        print("fig14 skipped: no other-band flux tables / synthetic light curves; run the data notebook under HEASoft "
+              "(synthetic_data/generate_synthetic_data.ipynb) to make synthetic_data/tables/ and the band directories.")
+        return None, summary
+    fig, axes_list, laxes = panels(len(bands), WIDTH * 0.4, legend_rows=2)
+    axes = np.array([axes_list])
     for ax, lax, band in zip(axes[0], laxes, bands):
         pred = predictive_curves(fit, n_draws=n_draws, band=band)
         obs = U.load_observed_lightcurves(band, data_dir("A", band), flux_column="flux_t", time_column="t_raw",
@@ -1126,10 +1310,12 @@ def fig_crossband(fit: dict, bands: Sequence[str] = ("soft", "medium", "hard"), 
         ax.fill_between(pred["grid"], pred["lo"], pred["hi"], color="C1", alpha=0.3, lw=0, label="68% predicted from broad fit")
         ax.plot(pred["grid"], pred["map"], color="C1", lw=1.0)
         model_at = U.eval_periodic(pred["grid"], pred["map"], binned["phase"].to_numpy())
-        chi2 = float(np.sum((binned["flux"].to_numpy() - model_at) ** 2 / err ** 2))
-        summary[band] = {"chi2": chi2, "n_bins": int(binned.shape[0])}
+        j_f = fit["spec"].index("log_f")
+        var = err ** 2 + ((np.exp(fit["theta_map"][j_f]) * model_at) ** 2 if j_f is not None else 0.0)
+        chi2 = float(np.sum((binned["flux"].to_numpy() - model_at) ** 2 / var))
+        summary[band] = {"chi2_effective": chi2, "n_bins": int(binned.shape[0])}
         ax.set(xlabel="orbital phase", ylabel=r"$F_b$ (erg cm$^{-2}$ s$^{-1}$)")
-        ax.set_title(f"{band} band, $\\chi^2/n = {chi2 / binned.shape[0]:.2f}$", loc="right", fontsize=7, color="0.35")
+        ax.set_title(f"{band} band, $\\chi^2_{{\\rm eff}}/n = {chi2 / binned.shape[0]:.2f}$", loc="right", fontsize=7, color="0.35")
         put_legend(lax, ax, ncol=1, fontsize=6.5)
     label_panels(axes[0])
     save_json("crossband", summary)
@@ -1155,14 +1341,18 @@ def performance_table(fit: Optional[dict] = None, repeat: int = 20) -> Tuple[str
            "numba": numba.__version__, "numpy": np.__version__, "machine": platform.platform()}
     res["forward_dth1_threads"] = bench(lambda: K.simulate_band_flux(**kw1))
     res["forward_dth2_threads"] = bench(lambda: K.simulate_band_flux(**kw2))
-    numba.set_num_threads(1)
-    res["forward_dth1_single"] = bench(lambda: K.simulate_band_flux(**kw1))
-    numba.set_num_threads(n_threads)
+    try:
+        numba.set_num_threads(1)
+        res["forward_dth1_single"] = bench(lambda: K.simulate_band_flux(**kw1))
+    finally:
+        numba.set_num_threads(n_threads)
     ph, fl = K.simulate_band_flux(**kw2)
     pe, fe = U.periodic_model(ph, fl)
     if fit is not None:
         data = fit["data"]
-        res["shift_search"] = bench(lambda: U.best_phase_shift(pe, fe, data.flux, data.err2, data.shift_search))
+        j_f = fit["spec"].index("log_f")
+        jit = float(np.exp(fit["theta_map"][j_f])) if j_f is not None else None
+        res["shift_search"] = bench(lambda: U.best_phase_shift(pe, fe, data.flux, data.err2, data.shift_search, jitter_frac=jit))
         theta = fit["theta_map"]
         priors = M.get_active_priors(fit["spec"], M.default_geometry_priors(fit["spec"].mode), {}, None)
         res["log_posterior_dth2"] = bench(lambda: M.log_probability(theta, fit["spec"], priors, fit["model"], data), n=10)
@@ -1171,7 +1361,7 @@ def performance_table(fit: Optional[dict] = None, repeat: int = 20) -> Tuple[str
             [f"forward model, {n_threads} threads", f"{res['forward_dth1_threads']:.1f} ms / {res['forward_dth2_threads']:.1f} ms",
              r"$\Delta\gamma=1^\circ$ / $2^\circ$"]]
     if fit is not None:
-        rows.append(["phase-offset search alone", f"{res['shift_search']:.2f} ms", f"{res['n_bins']} bins, automatic $n_c$, two 33-point refinements"])
+        rows.append(["phase-offset search alone (the fit's objective)", f"{res['shift_search']:.2f} ms", f"{res['n_bins']} bins, automatic $n_c$, two 33-point refinements"])
         rows.append(["log-posterior evaluation (incl.\\ phase profiling)", f"{res['log_posterior_dth2']:.1f} ms", r"$\Delta\gamma=2^\circ$"])
     path = write_table("tab_performance", rows, caption_note=f"Table: wall-clock performance on {res['machine']}, Python {res['python']}, numba {res['numba']}")
     save_json("performance", res)

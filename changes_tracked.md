@@ -890,6 +890,70 @@ from a prior that puts half the initial ball at `-inf`; a wrapping window with
 runs against the PyXspec stand-in (response, background, `calcFlux` and
 `fakeit` semantics mirrored from the live audit); pyflakes clean.
 
+### Commit 14 — Second figure-pipeline review: extended-emitter flux, calibration of the paper's fit
+
+Model:
+- **Flux of a partially occulted emitter** is the per-cell attenuated flux
+  summed over the visible cells and divided by the *total* disk area (hidden
+  cells emit nothing). The kernel returned the visible-area mean, so a
+  resolved disk 98 % behind the companion kept its full flux (factor 6 at a
+  17 %-visible phase of the Figure 5 disk; no dip at all without absorption).
+  Fully visible phases keep their value exactly; point-like emitters are
+  unaffected; `flx`/`fl` stay visible-area means. Paper Eq. (flux) and the
+  algorithm listing updated; test added.
+- The `beta_law` limb split is gated on the relative distance to the
+  photosphere (`(b − R⋆)/R⋆ < 0.4`), so the quadrature is scale-covariant
+  (the invariance table showed 5.8e-4 for λ = 2 next to "0 (round-off)");
+  every ray stays within 1.1e-7 of adaptive quadrature for any stellar radius.
+Fitter:
+- `--prior-fscatter MEAN,STD,MIN,MAX`: a fixed prior for the floor (the
+  default stays data-driven); `*_diagnostics.json` next to the chain records
+  the convergence verdict and autocorrelation times.
+Calibration batch (`figures/run_sbc.py`), now on the paper's fit:
+- jitter likelihood, wind shape, opacity and floor free, `--kepler-mtot`, the
+  same sampling settings as the paper fits (`figlib.FIT_SETTINGS`), data at
+  1°, fit at 2°; the floor drawn from and fitted with `figlib.FLOOR_PRIOR`;
+  10 % intrinsic variability injected; `q_m` frozen (its posterior equals its
+  prior); the jitter parameter ranked as a diagnostic only (its reference is
+  the injected amplitude diluted by √(rows per bin)); the fitter's convergence
+  verdict recorded per draw and unconverged draws excluded by the figure; the
+  ranks file carries a configuration digest and refuses other settings; the
+  wind normalisation is passed to the fit (it used the simulator default,
+  which would have shifted every `log f_opa` rank by 0.4 dex).
+Figure code (`figures/figlib.py`):
+- `FIT_SETTINGS` (walkers, steps, burn-in, prior overrides) in one place and
+  part of the cache digest; the digest treats only real path options as
+  paths, hashes truth files without absolute paths and includes the prior
+  registries and simulator defaults; `load_fit` refuses a chain whose `n_obs`
+  differs from the rebinned data and reads the convergence verdict, which the
+  figures annotate when negative.
+- Posterior bands use each draw's own profiled phase shift; injected values
+  come from the light curve's truth file and are checked against the fiducial
+  definitions; the jitter reference is `ln(ε/√n̄)`; the ridge panels share
+  explicit ranges; the shift-profile figure uses the fit's own objective and
+  marks both dense passes; half-depth widths interpolate the crossings; the
+  mean-column flux extrapolates like the kernel; the cross-band chi-square
+  uses the effective variance; LaTeX tables use parameter symbols and
+  `a × 10^b`; the SBC figure labels the diagnostic panel and puts axis labels
+  on visible axes; numba's thread count is restored in a `finally`.
+- `fiducial.visits()` gives exact visit starts (the old `:g` formatting had
+  rounded them), so the synthetic light curves were regenerated; the table
+  policy is shared with the data notebook (`fiducial.available_tables`); the
+  data notebook surfaces the generator's output on failure.
+- Found when the notebook was re-executed on the new fits: a non-raw `"\bar n"`
+  in the corner-plot note (Python read `\b` as a backspace) aborted the run
+  with a mathtext error; the unconverged-chain note is now one line under the
+  figure (`unconverged_note(fig, *fits)`; the per-panel version collapsed the
+  three ridge panels to slivers and sat on the eclipse minimum in fig08);
+  `fig_sbc`/`fig_crossband` return no figure when their inputs are missing
+  and `save_fig(None, name)` removes a stale PDF instead of writing a
+  placeholder (fig10 and fig14 are therefore absent until the calibration
+  batch and the other-band tables exist); the recovery and invariance tables
+  wrap every number in math mode (`\times` had been emitted in text mode).
+- Verified: tests 14/14; both notebooks execute at full size on the four
+  cached fits (regenerated data); pyflakes clean; every `$...$` literal in
+  the figure code parses with matplotlib's mathtext parser.
+
 ### Commit 13 — Figure pipeline review: no reduced mode, input-keyed fit caches, cross-band floor
 
 - The quick/smoke mode is gone (`CLOAK_QUICK`, `--quick`): the notebook and

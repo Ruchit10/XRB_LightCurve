@@ -49,6 +49,7 @@ Usage:
 
 import argparse
 import copy
+import json
 import multiprocessing as mp
 import os
 import random
@@ -101,6 +102,7 @@ from cloak.kernel import (
     flux_table_bands,
 )
 from cloak.utils import (
+    _jsonable,
     ORBITAL_PERIOD,
     RUN_CONFIG_SUFFIX,
     WIND_NORMALIZATION,
@@ -1536,6 +1538,9 @@ def run_single_fit(band: str, args, spec: ParamSpec, priors: Dict, model,
     stats = compute_statistics(samples, spec, log_prob=log_prob_flat)
     print_results(stats, spec, band)
     stats['_diagnostics'] = print_diagnostics(sampler, args.sampler, spec.active_names, n_burn=args.n_burn)
+    # Machine-readable copy of the convergence verdict, next to the chain, for downstream code.
+    with open(os.path.join(args.output_dir, f"{suffix}_diagnostics.json"), 'w') as fh:
+        json.dump(_jsonable(stats['_diagnostics']), fh, indent=2)
     stats['_run_meta'] = {
         'sampler': args.sampler, 'likelihood': spec.likelihood,
         'n_walkers': int(args.n_walkers), 'n_steps': int(args.n_steps),
@@ -1924,6 +1929,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--prior-fopa", type=str, default=None, metavar="MEAN,STD,MIN,MAX", dest="prior_log_fopa",
         help=f"Prior for log10 f_opacity (--fit-fopacity). Default: {FOPACITY_PRIOR['mean']},"
              f"{FOPACITY_PRIOR['std']},{FOPACITY_PRIOR['min']},{FOPACITY_PRIOR['max']}")
+    prior_group.add_argument(
+        "--prior-fscatter", type=str, default=None, metavar="MEAN,STD,MIN,MAX", dest="prior_f_scatter",
+        help="Fixed prior for the scattered-flux floor f_scatter (--fit-scatter), in flux units. Default: "
+             "a data-driven prior centred on the mean flux in --scatter-eclipse-phase with that value as "
+             "its width, on [0, brightest bin]. A fixed prior is what simulation-based calibration needs.")
 
     shape_group = parser.add_argument_group(
         'Wind-Shape Prior Customization', 'Only active with --fit-wind-shape (format: mean,std,min,max).')
@@ -1987,14 +1997,18 @@ def load_fit_data(args, band: str) -> Tuple[FitData, Optional[pd.DataFrame], Opt
 
     scatter_prior = None
     if args.fit_scatter:
-        centre = estimate_scattered_flux(phase, flux, window=tuple(map(float, args.scatter_eclipse_phase)))
-        flux_max = float(np.nanmax(flux)) if np.any(np.isfinite(flux)) else 1.0
-        tiny = max(1e-30, abs(float(np.nanmedian(flux))) * 1e-6)
-        scatter_prior = {'mean': float(centre), 'std': float(max(centre, tiny)),
-                         'min': 0.0, 'max': float(max(flux_max, centre + tiny))}
+        override = getattr(args, '_scatter_prior_override', None)
+        if override:
+            scatter_prior = dict(override)
+        else:
+            centre = estimate_scattered_flux(phase, flux, window=tuple(map(float, args.scatter_eclipse_phase)))
+            flux_max = float(np.nanmax(flux)) if np.any(np.isfinite(flux)) else 1.0
+            tiny = max(1e-30, abs(float(np.nanmedian(flux))) * 1e-6)
+            scatter_prior = {'mean': float(centre), 'std': float(max(centre, tiny)),
+                             'min': 0.0, 'max': float(max(flux_max, centre + tiny))}
         if not args.quiet:
-            print("Scatter prior: mean={mean:.4g}, std={std:.4g}, min={min:.4g}, max={max:.4g}"
-                  .format(**scatter_prior))
+            print(("Scatter prior (fixed, --prior-fscatter)" if override else "Scatter prior (data-driven)")
+                  + ": mean={mean:.4g}, std={std:.4g}, min={min:.4g}, max={max:.4g}".format(**scatter_prior))
     return data, smoothed, scatter_prior
 
 
@@ -2031,6 +2045,10 @@ def validate_args(parser: argparse.ArgumentParser, args, spec: ParamSpec, frozen
         err("--phase-shift-grid-size must be >= 3.")
 
     # --- scattered flux --------------------------------------------------------
+    if 'prior_f_scatter' in explicit and not args.fit_scatter:
+        err("--prior-fscatter sets the prior of the fitted floor: use it with --fit-scatter.")
+    if 'prior_f_scatter' in explicit and 'scatter_eclipse_phase' in explicit:
+        err("--prior-fscatter replaces the data-driven floor prior, so --scatter-eclipse-phase has no effect.")
     if 'scatter_eclipse_phase' in explicit and not args.fit_scatter:
         err("--scatter-eclipse-phase only centres the f_scatter prior; add --fit-scatter.")
     if args.fit_scatter and 'f_scatter' in frozen:
@@ -2156,6 +2174,7 @@ def main():
 
     geometry_priors = default_geometry_priors(mode)
     geometry_priors.update(_parse_prior_overrides(parser, args, geometry_names(mode)))
+    args._scatter_prior_override = _parse_prior_overrides(parser, args, ('f_scatter',), kind="floor ").get('f_scatter')
     shape_prior_overrides = _parse_prior_overrides(parser, args, ALL_WIND_SHAPE_NAMES, kind="shape param ")
     shape_prior_overrides.update(_parse_prior_overrides(parser, args, ('log_fopa',)))
     for fname, fval in frozen.items():

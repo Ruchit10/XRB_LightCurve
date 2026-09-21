@@ -48,11 +48,11 @@
       60000.0
     ],
     [
-      10342100.0,
+      10342080.0,
       60000.0
     ],
     [
-      13685800.0,
+      13685760.0,
       60000.0
     ]
   ],
@@ -65,7 +65,7 @@
     "ORBITAL_PERIOD": 777600.0
   },
   "n_bins": 3240,
-  "total_counts": 549105.0,
+  "total_counts": 549054.0,
   "zero_count_bins": 1,
   "output": "/Users/rpanchal/Desktop/xrb_lc/XRB_LightCurve/synthetic_data/systemB/broad/systemB_broad.txt"
 }
