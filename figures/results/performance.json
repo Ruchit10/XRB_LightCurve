@@ -5,10 +5,10 @@
   "numba": "0.61.2",
   "numpy": "2.2.6",
   "machine": "macOS-15.7.7-x86_64-i386-64bit-Mach-O",
-  "forward_dth1_threads": 11.086681974120438,
-  "forward_dth2_threads": 5.9063685475848615,
-  "forward_dth1_single": 57.71458649542183,
-  "shift_search": 4.601514432579279,
-  "log_posterior_dth2": 11.085672536864877,
-  "n_bins": 594
+  "forward_dth1_threads": 10.627191455569118,
+  "forward_dth2_threads": 5.741050001233816,
+  "forward_dth1_single": 56.31612497381866,
+  "shift_search": 5.692375008948147,
+  "log_posterior_dth2": 10.624561051372439,
+  "n_bins": 588
 }

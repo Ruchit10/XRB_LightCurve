@@ -13,7 +13,7 @@ scattered floor free, the jitter likelihood, the same walkers/steps/burn-in as
 ``figlib.FIT_SETTINGS``, data generated at 1 degree and fitted at 2 degrees.
 Two things a calibration test cannot take from the paper's fits, stated here
 and in the caption:
-- the floor gets a fixed prior (``figlib.FLOOR_PRIOR``, via ``--prior-fscatter``)
+- the floor gets a fixed prior (``figlib.floor_prior()``, via ``--prior-fscatter``)
   instead of the data-driven one, and the injected floor is drawn from it;
 - ``q_m`` is drawn but frozen at its true value (its posterior equals its
   prior by construction, so ranking it tests nothing).
@@ -59,13 +59,14 @@ from cloak.synthetic import fiducial  # noqa: E402
 PY = sys.executable
 CACHE = os.path.join(L.CACHE, "sbc")
 SYSTEM = fiducial.SYSTEMS["A"]
+FLOOR_PRIOR = L.floor_prior()                                     # follows the flux scale of the table in use
 SAMPLED = ["M_tot", "R", "r", "i0", "Rb", "p", "log_fopa"]          # ranked and judged
 PRIORS = {
     "M_tot": MODES["kepler_mtot"]["scale_priors"]["M_tot"],
     "q_m": MODES["kepler_mtot"]["scale_priors"]["q_m"],
     "R": R_PRIOR, "r": SMALL_R_PRIOR, "i0": I0_PRIOR,
     "Rb": WIND_SHAPE_PRIORS["Rb"], "p": WIND_SHAPE_PRIORS["p"], "log_fopa": FOPACITY_PRIOR,
-    "f_scatter": L.FLOOR_PRIOR,
+    "f_scatter": FLOOR_PRIOR,
 }
 COLUMNS = ["draw", "param", "truth", "rank", "n_post", "converged", "note", "config"]
 
@@ -95,7 +96,7 @@ def run(cmd, log_path):
 
 def config_digest(args) -> str:
     settings = dict(band=args.band, dth=args.dth, gen_dth=args.gen_dth, n_walkers=args.n_walkers,
-                    n_steps=args.n_steps, n_burn=args.n_burn, thin=args.thin, floor_prior=L.FLOOR_PRIOR,
+                    n_steps=args.n_steps, n_burn=args.n_burn, thin=args.thin, floor_prior=FLOOR_PRIOR,
                     intrinsic_scatter=L.SBC_INTRINSIC_SCATTER, priors={k: v for k, v in PRIORS.items()},
                     table=os.path.basename(args.flux_csv), extra_args=list(L.FIT_SETTINGS["extra_args"]))
     return hashlib.sha1(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:10]
@@ -142,7 +143,7 @@ def main() -> None:
     obs = SYSTEM["observation"]
     period = float(SYSTEM["period_s"])
     K = fiducial.kepler_prefactor(period)
-    fp = L.FLOOR_PRIOR
+    fp = FLOOR_PRIOR
     floor_prior_arg = f"--prior-fscatter={fp['mean']:.6g},{fp['std']:.6g},{fp['min']:.6g},{fp['max']:.6g}"
 
     for k in range(args.start, args.start + args.n_draws):

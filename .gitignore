@@ -62,3 +62,9 @@ figures/cache/
 !figures/results/**/*.csv
 !figures/results/**/*.json
 !figures/results/**/*.txt
+
+# The fake spectrum's directory: the copied RMF/ARF are instrument calibration
+# (not distributed) and the PHA is only readable with them; the per-band
+# flux-per-count-rate factors the light-curve step uses are kept.
+synthetic_data/spec/*
+!synthetic_data/spec/band_factors.json

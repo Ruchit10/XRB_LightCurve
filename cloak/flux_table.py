@@ -118,6 +118,15 @@ def find_spectrum_files(specdir: str) -> Tuple[str, Optional[str], Optional[str]
     return src, bkg, rmf, arf
 
 
+def _background_file(spectrum) -> Optional[str]:
+    """File name of the loaded spectrum's background, or None: PyXspec raises on ``spectrum.background``
+    (rather than returning None) when the spectrum has no background."""
+    try:
+        return spectrum.background.fileName
+    except Exception:
+        return None
+
+
 def load_xspec_spectrum(src: str, bkg: Optional[str], rmf: Optional[str], arf: Optional[str]) -> None:
     """Load the spectrum into XSPEC; fill in whatever the PHA header did not supply.
 
@@ -136,7 +145,7 @@ def load_xspec_spectrum(src: str, bkg: Optional[str], rmf: Optional[str], arf: O
         os.chdir(os.path.dirname(os.path.abspath(src)))
         AllData(os.path.basename(src))
         spectrum = AllData(1)
-        if bkg and not spectrum.background:
+        if bkg and _background_file(spectrum) is None:
             spectrum.background = os.path.basename(bkg)
         if not spectrum.responsesUsed:
             if rmf is None:
@@ -156,7 +165,7 @@ def load_xspec_spectrum(src: str, bkg: Optional[str], rmf: Optional[str], arf: O
         except Exception:
             arf_in_use = None
         print(f"  Response in use: {spectrum.response.rmf}  ARF: {arf_in_use or 'none'}  "
-              f"background: {spectrum.background.fileName if spectrum.background else 'none'}")
+              f"background: {_background_file(spectrum) or 'none'}")
     finally:
         os.chdir(cwd)
 

@@ -1,0 +1,14 @@
+{
+  "soft": {
+    "chi2_effective": 302.58152073817365,
+    "n_bins": 292
+  },
+  "medium": {
+    "chi2_effective": 199.34681280883478,
+    "n_bins": 211
+  },
+  "hard": {
+    "chi2_effective": 251.68008586628207,
+    "n_bins": 231
+  }
+}

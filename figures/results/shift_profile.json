@@ -1,11 +1,11 @@
 {
   "objective": "jitter -2lnL",
-  "jitter_f": 0.059743983074578476,
-  "search_shift": 0.020009765625000002,
-  "search_value": -34873.83089819488,
-  "brute_shift": 0.02,
-  "brute_value": -34873.826452428155,
-  "search_minus_brute": -0.004445766724529676,
+  "jitter_f": 0.048618786417746314,
+  "search_shift": 0.02083984375,
+  "search_value": -33244.72414634227,
+  "brute_shift": 0.02085,
+  "brute_value": -33244.72220346941,
+  "search_minus_brute": -0.0019428728555794805,
   "brute_grid_step": 5e-05,
   "search_resolution": 9.765625e-06,
   "note": "a negative difference means the search's finer final step found a lower value than the brute-force grid"

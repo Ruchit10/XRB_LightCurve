@@ -1,0 +1,43 @@
+{
+  "model": "tbabs*powerlaw",
+  "nH_1e22": 0.3,
+  "PhoIndex": 1.8,
+  "norm": 0.001,
+  "exposure_s": 100000.0,
+  "rmf": "/Users/rpanchal/Desktop/xrb_lc/XRB_LightCurve/data/IC10X1_spec/X1_spectrum_combined_src.rmf",
+  "arf": "/Users/rpanchal/Desktop/xrb_lc/XRB_LightCurve/data/IC10X1_spec/X1_spectrum_combined_src.arf",
+  "background": null,
+  "seed": 1,
+  "fake_background": null,
+  "fake_pha": "/Users/rpanchal/Desktop/xrb_lc/XRB_LightCurve/synthetic_data/spec/synthetic_src.pha",
+  "bands": {
+    "broad": {
+      "emin_keV": 0.5,
+      "emax_keV": 7.0,
+      "flux_erg": 3.8609665648081355e-12,
+      "rate_cts_s": 0.31355,
+      "flux_per_rate": 1.2313718911842244e-11
+    },
+    "soft": {
+      "emin_keV": 0.5,
+      "emax_keV": 2.0,
+      "flux_erg": 1.3012092402069042e-12,
+      "rate_cts_s": 0.22318999999999997,
+      "flux_per_rate": 5.830051705752517e-12
+    },
+    "medium": {
+      "emin_keV": 1.2,
+      "emax_keV": 2.0,
+      "flux_erg": 7.504371405705646e-13,
+      "rate_cts_s": 0.12072999999999999,
+      "flux_per_rate": 6.215829873027124e-12
+    },
+    "hard": {
+      "emin_keV": 2.0,
+      "emax_keV": 7.0,
+      "flux_erg": 2.559757324601233e-12,
+      "rate_cts_s": 0.09157000000000007,
+      "flux_per_rate": 2.795410423284079e-11
+    }
+  }
+}

@@ -1044,11 +1044,16 @@ trapezoid over a plot grid (XSPEC clips a band to the model energy array, so
 bands outside 0.1–20 keV are rejected); PyXspec is imported after argument
 parsing so `--help` works without HEASoft; and the exponential
 law drawn on the figure is `utils.fit_exponential`, the function the
-simulator's `refit` method uses. HEASoft is not importable from plain `henv`,
-so the script's control flow was exercised end to end against a PyXspec
-stand-in (a fake `xspec` module with the same attribute semantics) and its
-output table fed to `simulate_band_flux`; the calls it makes of PyXspec are the
-documented ones.
+simulator's `refit` method uses. HEASoft is part of `henv`
+(`$CONDA_PREFIX/heasoft`, initialised by the environment's activation hook; a
+plain `import xspec` without it fails). The script's control flow was first
+exercised against a PyXspec stand-in; the first live run (2026-09-21, on the
+fake spectrum of the data notebook) found one PyXspec semantic the stand-in
+did not have — `spectrum.background` raises when the spectrum has no
+background instead of returning None — now handled by `_background_file`.
+The data notebook fits the fake spectrum with `--statistic cstat`: chi-square
+on the low-count channels gave Γ = 1.88 and `nH` = 0.32 for inputs of 1.8 and
+0.30, cstat gives 1.793 and 0.299.
 
 ---
 
@@ -1092,15 +1097,20 @@ defines the paper's two generic systems (A: WR-like, `P = 1.6 d`, `a = 17`,
 `R = 2.5 R☉`, `i = 84°`, smooth_pl, `f_opa = 0.05`; B: OB-like, `P = 9 d`,
 `a = 60`, `R = 18 R☉`, `i = 78°`, beta_law, `f_opa = 1`) with their observing
 patterns. `synthetic_data/generate_synthetic_data.ipynb` turns them into data
-(tables under HEASoft, light curves for every band with a table, diagnostic
-plots) and `figures/paper_figures.ipynb` turns the data into the paper's
+(under HEASoft: a fake `tbabs*powerlaw` spectrum through a Chandra response and
+one table per band in `BANDS`, fitted with cstat; then light curves of both
+systems in every band, a sub-band's count rate following from the fake
+spectrum's flux-per-count-rate factors in `spec/band_factors.json` so that the
+broad band meets the system's `target_rate`; a light curve is regenerated when
+its table or the fiducial definition changed; diagnostic plots) and
+`figures/paper_figures.ipynb` turns the data into the paper's
 results figures fig02–fig14 and tables (fiducial, priors, invariance,
 recovery, performance), caching the MCMC fits under `figures/cache/`;
 `figures/run_sbc.py` runs the simulation-based calibration batch that
 fig10 reads: it fits the paper's own model (jitter likelihood, wind shape,
 opacity and floor free, `--kepler-mtot`, the sampling settings of
 `figlib.FIT_SETTINGS`) with two stated changes a calibration test needs — the
-floor gets the fixed prior `figlib.FLOOR_PRIOR` (`--prior-fscatter`) from
+floor gets the fixed prior `figlib.floor_prior()` (`--prior-fscatter`) from
 which the injected floor is drawn, and `q_m` is frozen at its drawn value —
 injects 10 % intrinsic variability, ranks the jitter parameter as a
 diagnostic only, records the fitter's convergence verdict per draw and lets

@@ -54,10 +54,17 @@ WIDTH = 13.5 / 2.54                                 # MDPI figure width in inche
 # 100-300 steps for the fiducial fits); "extra_args" holds prior overrides applied to all
 # fits, e.g. ["--prior-R", "2.5,1.0,1.0,8.0"]. Everything here enters the fit-cache digest.
 FIT_SETTINGS = {"n_walkers": 32, "n_steps": 5000, "n_burn": 1000, "ridge_n_steps": 3000, "extra_args": []}
-# Fixed prior of the scattered floor used by the calibration batch (flux units, System A's scale):
-# mean 3 % of the fiducial out-of-eclipse flux, wide, non-negative.
-FLOOR_PRIOR = {"mean": 3.4e-14, "std": 2.0e-14, "min": 0.0, "max": 1.2e-13}
 SBC_INTRINSIC_SCATTER = 0.10                        # per-row log-normal variability injected in the batch
+
+
+def floor_prior(name: str = "A", band: str = "broad") -> Dict[str, float]:
+    """Fixed prior of the scattered floor for the calibration batch, in the flux units of the table in
+    use: mean = the fiducial scattered fraction (3 %) of the system's out-of-eclipse model flux, a
+    2 % width, non-negative, cut at 10 % of that flux. A function rather than numbers so the prior
+    follows the flux scale of whatever table the data notebook produced."""
+    f_out = float(np.max(curve(name, band)[1]))
+    frac = float(F.SYSTEMS[name]["observation"]["scatter_fraction"])
+    return {"mean": frac * f_out, "std": (2.0 / 3.0) * frac * f_out, "min": 0.0, "max": (10.0 / 3.0) * frac * f_out}
 PRIOR_REGISTRIES = ("R_PRIOR", "SMALL_R_PRIOR", "I0_PRIOR", "WIND_SHAPE_PRIORS", "FOPACITY_PRIOR", "JITTER_PRIOR")
 PROFILE_LABELS = {"smooth_pl": "smoothly broken power law", "confinement": "confinement", "beta_law": r"$\beta$-law"}
 os.makedirs(CACHE, exist_ok=True)
@@ -633,6 +640,13 @@ def fig_energy_dependence(dth: float = 1.0) -> Tuple[plt.Figure, dict]:
         bx.plot([], [], marker=marker, color="k", ls="none", label=f"System {name}")
     ax.set(xlabel="orbital phase", ylabel=r"$F_b / F_{b,\rm out}$", xlim=(0.3, 0.7))
     bx.set(xlabel=r"band energy $\sqrt{E_{\min}E_{\max}}$ (keV)", ylabel="half-depth eclipse width (phase)", xscale="log")
+    # Plain keV tick labels on the short logarithmic axis (the default "2 x 10^0" labels are unreadable).
+    from matplotlib.ticker import FixedLocator, NullFormatter, ScalarFormatter
+    energies = [math.sqrt(lo * hi) for lo, hi in (BANDS[b] for b in bands)]
+    ticks = [t for t in (0.5, 0.7, 1, 1.5, 2, 3, 4, 5, 7, 10) if 0.8 * min(energies) <= t <= 1.25 * max(energies)]
+    bx.set_xlim(0.8 * min(energies), 1.25 * max(energies))
+    bx.xaxis.set_major_locator(FixedLocator(ticks)); bx.xaxis.set_major_formatter(ScalarFormatter())
+    bx.xaxis.set_minor_formatter(NullFormatter())
     label_panels(axes)
     put_legend(la, ax, ncol=2); put_legend(lb, bx, ncol=2)
     if len(bands) < 2:
@@ -1315,7 +1329,8 @@ def fig_crossband(fit: dict, bands: Sequence[str] = ("soft", "medium", "hard"),
         chi2 = float(np.sum((binned["flux"].to_numpy() - model_at) ** 2 / var))
         summary[band] = {"chi2_effective": chi2, "n_bins": int(binned.shape[0])}
         ax.set(xlabel="orbital phase", ylabel=r"$F_b$ (erg cm$^{-2}$ s$^{-1}$)")
-        ax.set_title(f"{band} band, $\\chi^2_{{\\rm eff}}/n = {chi2 / binned.shape[0]:.2f}$", loc="right", fontsize=7, color="0.35")
+        # Short right title (the legend names the band): a longer one collides with the panel letter.
+        ax.set_title(f"$\\chi^2_{{\\rm eff}}/n={chi2 / binned.shape[0]:.2f}$", loc="right", fontsize=6.5, color="0.35")
         put_legend(lax, ax, ncol=1, fontsize=6.5)
     label_panels(axes[0])
     save_json("crossband", summary)
